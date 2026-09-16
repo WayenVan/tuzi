@@ -2,9 +2,15 @@ use crate::action::Action;
 
 use super::{Key, KeyContext, Keymap};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhichCandidate {
+	pub keys:        Vec<Key>,
+	pub description: String,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Route {
-	Pending,
+	Pending(Vec<WhichCandidate>),
 	Actions(Vec<Action>),
 	Unmatched,
 }
@@ -16,26 +22,34 @@ pub struct Router {
 }
 
 impl Router {
-	pub fn hint(&self) -> &str { self.keymap.hint() }
-
 	pub fn route(&mut self, context: KeyContext, key: Key) -> Route {
 		self.pending.push(key);
-		let mut matched = self
+		let matched: Vec<_> = self
 			.keymap
 			.bindings(context)
-			.filter(|binding| binding.keys.starts_with(&self.pending));
+			.filter(|binding| binding.keys.starts_with(&self.pending))
+			.collect();
 
-		let Some(first) = matched.next() else {
+		if matched.is_empty() {
 			self.pending.clear();
 			return Route::Unmatched;
-		};
+		}
 
-		if first.keys.len() == self.pending.len() {
-			let actions = first.actions.clone();
+		if let Some(binding) = matched.iter().find(|binding| binding.keys.len() == self.pending.len()) {
+			let actions = binding.actions.clone();
 			self.pending.clear();
 			Route::Actions(actions)
 		} else {
-			Route::Pending
+			let typed = self.pending.len();
+			Route::Pending(
+				matched
+					.into_iter()
+					.map(|binding| WhichCandidate {
+						keys: binding.keys[typed..].to_vec(),
+						description: binding.description.clone(),
+					})
+					.collect(),
+			)
 		}
 	}
 }
@@ -44,7 +58,7 @@ impl Router {
 mod tests {
 	use crossterm::event::{KeyCode, KeyModifiers};
 
-	use crate::action::{Action, CursorTarget, InputKind};
+	use crate::{action::{Action, CursorTarget, InputKind}, column_mode::ColumnMode};
 
 	use super::*;
 
@@ -52,7 +66,7 @@ mod tests {
 	fn matches_single_keys_and_arbitrary_chords() {
 		let mut router = Router::default();
 		assert_eq!(router.route(KeyContext::Manager, Key::char('j')), Route::Actions(vec![Action::MoveCursor(1)]));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending);
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char(' ')),
 			Route::Actions(vec![Action::OpenInput(InputKind::Cd)])
@@ -62,7 +76,7 @@ mod tests {
 	#[test]
 	fn mismatch_clears_the_pending_sequence() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char('t')), Route::Pending);
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('t')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('x')), Route::Unmatched);
 		assert_eq!(router.route(KeyContext::Manager, Key::char('q')), Route::Actions(vec![Action::Quit]));
 	}
@@ -96,11 +110,52 @@ mod tests {
 	#[test]
 	fn shares_the_g_prefix_between_top_and_directory_navigation() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending);
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('g')), Route::Actions(vec![Action::MoveTo(CursorTarget::Top)]));
 
-		assert_eq!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending);
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Actions(vec![Action::OpenInput(InputKind::Cd)]));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('G')), Route::Actions(vec![Action::MoveTo(CursorTarget::Bottom)]));
+	}
+
+	#[test]
+	fn m_prefix_selects_the_column_mode() {
+		let mut router = Router::default();
+		for (key, mode) in [
+			('n', ColumnMode::None),
+			('s', ColumnMode::Size),
+			('p', ColumnMode::Permissions),
+			('m', ColumnMode::Modified),
+		] {
+			assert!(matches!(router.route(KeyContext::Manager, Key::char('m')), Route::Pending(_)));
+			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![Action::SetColumnMode(mode)]));
+		}
+	}
+
+	#[test]
+	fn pending_route_exposes_remaining_keys_and_descriptions() {
+		let mut router = Router::default();
+		let Route::Pending(candidates) = router.route(KeyContext::Manager, Key::char('m')) else {
+			panic!("m should open the column-mode prefix");
+		};
+
+		assert_eq!(candidates.len(), 4);
+		assert!(candidates.iter().any(|candidate| candidate.keys == [Key::char('s')] && candidate.description == "Show size column"));
+		assert!(candidates.iter().any(|candidate| candidate.keys == [Key::char('n')] && candidate.description == "Hide column"));
+	}
+
+	#[test]
+	fn control_p_toggles_the_preview() {
+		let mut router = Router::default();
+		let key = Key::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+		assert_eq!(router.route(KeyContext::Manager, key), Route::Actions(vec![Action::TogglePreview]));
+	}
+
+	#[test]
+	fn alt_j_and_k_scroll_the_preview() {
+		let mut router = Router::default();
+		let alt = |c| Key::new(KeyCode::Char(c), KeyModifiers::ALT);
+		assert_eq!(router.route(KeyContext::Manager, alt('j')), Route::Actions(vec![Action::SeekPreview(1)]));
+		assert_eq!(router.route(KeyContext::Manager, alt('k')), Route::Actions(vec![Action::SeekPreview(-1)]));
 	}
 }

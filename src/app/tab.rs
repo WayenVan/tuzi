@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{core::{Node, Selection, Tree, Visual}, event::Event, fs::{Cha, Engine, LocalEngine}, scheduler::Scheduler, watcher::Watcher};
+use crate::{column_mode::ColumnMode, core::{Node, Selection, Tree, Visual}, event::Event, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, watcher::Watcher};
 
 use super::input::{Completion, InputPurpose, InputSession};
 
@@ -18,8 +18,10 @@ pub struct Tab {
 	pub id:             usize,
 	pub tree:           Tree,
 	pub cursor:         usize,
+	pub column_mode:    ColumnMode,
+	pub preview:        Preview,
 	pub watcher:        Watcher,
-	pub scheduler:      Scheduler,
+	pub fs_scheduler:   FsScheduler,
 	pub selection:      Selection,
 	pub visual:         Option<Visual>,
 	pub clipboard:      Vec<PathBuf>,
@@ -39,17 +41,19 @@ impl Tab {
 		watcher.watch(&root_path)?;
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
-		let mut scheduler = Scheduler::new(id, tx.clone(), engine);
+		let mut fs_scheduler = FsScheduler::new(id, tx.clone(), engine);
 		if needs_fetch {
-			scheduler.refresh(root_path);
+			fs_scheduler.refresh(root_path);
 		}
 
 		Ok(Self {
 			id,
 			tree,
 			cursor: 0,
+			column_mode: ColumnMode::None,
+			preview: Preview::new(id, tx.clone()),
 			watcher,
-			scheduler,
+			fs_scheduler,
 			selection: Selection::default(),
 			visual: None,
 			clipboard: Vec::new(),
@@ -67,12 +71,27 @@ impl Tab {
 		if len == 0 {
 			return;
 		}
-		self.cursor = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+		let cursor = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+		if cursor != self.cursor {
+			self.cursor = cursor;
+			self.preview.target_changed();
+		}
 	}
 
-	pub fn move_to_top(&mut self) { self.cursor = 0; }
+	pub fn move_to_top(&mut self) {
+		if self.cursor != 0 {
+			self.cursor = 0;
+			self.preview.target_changed();
+		}
+	}
 
-	pub fn move_to_bottom(&mut self) { self.cursor = self.visible().len().saturating_sub(1); }
+	pub fn move_to_bottom(&mut self) {
+		let cursor = self.visible().len().saturating_sub(1);
+		if cursor != self.cursor {
+			self.cursor = cursor;
+			self.preview.target_changed();
+		}
+	}
 
 	/// Marks the directory open immediately (the triangle flips, the row
 	/// stays put) and, if it's never been listed, kicks off a background
@@ -83,7 +102,7 @@ impl Tab {
 		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
 		let _ = self.watcher.watch(&path);
 		if needs_fetch {
-			self.scheduler.refresh(path);
+			self.fs_scheduler.refresh(path);
 		}
 	}
 
@@ -99,7 +118,7 @@ impl Tab {
 
 		self.tree.collapse(&target);
 		self.watcher.unwatch(&target);
-		self.scheduler.forget(&target);
+		self.fs_scheduler.forget(&target);
 		self.select(&target);
 	}
 
@@ -155,7 +174,7 @@ impl Tab {
 		}
 
 		if self.pending_delete.as_deref() == Some(targets.as_slice()) {
-			self.scheduler.delete(targets);
+			self.fs_scheduler.delete(targets);
 			self.pending_delete = None;
 		} else {
 			self.pending_delete = Some(targets);
@@ -171,7 +190,7 @@ impl Tab {
 			return;
 		}
 		let Some(target_dir) = self.paste_target() else { return };
-		self.scheduler.copy(self.clipboard.clone(), target_dir);
+		self.fs_scheduler.copy(self.clipboard.clone(), target_dir);
 	}
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
@@ -316,10 +335,10 @@ impl Tab {
 		}
 
 		self.watcher.unwatch(&target);
-		self.scheduler.forget(&target);
+		self.fs_scheduler.forget(&target);
 		self.selection.remove(&target);
 		if self.tree.is_loaded(parent) {
-			self.scheduler.refresh(parent.to_path_buf());
+			self.fs_scheduler.refresh(parent.to_path_buf());
 		}
 	}
 
@@ -385,7 +404,7 @@ impl Tab {
 	/// ever fires for ones we actually have cached.
 	pub fn on_changed(&mut self, path: PathBuf) {
 		if self.tree.is_loaded(&path) {
-			self.scheduler.refresh(path);
+			self.fs_scheduler.refresh(path);
 		}
 	}
 
@@ -393,7 +412,7 @@ impl Tab {
 	/// most recent request for that path — a superseded one is discarded
 	/// rather than clobbering a listing a newer request already applied.
 	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>) {
-		if !self.scheduler.accept(&path, ticket) {
+		if !self.fs_scheduler.accept(&path, ticket) {
 			return;
 		}
 		if let Ok(entries) = result {
@@ -405,7 +424,7 @@ impl Tab {
 	pub fn on_deleted(&mut self, paths: Vec<PathBuf>) {
 		for path in &paths {
 			self.watcher.unwatch(path);
-			self.scheduler.forget(path);
+			self.fs_scheduler.forget(path);
 			self.selection.remove(path);
 		}
 		self.refresh_parents(&paths);
@@ -413,7 +432,7 @@ impl Tab {
 
 	pub fn on_pasted(&mut self, target: PathBuf) {
 		if self.tree.is_loaded(&target) {
-			self.scheduler.refresh(target);
+			self.fs_scheduler.refresh(target);
 		}
 	}
 
@@ -450,7 +469,7 @@ impl Tab {
 		parents.dedup();
 		for parent in parents {
 			if self.tree.is_loaded(&parent) {
-				self.scheduler.refresh(parent);
+				self.fs_scheduler.refresh(parent);
 			}
 		}
 	}
@@ -462,7 +481,15 @@ impl Tab {
 		}
 	}
 
-	pub fn status_line(&self, key_hint: &str) -> (String, bool) {
+	/// The confirmation/mode banners still take over the line when they're
+	/// live — they're state the user needs to act on, not a passive
+	/// hint — but otherwise this is dedicated to the hovered node: its
+	/// name, size, and permissions.
+	///
+	/// Both files and directories display the size reported by their own
+	/// filesystem metadata. This is deliberately not a recursive directory
+	/// total: rendering reads `Cha` only and never starts background I/O.
+	pub fn status_line(&self) -> (String, bool) {
 		if let Some(visual) = self.visual {
 			let label = if visual.unset { "VISUAL UNSET" } else { "VISUAL SELECT" };
 			return (format!("-- {label} -- move to extend, Esc to apply"), true);
@@ -470,13 +497,11 @@ impl Tab {
 		if let Some(pending) = &self.pending_delete {
 			return (format!("Delete {} item(s)? Press d again to confirm, Esc to cancel", pending.len()), true);
 		}
-		if !self.selection.is_empty() {
-			return (format!("{} selected", self.selection.len()), false);
-		}
-		if !self.clipboard.is_empty() {
-			return (format!("{} in clipboard — p to paste", self.clipboard.len()), false);
-		}
-		(key_hint.to_owned(), false)
+
+		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return (String::new(), false) };
+		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
+		let size = format_size(node.cha.len);
+		(format!("{name}  {size}  {}", node.cha.permissions()), false)
 	}
 }
 
@@ -908,6 +933,24 @@ mod tests {
 
 		assert_eq!(complete_directories(&root, "pro", 3).unwrap(), ["profiles", "Projects"]);
 		assert_eq!(complete_directories(&root, "Pro", 3).unwrap(), ["Projects"]);
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn status_line_displays_the_directorys_own_metadata_size() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-directory-cha");
+		fs::create_dir_all(root.join("dir")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.move_cursor(1); // onto "dir"
+
+		let dir = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("dir")).unwrap();
+		let expected = format_size(dir.cha.len);
+
+		let (line, _) = tab.status_line();
+		assert!(line.contains(&expected), "directories display Cha::len directly: {line}");
 
 		fs::remove_dir_all(&root).unwrap();
 	}

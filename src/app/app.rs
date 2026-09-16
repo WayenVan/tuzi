@@ -5,7 +5,7 @@ use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, keymap::{Key, KeyContext, Route, Router}, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView, WinBar}}};
+use crate::{event::Event, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, WhichPopup, WinBar}}};
 
 use super::{Dispatcher, Tab};
 
@@ -15,6 +15,7 @@ pub struct App {
 	pub quit:    bool,
 	next_tab_id: usize,
 	tree_rows:   usize,
+	which:       Vec<WhichCandidate>,
 	tx:          mpsc::UnboundedSender<Event>,
 }
 
@@ -36,12 +37,15 @@ impl App {
 		});
 
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
-		let mut app = Self { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, tx };
+		let mut app = Self { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), tx };
 		let mut term = Raterm::start()?;
 		let mut router = Router::default();
 
-		let draw = |app: &mut App, term: &mut Raterm, key_hint: &str| -> io::Result<()> {
+		let draw = |app: &mut App, term: &mut Raterm| -> io::Result<()> {
 			let tree_rows = Cell::new(app.tree_rows);
+			let preview_size = Cell::new((0, 0));
+			let redraw_tx = app.tx.clone();
+			let which = app.which.clone();
 			let cwd = app.active_tab().tree.root.path.clone();
 			// Collected as owned strings *before* grabbing the active tab
 			// mutably below — otherwise the tab bar's shared borrow of
@@ -67,23 +71,46 @@ impl App {
 			let mut input = tab.input.take();
 
 			let rows = tab.visible();
-			let (mut status, mut warn) = tab.status_line(key_hint);
+			let (mut status, mut warn) = tab.status_line();
 			if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
 				status = error.clone();
 				warn = true;
 			}
 			let visual = tab.visual_range();
+			let column_mode = tab.column_mode;
+			let preview_visible = tab.preview.visible;
+			let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
 			term.terminal.draw(|frame| {
-				let [win_area, tab_area, tree_area, status_area] = Layout::default()
+				let [win_area, tab_area, body_area, status_area] = Layout::default()
 					.direction(Direction::Vertical)
 					.constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
 					.areas(frame.area());
+				let (tree_area, preview_area) = if preview_visible {
+					let [tree, preview] = Layout::default()
+						.direction(Direction::Horizontal)
+						.constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+						.areas(body_area);
+					(tree, Some(preview))
+				} else {
+					(body_area, None)
+				};
 				tree_rows.set(tree_area.height as usize);
 
 				WinBar::render(frame, win_area, &cwd);
 				TabBar::render(frame, tab_area, &labels);
-				TreeView::render(frame, tree_area, &rows, tab.cursor, &tab.selection, visual);
+				TreeView::render(frame, tree_area, &rows, tab.cursor, &tab.selection, visual, column_mode);
+				if let Some(area) = preview_area {
+					preview_size.set((area.width.saturating_sub(1), area.height));
+					PreviewView::render(
+						frame,
+						area,
+						rows.get(tab.cursor).map(|(_, node)| *node),
+						&tab.preview.state,
+						tab.preview.skip,
+					);
+				}
 				StatusBar::render(frame, status_area, &status, warn);
+				WhichPopup::render(frame, frame.area(), &which);
 
 				if let Some(input) = &mut input {
 					let title = input.title();
@@ -94,6 +121,10 @@ impl App {
 					frame.set_cursor_position((x, y));
 				}
 			})?;
+			let (preview_width, preview_height) = preview_size.get();
+			if tab.preview.sync(preview_target, preview_width, preview_height) {
+				let _ = redraw_tx.send(Event::Redraw);
+			}
 
 			// Cursor *shape* is a raw terminal escape, not something ratatui's
 			// buffer diffing covers — set it after the frame's own writes are
@@ -106,12 +137,12 @@ impl App {
 				crossterm::execute!(io::stdout(), style)?;
 			}
 
-			app.active_tab_mut().input = input;
+			tab.input = input;
 			app.tree_rows = tree_rows.get();
 			Ok(())
 		};
 
-		draw(&mut app, &mut term, router.hint())?;
+		draw(&mut app, &mut term)?;
 		while let Some(event) = rx.recv().await {
 			match event {
 				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -120,11 +151,14 @@ impl App {
 					} else {
 						match router.route(KeyContext::Manager, Key::from(key)) {
 							Route::Actions(actions) => {
+								app.which.clear();
 								for action in actions {
 									Dispatcher::dispatch(&mut app, action);
 								}
 							}
-							Route::Pending | Route::Unmatched => continue,
+							Route::Pending(candidates) => app.which = candidates,
+							Route::Unmatched if app.which.is_empty() => continue,
+							Route::Unmatched => app.which.clear(),
 						}
 					}
 				}
@@ -135,7 +169,7 @@ impl App {
 			if app.quit {
 				break;
 			}
-			draw(&mut app, &mut term, router.hint())?;
+			draw(&mut app, &mut term)?;
 		}
 
 		Ok(())
@@ -198,12 +232,14 @@ impl App {
 mod tests {
 	use std::{fs, path::Path};
 
+	use crate::{action::Action, column_mode::ColumnMode};
+
 	use super::*;
 
 	async fn app(root: &Path) -> (App, mpsc::UnboundedReceiver<Event>) {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
-		let mut app = App { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, tx };
+		let mut app = App { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), tx };
 
 		// drain the root tab's initial listing so it's got visible rows
 		let event = rx.recv().await.unwrap();
@@ -284,6 +320,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn each_tab_keeps_its_own_column_mode() {
+		let root = std::env::temp_dir().join("tuzi-app-test-column-mode");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		Dispatcher::dispatch(&mut app, Action::SetColumnMode(ColumnMode::Size));
+		app.new_tab();
+		assert_eq!(app.active_tab().column_mode, ColumnMode::None, "new tabs start with the default mode");
+
+		Dispatcher::dispatch(&mut app, Action::SetColumnMode(ColumnMode::Permissions));
+		app.switch_tab(-1);
+		assert_eq!(app.active_tab().column_mode, ColumnMode::Size);
+		app.switch_tab(1);
+		assert_eq!(app.active_tab().column_mode, ColumnMode::Permissions);
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn preview_visibility_is_off_by_default_and_local_to_each_tab() {
+		let root = std::env::temp_dir().join("tuzi-app-test-preview-visibility");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		assert!(!app.active_tab().preview.visible);
+		Dispatcher::dispatch(&mut app, Action::TogglePreview);
+		assert!(app.active_tab().preview.visible);
+
+		app.new_tab();
+		assert!(!app.active_tab().preview.visible, "new tabs hide preview by default");
+		app.switch_tab(-1);
+		assert!(app.active_tab().preview.visible, "each tab retains its own preview setting");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn page_and_absolute_movement_use_visible_rows_and_clamp() {
 		let root = std::env::temp_dir().join("tuzi-app-test-page-movement");
 		fs::create_dir_all(&root).unwrap();
@@ -342,7 +417,7 @@ mod tests {
 		// exact path a real background load takes.
 		let path = root.join("a");
 		app.tab_mut(0).unwrap().tree.mark_expanded(&path);
-		app.tab_mut(0).unwrap().scheduler.refresh(path);
+		app.tab_mut(0).unwrap().fs_scheduler.refresh(path);
 
 		let event = rx.recv().await.unwrap();
 		let tab = match &event {

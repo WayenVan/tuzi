@@ -5,19 +5,14 @@ mod router;
 
 pub use binding::{Binding, KeyContext};
 pub use key::Key;
-pub use router::{Route, Router};
+pub use router::{Route, Router, WhichCandidate};
 
 pub struct Keymap {
 	bindings: Vec<Binding>,
-	hint:     String,
 }
 
 impl Default for Keymap {
-	fn default() -> Self {
-		let mut keymap = Self::new(defaults::bindings()).expect("built-in keymap must be valid");
-		keymap.hint = defaults::status_hint().to_owned();
-		keymap
-	}
+	fn default() -> Self { Self::new(defaults::bindings()).expect("built-in keymap must be valid") }
 }
 
 impl Keymap {
@@ -40,24 +35,12 @@ impl Keymap {
 				}
 			}
 		}
-		let mut groups: Vec<(Vec<String>, String, Vec<crate::action::Action>)> = Vec::new();
-		for binding in &bindings {
-			let keys = binding.keys.iter().map(ToString::to_string).collect::<String>();
-			if let Some((sequences, _, _)) = groups.iter_mut().find(|(_, _, actions)| *actions == binding.actions) {
-				sequences.push(keys);
-			} else {
-				groups.push((vec![keys], binding.description.clone(), binding.actions.clone()));
-			}
-		}
-		let hint = groups.into_iter().map(|(keys, description, _)| format!("{} {description}", keys.join("/"))).collect::<Vec<_>>().join("  ");
-		Ok(Self { bindings, hint })
+		Ok(Self { bindings })
 	}
 
 	pub fn bindings(&self, context: KeyContext) -> impl Iterator<Item = &Binding> {
 		self.bindings.iter().filter(move |binding| binding.context == context)
 	}
-
-	pub fn hint(&self) -> &str { &self.hint }
 }
 
 #[cfg(test)]

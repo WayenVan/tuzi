@@ -16,8 +16,6 @@ impl Selection {
 
 	pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
-	pub fn len(&self) -> usize { self.0.len() }
-
 	pub fn iter(&self) -> impl Iterator<Item = &PathBuf> { self.0.iter() }
 
 	pub fn remove(&mut self, path: &Path) { self.0.remove(path); }

@@ -25,11 +25,15 @@ impl Dispatcher {
 			Action::NewTab => app.new_tab(),
 			Action::CloseTab => app.close_tab(),
 			Action::SwitchTab(delta) => app.switch_tab(delta),
+			Action::SetColumnMode(mode) => app.active_tab_mut().column_mode = mode,
+			Action::TogglePreview => app.active_tab_mut().preview.toggle(),
+			Action::SeekPreview(units) => app.active_tab_mut().preview.seek(units),
 		}
 	}
 
 	pub fn dispatch_event(app: &mut App, event: Event) {
 		match event {
+			Event::Redraw => {},
 			Event::Changed { tab, path } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
@@ -53,6 +57,11 @@ impl Dispatcher {
 			Event::CompletionLoaded { tab, input, revision, result } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_completion_loaded(input, revision, result);
+				}
+			}
+			Event::PreviewLoaded { tab, ticket, key, result } => {
+				if let Some(t) = app.tab_mut(tab) {
+					t.preview.accept(ticket, key, result);
 				}
 			}
 			Event::Term(_) => {}

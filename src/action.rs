@@ -1,3 +1,5 @@
+use crate::column_mode::ColumnMode;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputKind {
 	Rename,
@@ -28,4 +30,7 @@ pub enum Action {
 	NewTab,
 	CloseTab,
 	SwitchTab(isize),
+	SetColumnMode(ColumnMode),
+	TogglePreview,
+	SeekPreview(i16),
 }

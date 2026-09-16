@@ -54,7 +54,7 @@ mod tests {
 
 	use super::*;
 
-	/// Drives the tree the way `App` + `Scheduler` do, minus the background
+	/// Drives the tree the way `App` + `FsScheduler` do, minus the background
 	/// task: mark expanded (immediate), then apply whatever a listing would
 	/// have come back with (here, fetched inline since this test doesn't
 	/// need to be async).
