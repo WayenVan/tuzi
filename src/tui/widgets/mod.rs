@@ -1,4 +1,5 @@
 mod completion_popup;
+mod confirm_popup;
 mod prompt;
 mod preview_view;
 mod status_bar;
@@ -8,6 +9,7 @@ mod win_bar;
 mod which_popup;
 
 pub use completion_popup::CompletionPopup;
+pub use confirm_popup::ConfirmPopup;
 pub use prompt::Prompt;
 pub use preview_view::PreviewView;
 pub use status_bar::StatusBar;

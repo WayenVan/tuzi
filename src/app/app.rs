@@ -1,11 +1,11 @@
 use std::{cell::Cell, env, io, thread};
 
-use crossterm::event::KeyEventKind;
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, WhichPopup, WinBar}}};
+use crate::{event::Event, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, WhichPopup, WinBar}}};
 
 use super::{Dispatcher, Tab};
 
@@ -79,6 +79,7 @@ impl App {
 			let visual = tab.visual_range();
 			let column_mode = tab.column_mode;
 			let preview_visible = tab.preview.visible;
+			let pending_delete = tab.pending_delete.clone();
 			let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
 			term.terminal.draw(|frame| {
 				let [win_area, tab_area, body_area, status_area] = Layout::default()
@@ -111,6 +112,9 @@ impl App {
 				}
 				StatusBar::render(frame, status_area, &status, warn);
 				WhichPopup::render(frame, frame.area(), &which);
+				if let Some(targets) = &pending_delete {
+					ConfirmPopup::render_delete(frame, frame.area(), targets);
+				}
 
 				if let Some(input) = &mut input {
 					let title = input.title();
@@ -146,7 +150,16 @@ impl App {
 		while let Some(event) = rx.recv().await {
 			match event {
 				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
-					if app.active_tab().input.is_some() {
+					if app.active_tab().pending_delete.is_some() {
+						let submit = match key.code {
+							KeyCode::Char('y') => Some(true),
+							KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => Some(false),
+							KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+							_ => None,
+						};
+						let Some(submit) = submit else { continue };
+						app.active_tab_mut().confirm_delete(submit);
+					} else if app.active_tab().input.is_some() {
 						app.active_tab_mut().handle_input_key(key);
 					} else {
 						match router.route(KeyContext::Manager, Key::from(key)) {

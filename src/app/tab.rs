@@ -26,6 +26,7 @@ pub struct Tab {
 	pub visual:         Option<Visual>,
 	pub clipboard:      Vec<PathBuf>,
 	pub pending_delete: Option<Vec<PathBuf>>,
+	pending_reveal:     Option<PathBuf>,
 	pub(super) input:   Option<InputSession>,
 	input_seq:          u64,
 	tx:                 UnboundedSender<Event>,
@@ -58,6 +59,7 @@ impl Tab {
 			visual: None,
 			clipboard: Vec::new(),
 			pending_delete: None,
+			pending_reveal: None,
 			input: None,
 			input_seq: 0,
 			tx,
@@ -160,24 +162,18 @@ impl Tab {
 		true
 	}
 
-	/// The first press arms a delete of the current targets; a second press
-	/// on the *same* targets confirms it. Anything that changes the targets
-	/// in between (a different selection, a moved cursor) just re-arms
-	/// instead of firing, so a stray keypress can never confirm a delete it
-	/// didn't mean to. The actual removal runs in the background — cleanup
-	/// (watcher/selection/refresh) happens once `Deleted` comes back.
+	/// Opens a modal confirmation for the current operation targets. The
+	/// event loop owns the modal keys and calls `confirm_delete`; another
+	/// ordinary `d` can never submit the destructive action.
 	pub fn delete_selected(&mut self) {
 		let targets = self.action_targets();
-		if targets.is_empty() {
-			self.pending_delete = None;
-			return;
-		}
+		self.pending_delete = (!targets.is_empty()).then_some(targets);
+	}
 
-		if self.pending_delete.as_deref() == Some(targets.as_slice()) {
+	pub fn confirm_delete(&mut self, submit: bool) {
+		let Some(targets) = self.pending_delete.take() else { return };
+		if submit {
 			self.fs_scheduler.delete(targets);
-			self.pending_delete = None;
-		} else {
-			self.pending_delete = Some(targets);
 		}
 	}
 
@@ -214,6 +210,15 @@ impl Tab {
 		let mut input = InputSession::new(self.input_seq, InputPurpose::Cd { base: self.tree.root.path.clone() }, "");
 		self.schedule_completion(&mut input);
 		self.input = Some(input);
+	}
+
+	pub fn start_create(&mut self) {
+		self.input_seq += 1;
+		self.input = Some(InputSession::new(
+			self.input_seq,
+			InputPurpose::Create { base: self.tree.root.path.clone() },
+			"",
+		));
 	}
 
 	/// Handles the common vim input used by rename and interactive cd.
@@ -312,6 +317,11 @@ impl Tab {
 		let value = input.value();
 		match &input.purpose {
 			InputPurpose::Rename { target } => self.confirm_rename(target.clone(), value),
+			InputPurpose::Create { base } => {
+				if !value.is_empty() {
+					self.fs_scheduler.create(base.clone(), value);
+				}
+			}
 			InputPurpose::Cd { base } => {
 				if value.is_empty() {
 					return;
@@ -418,7 +428,33 @@ impl Tab {
 		if let Ok(entries) = result {
 			self.tree.apply_listing(&path, entries);
 		}
+		if let Some(target) = self.pending_reveal.clone()
+			&& self.visible().iter().any(|(_, node)| node.path == target)
+		{
+			self.select(&target);
+			self.pending_reveal = None;
+		}
 		self.clamp_cursor();
+	}
+
+	pub fn on_created(&mut self, base: PathBuf, value: String, target: PathBuf, result: io::Result<()>) {
+		if let Err(error) = result {
+			self.input_seq += 1;
+			let mut input = InputSession::new(self.input_seq, InputPurpose::Create { base }, &value);
+			input.error = Some(error.to_string());
+			self.input = Some(input);
+			return;
+		}
+
+		self.pending_reveal = Some(target.clone());
+		let mut refresh = target.parent();
+		while let Some(path) = refresh {
+			if self.tree.is_loaded(path) {
+				self.fs_scheduler.refresh(path.to_path_buf());
+				return;
+			}
+			refresh = path.parent();
+		}
 	}
 
 	pub fn on_deleted(&mut self, paths: Vec<PathBuf>) {
@@ -494,10 +530,6 @@ impl Tab {
 			let label = if visual.unset { "VISUAL UNSET" } else { "VISUAL SELECT" };
 			return (format!("-- {label} -- move to extend, Esc to apply"), true);
 		}
-		if let Some(pending) = &self.pending_delete {
-			return (format!("Delete {} item(s)? Press d again to confirm, Esc to cancel", pending.len()), true);
-		}
-
 		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return (String::new(), false) };
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 		let size = format_size(node.cha.len);
@@ -594,6 +626,7 @@ mod tests {
 			Event::Loaded { path, ticket, result, .. } => tab.on_loaded(path, ticket, result),
 			Event::Deleted { paths, .. } => tab.on_deleted(paths),
 			Event::Pasted { target, .. } => tab.on_pasted(target),
+			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}
@@ -672,7 +705,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn delete_needs_a_second_press_on_the_same_target() {
+	async fn delete_requires_an_explicit_modal_confirmation() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-delete");
 		fs::create_dir_all(&root).unwrap();
 		fs::write(root.join("leaf.txt"), b"hi").unwrap();
@@ -682,12 +715,16 @@ mod tests {
 		tab.move_cursor(1); // onto "leaf.txt"
 
 		tab.delete_selected();
-		assert!(root.join("leaf.txt").exists(), "first press only arms it");
+		assert!(root.join("leaf.txt").exists(), "opening the confirmation does not delete");
 		assert!(tab.pending_delete.is_some());
 
 		tab.delete_selected();
+		assert!(root.join("leaf.txt").exists(), "a second d still does not submit the modal");
+		assert!(tab.pending_delete.is_some());
+
+		tab.confirm_delete(true);
 		pump(&mut tab, &mut rx).await; // wait for the background removal to actually land
-		assert!(!root.join("leaf.txt").exists(), "second press on the same target confirms it");
+		assert!(!root.join("leaf.txt").exists());
 		assert!(tab.pending_delete.is_none());
 
 		fs::remove_dir_all(&root).unwrap();
@@ -828,6 +865,59 @@ mod tests {
 		assert!(renamed.is_some(), "tree reflects the new name after the refresh lands");
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn create_input_makes_a_file_and_reveals_it() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-file");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.start_create();
+		set_input_value(&mut tab, "note.txt");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+
+		assert!(root.join("note.txt").is_file());
+		assert_eq!(tab.visible()[tab.cursor].1.path, root.join("note.txt"));
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn trailing_slash_creates_nested_directories() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-dir");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.start_create();
+		set_input_value(&mut tab, "one/two/");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+
+		assert!(root.join("one/two").is_dir());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn create_does_not_overwrite_an_existing_file() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-existing");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("keep.txt"), b"keep").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.start_create();
+		set_input_value(&mut tab, "keep.txt");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+
+		assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"keep");
+		assert_eq!(tab.input.as_ref().unwrap().value(), "keep.txt");
+		assert!(tab.input.as_ref().unwrap().error.is_some());
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]

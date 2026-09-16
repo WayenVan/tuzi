@@ -32,6 +32,7 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('y')], A::Yank, "Yank"),
 		Binding::manager(vec![Key::char('p')], A::Paste, "Paste"),
 		Binding::manager(vec![Key::char('r')], A::OpenInput(InputKind::Rename), "Rename"),
+		Binding::manager(vec![Key::char('a')], A::OpenInput(InputKind::Create), "Create a file (end with / for directories)"),
 		Binding::manager(vec![Key::char('w')], A::CloseTab, "Close tab"),
 		Binding::manager(vec![Key::char(']')], A::SwitchTab(1), "Next tab"),
 		Binding::manager(vec![Key::char('[')], A::SwitchTab(-1), "Previous tab"),

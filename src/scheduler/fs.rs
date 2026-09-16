@@ -94,4 +94,33 @@ impl FsScheduler {
 			let _ = tx.send(Event::Pasted { tab, target: target_dir });
 		});
 	}
+
+	pub fn create(&self, base: PathBuf, value: String) {
+		let tab = self.tab;
+		let tx = self.tx.clone();
+		let directory = value.ends_with('/') || value.ends_with('\\');
+		let target = base.join(&value);
+		let task_target = target.clone();
+		let task_value = value.clone();
+		let task_base = base.clone();
+		tokio::spawn(async move {
+			let result = tokio::task::spawn_blocking(move || {
+				if task_value.is_empty() {
+					return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "name cannot be empty"));
+				}
+				if directory {
+					std::fs::create_dir_all(&task_target)
+				} else {
+					let Some(parent) = task_target.parent() else {
+						return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "file has no parent directory"));
+					};
+					std::fs::create_dir_all(parent)?;
+					std::fs::OpenOptions::new().write(true).create_new(true).open(&task_target).map(drop)
+				}
+			})
+			.await
+			.unwrap_or_else(|error| Err(std::io::Error::other(error)));
+			let _ = tx.send(Event::Created { tab, base: task_base, value, target, result });
+		});
+	}
 }

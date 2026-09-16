@@ -22,6 +22,7 @@ impl Dispatcher {
 			Action::Paste => app.active_tab_mut().paste(),
 			Action::OpenInput(InputKind::Rename) => app.active_tab_mut().start_rename(),
 			Action::OpenInput(InputKind::Cd) => app.active_tab_mut().start_cd(),
+			Action::OpenInput(InputKind::Create) => app.active_tab_mut().start_create(),
 			Action::NewTab => app.new_tab(),
 			Action::CloseTab => app.close_tab(),
 			Action::SwitchTab(delta) => app.switch_tab(delta),
@@ -52,6 +53,11 @@ impl Dispatcher {
 			Event::Pasted { tab, target } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_pasted(target);
+				}
+			}
+			Event::Created { tab, base, value, target, result } => {
+				if let Some(t) = app.tab_mut(tab) {
+					t.on_created(base, value, target, result);
 				}
 			}
 			Event::CompletionLoaded { tab, input, revision, result } => {

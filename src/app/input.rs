@@ -5,6 +5,7 @@ use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
 pub(super) enum InputPurpose {
 	Rename { target: PathBuf },
 	Cd { base: PathBuf },
+	Create { base: PathBuf },
 }
 
 pub(super) struct Completion {
@@ -36,6 +37,7 @@ impl InputSession {
 		match self.purpose {
 			InputPurpose::Rename { .. } => "Rename",
 			InputPurpose::Cd { .. } => "Go to directory",
+			InputPurpose::Create { .. } => "Create (end with / for directories)",
 		}
 	}
 

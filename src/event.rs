@@ -11,6 +11,7 @@ pub enum Event {
 	Loaded { tab: usize, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>> },
 	Deleted { tab: usize, paths: Vec<PathBuf> },
 	Pasted { tab: usize, target: PathBuf },
+	Created { tab: usize, base: PathBuf, value: String, target: PathBuf, result: io::Result<()> },
 	CompletionLoaded { tab: usize, input: u64, revision: u64, result: io::Result<Vec<String>> },
 	PreviewLoaded { tab: usize, ticket: u64, key: PreviewKey, result: Result<PreviewData, String> },
 }

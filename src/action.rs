@@ -4,6 +4,7 @@ use crate::column_mode::ColumnMode;
 pub enum InputKind {
 	Rename,
 	Cd,
+	Create,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
