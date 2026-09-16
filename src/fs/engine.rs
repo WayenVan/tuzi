@@ -4,6 +4,21 @@ use super::Cha;
 
 pub trait Engine: Send + Sync {
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, Cha)>>;
+
+	fn read_dir_batches(
+		&self,
+		path: &Path,
+		batch_size: usize,
+		emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool,
+	) -> io::Result<()> {
+		let mut entries = self.read_dir(path)?.into_iter();
+		loop {
+			let batch: Vec<_> = entries.by_ref().take(batch_size).collect();
+			if batch.is_empty() || !emit(batch) {
+				return Ok(());
+			}
+		}
+	}
 }
 
 pub struct LocalEngine;
@@ -17,6 +32,26 @@ impl Engine for LocalEngine {
 				Ok((entry.path(), cha))
 			})
 			.collect()
+	}
+
+	fn read_dir_batches(
+		&self,
+		path: &Path,
+		batch_size: usize,
+		emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool,
+	) -> io::Result<()> {
+		let mut batch = Vec::with_capacity(batch_size);
+		for entry in fs::read_dir(path)? {
+			let entry = entry?;
+			batch.push((entry.path(), Cha::from(entry.metadata()?)));
+			if batch.len() == batch_size && !emit(std::mem::take(&mut batch)) {
+				return Ok(());
+			}
+		}
+		if !batch.is_empty() {
+			emit(batch);
+		}
+		Ok(())
 	}
 }
 

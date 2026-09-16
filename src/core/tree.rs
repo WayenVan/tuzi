@@ -49,6 +49,7 @@ impl Tree {
 		match self.root.find_mut(path) {
 			Some(node) => {
 				node.collapse();
+				node.loading = false;
 				node.load_error = Some(error);
 				true
 			}
@@ -56,9 +57,31 @@ impl Tree {
 		}
 	}
 
+	pub fn begin_incremental_listing(&mut self, path: &Path) -> bool {
+		self.root.find_mut(path).is_some_and(Node::begin_incremental_listing)
+	}
+
+	pub fn append_listing(&mut self, path: &Path, entries: Vec<(PathBuf, Cha)>) -> bool {
+		let Some(node) = self.root.find_mut(path) else { return false };
+		node.append_listing(entries);
+		true
+	}
+
+	pub fn finish_incremental_listing(&mut self, path: &Path) -> bool {
+		let Some(node) = self.root.find_mut(path) else { return false };
+		node.finish_incremental_listing();
+		true
+	}
+
+	pub fn discard_incremental_listing(&mut self, path: &Path) -> bool {
+		let Some(node) = self.root.find_mut(path) else { return false };
+		node.discard_incremental_listing();
+		true
+	}
+
 	pub fn parent_of(&self, path: &Path) -> Option<PathBuf> { self.root.find_parent(path).map(|node| node.path.clone()) }
 
-	pub fn is_loaded(&mut self, path: &Path) -> bool { self.root.find_mut(path).is_some_and(|node| node.children.is_some()) }
+	pub fn is_loaded(&self, path: &Path) -> bool { self.root.find(path).is_some_and(|node| node.children.is_some()) }
 }
 
 #[cfg(test)]

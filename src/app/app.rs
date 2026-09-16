@@ -330,8 +330,7 @@ mod tests {
 		};
 
 		// drain the root tab's initial listing so it's got visible rows
-		let event = rx.recv().await.unwrap();
-		Dispatcher::dispatch_event(&mut app, event);
+		pump(&mut app, &mut rx).await;
 
 		(app, rx)
 	}
@@ -341,8 +340,9 @@ mod tests {
 			let event = rx.recv().await.unwrap();
 			let task_finished = matches!(&event, Event::Task(TaskEvent::Finished { .. }));
 			let task_event = matches!(&event, Event::Task(_));
+			let listing_pending = matches!(&event, Event::Loaded { done: false, .. });
 			Dispatcher::dispatch_event(app, event);
-			if !task_event || task_finished {
+			if (!task_event || task_finished) && !listing_pending {
 				break;
 			}
 		}
@@ -737,9 +737,15 @@ mod tests {
 		// tab 1's own initial listing is already in flight; drain it before
 		// triggering the actual scenario below, so it can't race with (and
 		// get received ahead of) the event this test cares about.
-		let event = rx.recv().await.unwrap();
-		assert!(matches!(event, Event::Loaded { tab: 1, .. }), "tab 1's own startup load");
-		Dispatcher::dispatch_event(&mut app, event);
+		loop {
+			let event = rx.recv().await.unwrap();
+			let done = matches!(event, Event::Loaded { tab: 1, done: true, .. });
+			assert!(matches!(event, Event::Loaded { tab: 1, .. }), "tab 1's own startup load");
+			Dispatcher::dispatch_event(&mut app, event);
+			if done {
+				break;
+			}
+		}
 
 		// Expand a directory on the *inactive* tab 0 and route the
 		// resulting Loaded event straight through Dispatcher, the way the
@@ -750,7 +756,13 @@ mod tests {
 		app.tab_mut(0).unwrap().tree.mark_expanded(&path);
 		app.tab_mut(0).unwrap().fs_scheduler.refresh(path);
 
-		let event = rx.recv().await.unwrap();
+		let event = loop {
+			let event = rx.recv().await.unwrap();
+			if matches!(event, Event::Loaded { done: true, .. }) {
+				break event;
+			}
+			Dispatcher::dispatch_event(&mut app, event);
+		};
 		let tab = match &event {
 			Event::Loaded { tab, .. } => *tab,
 			_ => panic!("expected Loaded"),

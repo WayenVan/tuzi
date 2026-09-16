@@ -52,9 +52,9 @@ impl Dispatcher {
 					t.on_changed(path);
 				}
 			}
-			Event::Loaded { tab, path, ticket, result } => {
+			Event::Loaded { tab, path, ticket, result, done } => {
 				if let Some(t) = app.tab_mut(tab) {
-					t.on_loaded(path, ticket, result);
+					t.on_loaded(path, ticket, result, done);
 				}
 			}
 			Event::Created { tab, base, value, target, result } => {

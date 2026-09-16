@@ -21,8 +21,10 @@ pub struct TreeViewState<'a> {
 }
 
 impl TreeView {
-	pub fn render(frame: &mut Frame, area: Rect, rows: &[(usize, &Node)], state: TreeViewState<'_>) {
-		let items = rows.iter().enumerate().map(|(index, (depth, node))| {
+	pub fn render(frame: &mut Frame, area: Rect, rows: &[(usize, &Node)], row_offset: usize, state: TreeViewState<'_>) {
+		*state.scroll = row_offset;
+		let items = rows.iter().enumerate().map(|(visible_index, (depth, node))| {
+			let index = row_offset + visible_index;
 			let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 			let mut icon = state.icon_theme.icon_for(node);
 			if index == state.cursor {
@@ -52,7 +54,7 @@ impl TreeView {
 			// isn't "loading" anymore, just broken until retried.
 			let suffix = if let Some(error) = &node.load_error {
 				Some((format!(" (Error: {error})"), Style::new().fg(Color::Red)))
-			} else if node.expanded && node.children.is_none() {
+			} else if node.loading {
 				Some((" (loading…)".to_string(), Style::new().fg(Color::DarkGray)))
 			} else {
 				None
@@ -80,10 +82,25 @@ impl TreeView {
 		});
 
 		let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-		let mut list_state = ListState::default().with_selected(Some(state.cursor)).with_offset(*state.scroll);
+		let selected = state.cursor.checked_sub(row_offset).filter(|index| *index < rows.len());
+		let mut list_state = ListState::default().with_selected(selected);
 		frame.render_stateful_widget(list, area, &mut list_state);
-		*state.scroll = list_state.offset();
 	}
+}
+
+pub(crate) fn viewport(len: usize, cursor: usize, scroll: usize, height: usize) -> std::ops::Range<usize> {
+	if len == 0 || height == 0 {
+		return 0..0;
+	}
+	let cursor = cursor.min(len - 1);
+	let max_scroll = len.saturating_sub(height);
+	let mut start = scroll.min(max_scroll);
+	if cursor < start {
+		start = cursor;
+	} else if cursor >= start + height {
+		start = cursor + 1 - height;
+	}
+	start..(start + height).min(len)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -179,4 +196,25 @@ fn truncate(text: String, width: usize) -> String {
 	}
 	out.push('…');
 	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::viewport;
+
+	#[test]
+	fn viewport_keeps_the_cursor_visible_without_formatting_the_whole_tree() {
+		assert_eq!(viewport(56_000, 0, 0, 30), 0..30);
+		assert_eq!(viewport(56_000, 29, 0, 30), 0..30);
+		assert_eq!(viewport(56_000, 30, 0, 30), 1..31);
+		assert_eq!(viewport(56_000, 55_999, 0, 30), 55_970..56_000);
+		assert_eq!(viewport(56_000, 10, 100, 30), 10..40);
+	}
+
+	#[test]
+	fn viewport_handles_empty_and_short_lists() {
+		assert_eq!(viewport(0, 0, 0, 30), 0..0);
+		assert_eq!(viewport(10, 9, 100, 30), 0..10);
+		assert_eq!(viewport(10, 0, 0, 0), 0..0);
+	}
 }

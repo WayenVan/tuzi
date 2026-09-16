@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+	collections::HashMap,
+	path::{Path, PathBuf},
+};
 
 use super::Filter;
 use crate::fs::{Cha, SortBy, sort};
@@ -8,6 +11,7 @@ pub struct Node {
 	pub cha:        Cha,
 	pub expanded:   bool,
 	pub children:   Option<Vec<Node>>,
+	pub loading:    bool,
 	/// Set when the most recent listing attempt for this node failed
 	/// (permission denied, the directory vanished, …). Unlike a toast, this
 	/// stays pinned to the node — and thus visible in the tree — until the
@@ -16,7 +20,7 @@ pub struct Node {
 }
 
 impl Node {
-	pub fn new(path: PathBuf, cha: Cha) -> Self { Self { path, cha, expanded: false, children: None, load_error: None } }
+	pub fn new(path: PathBuf, cha: Cha) -> Self { Self { path, cha, expanded: false, children: None, loading: false, load_error: None } }
 
 	/// Marks this node open immediately (so the UI reacts right away) without
 	/// touching disk. Returns whether a listing still needs to be fetched —
@@ -24,10 +28,15 @@ impl Node {
 	pub fn mark_expanded(&mut self) -> bool {
 		self.expanded = true;
 		self.load_error = None;
-		self.children.is_none()
+		let needs_fetch = self.children.is_none();
+		self.loading = needs_fetch;
+		needs_fetch
 	}
 
-	pub fn collapse(&mut self) { self.expanded = false; }
+	pub fn collapse(&mut self) {
+		self.expanded = false;
+		self.loading = false;
+	}
 
 	/// Reconciles a freshly-fetched directory listing into this node,
 	/// keeping the cached subtree (and expanded state) of any entry that's
@@ -37,15 +46,21 @@ impl Node {
 	/// listing off-thread and only calling this once it has one.
 	pub fn apply_listing(&mut self, mut entries: Vec<(PathBuf, Cha)>) {
 		self.load_error = None;
+		self.loading = false;
 		sort(&mut entries, SortBy::Name);
 
-		let mut old = self.children.take().unwrap_or_default();
+		let mut old: HashMap<_, _> = self
+			.children
+			.take()
+			.unwrap_or_default()
+			.into_iter()
+			.map(|node| (node.path.clone(), node))
+			.collect();
 		self.children = Some(
 			entries
 				.into_iter()
-				.map(|(path, cha)| match old.iter().position(|n| n.path == path) {
-					Some(i) => {
-						let mut node = old.remove(i);
+				.map(|(path, cha)| match old.remove(&path) {
+					Some(mut node) => {
 						node.cha = cha;
 						node
 					}
@@ -62,6 +77,39 @@ impl Node {
 		self.children.as_mut()?.iter_mut().find_map(|child| child.find_mut(path))
 	}
 
+	pub fn find(&self, path: &Path) -> Option<&Node> {
+		if self.path == *path {
+			return Some(self);
+		}
+		self.children.as_ref()?.iter().find_map(|child| child.find(path))
+	}
+
+	pub fn begin_incremental_listing(&mut self) -> bool {
+		if self.children.is_some() {
+			return false;
+		}
+		self.load_error = None;
+		self.loading = true;
+		self.children = Some(Vec::new());
+		true
+	}
+
+	pub fn append_listing(&mut self, entries: Vec<(PathBuf, Cha)>) {
+		self.children.get_or_insert_with(Vec::new).extend(entries.into_iter().map(|(path, cha)| Node::new(path, cha)));
+	}
+
+	pub fn finish_incremental_listing(&mut self) {
+		if let Some(children) = &mut self.children {
+			children.sort_by(|a, b| b.cha.is_dir.cmp(&a.cha.is_dir).then_with(|| a.path.file_name().cmp(&b.path.file_name())));
+		}
+		self.loading = false;
+	}
+
+	pub fn discard_incremental_listing(&mut self) {
+		self.children = None;
+		self.loading = false;
+	}
+
 	pub fn find_parent(&self, path: &Path) -> Option<&Node> {
 		let children = self.children.as_ref()?;
 		if children.iter().any(|child| child.path == *path) {
@@ -70,12 +118,28 @@ impl Node {
 		children.iter().find_map(|child| child.find_parent(path))
 	}
 
-	pub fn visible(&self, depth: usize) -> Vec<(usize, &Node)> {
-		let mut rows = vec![(depth, self)];
-		if self.expanded && let Some(children) = &self.children {
-			rows.extend(children.iter().flat_map(|child| child.visible(depth + 1)));
+	/// Walks visible nodes in display order. Returning `false` from the
+	/// visitor stops immediately, allowing cursor and viewport lookups to
+	/// avoid building (or even traversing) the rest of a large directory.
+	#[cfg(test)]
+	pub fn visit_visible<'a>(&'a self, depth: usize, visitor: &mut impl FnMut(usize, &'a Node) -> bool) -> bool {
+		if !visitor(depth, self) {
+			return false;
 		}
-		rows
+		if self.expanded && let Some(children) = &self.children {
+			for child in children {
+				if !child.visit_visible(depth + 1, visitor) {
+					return false;
+				}
+			}
+		}
+		true
+	}
+
+	pub fn has_visible_match(&self, filter: &Filter) -> bool {
+		self.path.file_name().is_some_and(|name| filter.matches(&name.to_string_lossy()))
+			|| (self.expanded
+				&& self.children.as_ref().is_some_and(|children| children.iter().any(|child| child.has_visible_match(filter))))
 	}
 
 	/// Like `visible`, but a node only appears if it matches `filter` itself
@@ -83,6 +147,7 @@ impl Node {
 	/// of just highlighting them, the way `find` does. `None` means neither,
 	/// so the caller drops this node (and, since it's never called, its
 	/// whole subtree) from the result.
+	#[cfg(test)]
 	pub fn visible_filtered<'a>(&'a self, depth: usize, filter: &Filter) -> Option<Vec<(usize, &'a Node)>> {
 		let matches = self.path.file_name().is_some_and(|name| filter.matches(&name.to_string_lossy()));
 
@@ -152,5 +217,55 @@ mod tests {
 		let filter = Filter::new("nope".into()).unwrap();
 
 		assert!(root.visible_filtered(0, &filter).is_none());
+	}
+
+	#[test]
+	fn apply_listing_preserves_cached_state_for_existing_nodes() {
+		let mut kept = dir("kept", vec![file("nested.txt")]);
+		kept.load_error = Some("old error".into());
+		let mut root = dir("root", vec![file("removed.txt"), kept]);
+
+		let mut refreshed = cha(true);
+		refreshed.len = 42;
+		root.apply_listing(vec![(PathBuf::from("new.txt"), cha(false)), (PathBuf::from("kept"), refreshed)]);
+
+		let children = root.children.as_ref().unwrap();
+		assert_eq!(children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("kept"), Path::new("new.txt")]);
+
+		let kept = &children[0];
+		assert!(kept.expanded);
+		assert_eq!(kept.cha.len, 42);
+		assert_eq!(kept.load_error.as_deref(), Some("old error"));
+		assert_eq!(kept.children.as_ref().unwrap()[0].path, Path::new("nested.txt"));
+	}
+
+	#[test]
+	fn visible_walk_stops_without_visiting_the_rest_of_a_large_directory() {
+		let root = dir("root", (0..10_000).map(|i| file(&format!("file-{i}"))).collect());
+		let mut visited = 0;
+
+		root.visit_visible(0, &mut |_, _| {
+			visited += 1;
+			visited < 3
+		});
+
+		assert_eq!(visited, 3);
+	}
+
+	#[test]
+	fn incremental_listing_is_visible_while_loading_and_sorted_when_finished() {
+		let mut root = Node::new(PathBuf::from("root"), cha(true));
+		assert!(root.mark_expanded());
+		assert!(root.loading);
+		assert!(root.begin_incremental_listing());
+
+		root.append_listing(vec![(PathBuf::from("z.txt"), cha(false))]);
+		root.append_listing(vec![(PathBuf::from("dir"), cha(true)), (PathBuf::from("a.txt"), cha(false))]);
+		assert_eq!(root.children.as_ref().unwrap().len(), 3);
+		assert!(root.loading);
+
+		root.finish_incremental_listing();
+		assert!(!root.loading);
+		assert_eq!(root.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("dir"), Path::new("a.txt"), Path::new("z.txt")]);
 	}
 }

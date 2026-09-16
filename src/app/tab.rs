@@ -1,4 +1,4 @@
-use std::{io, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
@@ -6,7 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{action::DeleteMode, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
-use super::input::{Completion, InputPurpose, InputSession};
+use super::{input::{Completion, InputPurpose, InputSession}, visible_projection::VisibleProjection};
 
 /// One tab: its own tree, cursor, selection and background workers —
 /// everything but whether the whole program should quit. The clipboard
@@ -19,6 +19,7 @@ use super::input::{Completion, InputPurpose, InputSession};
 pub struct Tab {
 	pub id:             usize,
 	pub tree:           Tree,
+	projection:         VisibleProjection,
 	pub cursor:         usize,
 	/// The tree view's scroll offset (index of its first visible row),
 	/// persisted across frames so ratatui only nudges it when the cursor
@@ -29,6 +30,7 @@ pub struct Tab {
 	pub preview:        Preview,
 	pub watcher:        Watcher,
 	pub fs_scheduler:   FsScheduler,
+	pending_listings:   HashMap<PathBuf, PendingListing>,
 	pub selection:      Selection,
 	pub visual:         Option<Visual>,
 	pub pending_delete: Option<(Vec<PathBuf>, DeleteMode)>,
@@ -51,6 +53,11 @@ struct RevealState {
 	refreshed_parent: bool,
 }
 
+enum PendingListing {
+	Incremental { ticket: u64 },
+	Buffered { ticket: u64, entries: Vec<(PathBuf, Cha)> },
+}
+
 impl Tab {
 	pub fn open(id: usize, path: PathBuf, tx: UnboundedSender<Event>) -> io::Result<Self> {
 		let mut tree = Tree::open(path)?;
@@ -66,15 +73,18 @@ impl Tab {
 			fs_scheduler.refresh(root_path);
 		}
 
+		let projection = VisibleProjection::new(&tree.root, None);
 		Ok(Self {
 			id,
 			tree,
+			projection,
 			cursor: 0,
 			scroll: 0,
 			column_mode: ColumnMode::None,
 			preview: Preview::new(id, tx.clone()),
 			watcher,
 			fs_scheduler,
+			pending_listings: HashMap::new(),
 			selection: Selection::default(),
 			visual: None,
 			pending_delete: None,
@@ -91,15 +101,35 @@ impl Tab {
 	/// The rows to draw: every row when no filter is active, otherwise only
 	/// rows that match it or have a visible descendant that does — with the
 	/// root kept regardless, so an empty result still shows where you are.
+	#[cfg(test)]
 	pub fn visible(&self) -> Vec<(usize, &Node)> {
-		match &self.filter {
-			Some(filter) => self.tree.root.visible_filtered(0, filter).unwrap_or_else(|| vec![(0, &self.tree.root)]),
-			None => self.tree.root.visible(0),
+		self.projection.range(&self.tree, 0..self.projection.len())
+	}
+
+	pub fn visible_len(&self) -> usize { self.projection.len() }
+
+	pub fn visible_at(&self, target: usize) -> Option<(usize, &Node)> { self.projection.get(&self.tree, target) }
+
+	pub fn visible_range(&self, range: std::ops::Range<usize>) -> Vec<(usize, &Node)> {
+		self.projection.range(&self.tree, range)
+	}
+
+	fn visible_position(&self, path: &Path) -> Option<usize> { self.projection.position(path) }
+
+	fn sync_projection(&mut self, path: &Path) {
+		self.projection.sync_subtree(&self.tree.root, path, self.filter.as_ref());
+	}
+
+	fn rebuild_projection(&mut self) { self.projection.rebuild(&self.tree.root, self.filter.as_ref()); }
+
+	fn cancel_listing(&mut self, path: &Path) {
+		if matches!(self.pending_listings.remove(path), Some(PendingListing::Incremental { .. })) {
+			self.tree.discard_incremental_listing(path);
 		}
 	}
 
 	pub fn move_cursor(&mut self, delta: isize) {
-		let len = self.visible().len();
+		let len = self.visible_len();
 		if len == 0 {
 			return;
 		}
@@ -118,7 +148,7 @@ impl Tab {
 	}
 
 	pub fn move_to_bottom(&mut self) {
-		let cursor = self.visible().len().saturating_sub(1);
+		let cursor = self.visible_len().saturating_sub(1);
 		if cursor != self.cursor {
 			self.cursor = cursor;
 			self.preview.target_changed();
@@ -132,6 +162,7 @@ impl Tab {
 	pub fn expand_selected(&mut self) {
 		let Some(path) = self.selected_dir() else { return };
 		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
+		self.sync_projection(&path);
 		let _ = self.watcher.watch(&path);
 		if needs_fetch {
 			self.fs_scheduler.refresh(path);
@@ -139,13 +170,15 @@ impl Tab {
 	}
 
 	pub fn toggle_expand_selected(&mut self) {
-		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
 		if !node.cha.is_dir {
 			return;
 		}
 		if node.expanded {
 			let path = node.path.clone();
+			self.cancel_listing(&path);
 			self.tree.collapse(&path);
+			self.sync_projection(&path);
 			self.watcher.unwatch(&path);
 			self.fs_scheduler.forget(&path);
 		} else {
@@ -158,19 +191,21 @@ impl Tab {
 	/// and moves the cursor there instead — pressing "collapse" always does
 	/// something visible, the way it does in most tree file managers.
 	pub fn collapse_selected(&mut self) {
-		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
 		let path = node.path.clone();
 
 		let target = if node.cha.is_dir && node.expanded { path } else { self.tree.parent_of(&path).unwrap_or(path) };
 
+		self.cancel_listing(&target);
 		self.tree.collapse(&target);
+		self.sync_projection(&target);
 		self.watcher.unwatch(&target);
 		self.fs_scheduler.forget(&target);
 		self.select(&target);
 	}
 
 	pub fn toggle_selected(&mut self) {
-		if let Some((_, node)) = self.visible().into_iter().nth(self.cursor) {
+		if let Some((_, node)) = self.visible_at(self.cursor) {
 			self.selection.toggle(node.path.clone());
 		}
 		self.move_cursor(1);
@@ -184,10 +219,9 @@ impl Tab {
 	/// once, on commit, not row-by-row as the cursor moves over it.
 	fn commit_visual(&mut self) -> bool {
 		let Some(visual) = self.visual.take() else { return false };
-		let rows = self.visible();
-		let last = rows.len().saturating_sub(1);
+		let last = self.visible_len().saturating_sub(1);
 		let (lo, hi) = visual.range(self.cursor.min(last));
-		let paths: Vec<PathBuf> = rows[lo..=hi.min(last)].iter().map(|(_, node)| node.path.clone()).collect();
+		let paths: Vec<PathBuf> = self.visible_range(lo..hi.min(last).saturating_add(1)).into_iter().map(|(_, node)| node.path.clone()).collect();
 
 		for path in paths {
 			if visual.unset {
@@ -252,7 +286,7 @@ impl Tab {
 	/// type over it. Renaming the tree's own root is refused — it would
 	/// orphan every path already cached under it.
 	pub fn start_rename(&mut self) {
-		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
 		if node.path == self.tree.root.path {
 			return;
 		}
@@ -287,17 +321,17 @@ impl Tab {
 
 	pub fn start_filter(&mut self) {
 		self.filter = None;
+		self.rebuild_projection();
 		self.input_seq += 1;
 		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Filter, ""));
 	}
 
 	pub fn find_arrow(&mut self, previous: bool, include_current: bool) {
 		let Some(finder) = &self.finder else { return };
-		let rows = self.visible();
-		if rows.is_empty() {
+		let len = self.visible_len();
+		if len == 0 {
 			return;
 		}
-		let len = rows.len();
 		let first = usize::from(!include_current);
 		let found = (first..len).find_map(|offset| {
 			let index = if previous {
@@ -305,7 +339,7 @@ impl Tab {
 			} else {
 				(self.cursor + offset) % len
 			};
-			let name = node_name(rows[index].1);
+			let name = node_name(self.visible_at(index)?.1);
 			finder.matches(&name).then_some(index)
 		});
 		if let Some(cursor) = found
@@ -428,6 +462,7 @@ impl Tab {
 		}
 		if input.is_filter() {
 			self.filter = Filter::new(input.value());
+			self.rebuild_projection();
 		}
 	}
 
@@ -446,7 +481,10 @@ impl Tab {
 					self.find_arrow(*previous, true);
 				}
 			}
-			InputPurpose::Filter => self.filter = Filter::new(value),
+			InputPurpose::Filter => {
+				self.filter = Filter::new(value);
+				self.rebuild_projection();
+			}
 			InputPurpose::Cd { base } => {
 				if value.is_empty() {
 					return;
@@ -530,7 +568,7 @@ impl Tab {
 	fn continue_reveal(&mut self) {
 		let Some(state) = &self.pending_reveal else { return };
 		let target = state.target.clone();
-		if self.visible().iter().any(|(_, node)| node.path == target) {
+		if self.visible_position(&target).is_some() {
 			self.select(&target);
 			self.pending_reveal = None;
 			self.preview.target_changed();
@@ -549,6 +587,7 @@ impl Tab {
 		for directory in ancestor_directories(&root, &parent) {
 			match self.tree.mark_expanded(&directory) {
 				Some(needs_fetch) => {
+					self.sync_projection(&directory);
 					let _ = self.watcher.watch(&directory);
 					if needs_fetch {
 						self.fs_scheduler.refresh(directory);
@@ -613,6 +652,7 @@ impl Tab {
 			return;
 		}
 		if self.filter.take().is_some() {
+			self.rebuild_projection();
 			return;
 		}
 		if self.pending_delete.take().is_some() {
@@ -630,23 +670,74 @@ impl Tab {
 		}
 	}
 
-	/// A background listing finished. `accept` first checks it's still the
-	/// most recent request for that path — a superseded one is discarded
-	/// rather than clobbering a listing a newer request already applied.
+	/// A background listing batch arrived. First loads are appended directly
+	/// so large directories become usable before their scan finishes; refreshes
+	/// keep the old listing visible and buffer batches until completion.
 	/// A failed listing (permission denied, the directory vanished, …)
 	/// collapses the node and pins the error to it (`Node::load_error`)
 	/// instead of leaving it stuck showing "(loading…)" forever — this is a
 	/// standing problem with that one directory, not a one-off toast.
-	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>) {
-		if !self.fs_scheduler.accept(&path, ticket) {
+	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>, done: bool) {
+		if !self.fs_scheduler.accept(&path, ticket, done) {
 			return;
 		}
+
+		if !done {
+			let entries = match result {
+				Ok(entries) => entries,
+				Err(_) => return,
+			};
+			if !self.pending_listings.contains_key(&path) {
+				let listing = if self.tree.begin_incremental_listing(&path) {
+					PendingListing::Incremental { ticket }
+				} else {
+					PendingListing::Buffered { ticket, entries: Vec::new() }
+				};
+				self.pending_listings.insert(path.clone(), listing);
+			}
+			match self.pending_listings.get_mut(&path) {
+				Some(PendingListing::Incremental { ticket: current }) if *current == ticket => {
+					let start = self.tree.root.find(&path).and_then(|node| node.children.as_ref()).map_or(0, Vec::len);
+					self.tree.append_listing(&path, entries);
+					self.projection.append_children(&self.tree.root, &path, start, self.filter.as_ref());
+				}
+				Some(PendingListing::Buffered { ticket: current, entries: buffered }) if *current == ticket => buffered.extend(entries),
+				_ => return,
+			}
+			self.continue_reveal();
+			self.clamp_cursor();
+			return;
+		}
+
+		let hovered = self.visible_at(self.cursor).map(|(_, node)| node.path.clone());
+		let pending = self.pending_listings.remove(&path);
 		match result {
-			Ok(entries) => {
-				self.tree.apply_listing(&path, entries);
+			Ok(_) => {
+				match pending {
+					Some(PendingListing::Incremental { ticket: current }) if current == ticket => {
+						self.tree.finish_incremental_listing(&path);
+						self.sync_projection(&path);
+					}
+					Some(PendingListing::Buffered { ticket: current, entries }) if current == ticket => {
+						self.tree.apply_listing(&path, entries);
+						self.sync_projection(&path);
+					}
+					None => {
+						self.tree.apply_listing(&path, Vec::new());
+						self.sync_projection(&path);
+					}
+					_ => return,
+				}
+				if let Some(hovered) = hovered {
+					self.select(&hovered);
+				}
 			}
 			Err(error) => {
+				if matches!(pending, Some(PendingListing::Incremental { ticket: current }) if current == ticket) {
+					self.tree.discard_incremental_listing(&path);
+				}
 				self.tree.fail_listing(&path, error.to_string());
+				self.sync_projection(&path);
 			}
 		}
 		self.continue_reveal();
@@ -675,6 +766,7 @@ impl Tab {
 
 	pub fn on_deleted(&mut self, paths: Vec<PathBuf>) {
 		for path in &paths {
+			self.cancel_listing(path);
 			self.watcher.unwatch(path);
 			self.fs_scheduler.forget(path);
 			self.selection.remove(path);
@@ -689,12 +781,12 @@ impl Tab {
 	}
 
 	fn selected_dir(&self) -> Option<PathBuf> {
-		let (_, node) = self.visible().into_iter().nth(self.cursor)?;
+		let (_, node) = self.visible_at(self.cursor)?;
 		node.cha.is_dir.then(|| node.path.clone())
 	}
 
 	fn select(&mut self, path: &Path) {
-		if let Some(i) = self.visible().iter().position(|(_, node)| node.path == *path) {
+		if let Some(i) = self.visible_position(path) {
 			self.cursor = i;
 		}
 	}
@@ -705,7 +797,7 @@ impl Tab {
 		if !self.selection.is_empty() {
 			return self.selection.iter().cloned().collect();
 		}
-		self.visible().into_iter().nth(self.cursor).map(|(_, node)| node.path.clone()).into_iter().collect()
+		self.visible_at(self.cursor).map(|(_, node)| node.path.clone()).into_iter().collect()
 	}
 
 	pub fn take_open_targets(&mut self) -> Vec<PathBuf> {
@@ -718,7 +810,7 @@ impl Tab {
 	/// the tree, not a directory to descend into. `None` when the cursor is
 	/// on the tree's own root, which has no parent to paste into.
 	fn paste_target(&self) -> Option<PathBuf> {
-		let (_, node) = self.visible().into_iter().nth(self.cursor)?;
+		let (_, node) = self.visible_at(self.cursor)?;
 		self.tree.parent_of(&node.path)
 	}
 
@@ -734,7 +826,7 @@ impl Tab {
 	}
 
 	fn clamp_cursor(&mut self) {
-		let len = self.visible().len();
+		let len = self.visible_len();
 		if self.cursor >= len {
 			self.cursor = len.saturating_sub(1);
 		}
@@ -749,7 +841,7 @@ impl Tab {
 			Some(_) => StatusMode::Select,
 			None => StatusMode::Normal,
 		};
-		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return StatusLine::empty(mode) };
+		let Some((_, node)) = self.visible_at(self.cursor) else { return StatusLine::empty(mode) };
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 		// `error` here is left for `render.rs` to fill in from the active
 		// input's own validation error, if any — `pending_notice` is a
@@ -869,15 +961,20 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let mut tab = Tab::open(0, root.to_path_buf(), tx).unwrap();
 
-		let event = rx.recv().await.unwrap();
-		apply(&mut tab, event);
+		pump(&mut tab, &mut rx).await;
 
 		(tab, rx)
 	}
 
 	async fn pump(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
-		let event = rx.recv().await.unwrap();
-		apply(tab, event);
+		loop {
+			let event = rx.recv().await.unwrap();
+			let done = !matches!(&event, Event::Loaded { done: false, .. });
+			apply(tab, event);
+			if done {
+				break;
+			}
+		}
 	}
 
 	/// A minimal stand-in for `Dispatcher::dispatch` that only understands
@@ -886,7 +983,7 @@ mod tests {
 	fn apply(tab: &mut Tab, event: Event) {
 		match event {
 			Event::Changed { path, .. } => tab.on_changed(path),
-			Event::Loaded { path, ticket, result, .. } => tab.on_loaded(path, ticket, result),
+			Event::Loaded { path, ticket, result, done, .. } => tab.on_loaded(path, ticket, result, done),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			_ => panic!("unexpected event in a single-tab test"),
 		}

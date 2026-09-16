@@ -58,7 +58,7 @@ mod tests {
 	use super::*;
 
 	fn node(path: &str, is_dir: bool, is_link: bool, expanded: bool) -> Node {
-		Node { path: PathBuf::from(path), cha: Cha { len: 0, is_dir, is_link, modified: None, mode: 0 }, expanded, children: None, load_error: None }
+		Node { path: PathBuf::from(path), cha: Cha { len: 0, is_dir, is_link, modified: None, mode: 0 }, expanded, children: None, loading: false, load_error: None }
 	}
 
 	#[test]

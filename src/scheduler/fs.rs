@@ -4,6 +4,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{event::Event, fs::Engine};
 
+const LISTING_BATCH_SIZE: usize = 512;
+
 #[derive(Default)]
 struct Entry {
 	busy:  Option<u64>,
@@ -42,15 +44,27 @@ impl FsScheduler {
 		let tx = self.tx.clone();
 		let target = path.clone();
 		tokio::spawn(async move {
-			let result = tokio::task::spawn_blocking(move || engine.read_dir(&target)).await.expect("read_dir task panicked");
-			let _ = tx.send(Event::Loaded { tab, path, ticket, result });
+			let chunk_tx = tx.clone();
+			let chunk_path = path.clone();
+			let result = tokio::task::spawn_blocking(move || {
+				engine.read_dir_batches(&target, LISTING_BATCH_SIZE, &mut |entries| {
+					chunk_tx.send(Event::Loaded { tab, path: chunk_path.clone(), ticket, result: Ok(entries), done: false }).is_ok()
+				})
+			})
+			.await
+			.unwrap_or_else(|error| Err(std::io::Error::other(error)))
+			.map(|()| Vec::new());
+			let _ = tx.send(Event::Loaded { tab, path, ticket, result, done: true });
 		});
 	}
 
-	pub fn accept(&mut self, path: &Path, ticket: u64) -> bool {
+	pub fn accept(&mut self, path: &Path, ticket: u64, done: bool) -> bool {
 		let Some(entry) = self.entries.get_mut(path) else { return false };
 		if entry.busy != Some(ticket) {
 			return false;
+		}
+		if !done {
+			return true;
 		}
 		entry.busy = None;
 		if std::mem::take(&mut entry.dirty) {
@@ -88,5 +102,76 @@ impl FsScheduler {
 			.unwrap_or_else(|error| Err(std::io::Error::other(error)));
 			let _ = tx.send(Event::Created { tab, base: task_base, value, target, result });
 		});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+
+	use super::*;
+	use crate::fs::Cha;
+
+	struct CountingEngine(AtomicUsize);
+
+	impl Engine for CountingEngine {
+		fn read_dir(&self, _path: &Path) -> std::io::Result<Vec<(PathBuf, Cha)>> {
+			self.0.fetch_add(1, Ordering::Relaxed);
+			Ok(Vec::new())
+		}
+	}
+
+	struct LargeEngine;
+
+	impl Engine for LargeEngine {
+		fn read_dir(&self, path: &Path) -> std::io::Result<Vec<(PathBuf, Cha)>> {
+			Ok((0..1_200)
+				.map(|index| (path.join(format!("file-{index}")), Cha { len: 0, is_dir: false, is_link: false, modified: None, mode: 0 }))
+				.collect())
+		}
+	}
+
+	#[tokio::test]
+	async fn large_listings_arrive_in_bounded_batches_before_done() {
+		let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+		let mut scheduler = FsScheduler::new(2, tx, Arc::new(LargeEngine));
+		let path = PathBuf::from("large-directory");
+		scheduler.refresh(path.clone());
+
+		let mut sizes = Vec::new();
+		loop {
+			let Event::Loaded { ticket, result, done, .. } = rx.recv().await.unwrap() else { panic!("expected listing") };
+			assert!(scheduler.accept(&path, ticket, done));
+			if done {
+				assert!(result.is_ok());
+				break;
+			}
+			sizes.push(result.unwrap().len());
+		}
+
+		assert_eq!(sizes, [512, 512, 176]);
+	}
+
+	#[tokio::test]
+	async fn changes_while_busy_collapse_into_one_follow_up_refresh() {
+		let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+		let engine = Arc::new(CountingEngine(AtomicUsize::new(0)));
+		let mut scheduler = FsScheduler::new(4, tx, engine.clone());
+		let path = PathBuf::from("busy-directory");
+
+		scheduler.refresh(path.clone());
+		for _ in 0..5 {
+			scheduler.refresh(path.clone());
+		}
+
+		let first = rx.recv().await.unwrap();
+		let Event::Loaded { ticket, .. } = first else { panic!("expected listing") };
+		assert!(scheduler.accept(&path, ticket, true));
+
+		let second = rx.recv().await.unwrap();
+		let Event::Loaded { ticket, .. } = second else { panic!("expected follow-up listing") };
+		assert!(scheduler.accept(&path, ticket, true));
+		assert_eq!(engine.0.load(Ordering::Relaxed), 2);
+		assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
 	}
 }

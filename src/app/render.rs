@@ -35,7 +35,7 @@ impl App {
 		// Input is temporarily moved out because visible rows borrow the tree,
 		// while edtui needs mutable access to the input state during rendering.
 		let mut input = tab.input.take();
-		let rows = tab.visible();
+		let visible_len = tab.visible_len();
 		let mut status = tab.status_line();
 		if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
 			status.error = Some(error.clone());
@@ -44,7 +44,8 @@ impl App {
 		let mut scroll = tab.scroll;
 		let preview_visible = tab.preview.visible;
 		let pending_delete = tab.pending_delete.clone();
-		let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
+		let selected_node = tab.visible_at(tab.cursor).map(|(_, node)| node);
+		let preview_target = selected_node.map(PreviewTarget::from_node);
 		let finder_query = tab.finder.as_ref().map(|finder| finder.query());
 		let filter_query = tab.filter.as_ref().map(|filter| filter.query());
 		let task_visible = self.tasks.visible;
@@ -85,6 +86,8 @@ impl App {
 				(body_area, None)
 			};
 			tree_rows.set(tree_area.height as usize);
+			let range = crate::tui::widgets::viewport(visible_len, tab.cursor, scroll, tree_area.height as usize);
+			let rows = tab.visible_range(range.clone());
 
 			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query });
 			TabBar::render(frame, tab_area, &labels);
@@ -92,6 +95,7 @@ impl App {
 				frame,
 				tree_area,
 				&rows,
+				range.start,
 				TreeViewState {
 					cursor: tab.cursor,
 					selection: &tab.selection,
@@ -107,7 +111,7 @@ impl App {
 			);
 			if let Some(area) = preview_area {
 				preview_size.set((area.width.saturating_sub(1), area.height));
-				PreviewView::render(frame, area, rows.get(tab.cursor).map(|(_, node)| *node), &tab.preview.state, tab.preview.skip);
+				PreviewView::render(frame, area, selected_node, &tab.preview.state, tab.preview.skip);
 			}
 			StatusBar::render(frame, status_area, &status_left, &status_right);
 			WhichPopup::render(frame, frame.area(), &which);
