@@ -1,38 +1,32 @@
-use crate::event::Event;
+use crate::{action::{Action, InputKind}, event::Event};
 
 use super::App;
 
 pub struct Dispatcher;
 
 impl Dispatcher {
-	pub fn dispatch(app: &mut App, event: Event) {
+	pub fn dispatch(app: &mut App, action: Action) {
+		match action {
+			Action::Quit => app.quit = true,
+			Action::Escape => app.active_tab_mut().escape(),
+			Action::MoveCursor(delta) => app.active_tab_mut().move_cursor(delta),
+			Action::Expand => app.active_tab_mut().expand_selected(),
+			Action::Collapse => app.active_tab_mut().collapse_selected(),
+			Action::ToggleSelect => app.active_tab_mut().toggle_selected(),
+			Action::VisualSelect { unset } => app.active_tab_mut().enter_visual(unset),
+			Action::Delete => app.active_tab_mut().delete_selected(),
+			Action::Yank => app.active_tab_mut().yank_selected(),
+			Action::Paste => app.active_tab_mut().paste(),
+			Action::OpenInput(InputKind::Rename) => app.active_tab_mut().start_rename(),
+			Action::OpenInput(InputKind::Cd) => app.active_tab_mut().start_cd(),
+			Action::NewTab => app.new_tab(),
+			Action::CloseTab => app.close_tab(),
+			Action::SwitchTab(delta) => app.switch_tab(delta),
+		}
+	}
+
+	pub fn dispatch_event(app: &mut App, event: Event) {
 		match event {
-			Event::Quit => app.quit = true,
-			Event::TabNew => app.new_tab(),
-			Event::TabClose => app.close_tab(),
-			Event::TabNext => app.next_tab(),
-			Event::TabPrev => app.prev_tab(),
-
-			// Keyboard-driven actions always act on whichever tab is
-			// currently on screen.
-			Event::MoveDown => app.active_tab_mut().move_cursor(1),
-			Event::MoveUp => app.active_tab_mut().move_cursor(-1),
-			Event::Expand => app.active_tab_mut().expand_selected(),
-			Event::Collapse => app.active_tab_mut().collapse_selected(),
-			Event::ToggleSelect => app.active_tab_mut().toggle_selected(),
-			Event::VisualSelect => app.active_tab_mut().enter_visual(false),
-			Event::VisualUnset => app.active_tab_mut().enter_visual(true),
-			Event::Delete => app.active_tab_mut().delete_selected(),
-			Event::Yank => app.active_tab_mut().yank_selected(),
-			Event::Paste => app.active_tab_mut().paste(),
-			Event::Escape => app.active_tab_mut().escape(),
-			Event::Rename => app.active_tab_mut().start_rename(),
-			Event::CdInteractive => app.active_tab_mut().start_cd(),
-			Event::InputKey(key) => app.active_tab_mut().handle_input_key(key),
-
-			// Background events carry the id of the tab that requested
-			// them, which may not be the active one — and may not even
-			// exist anymore, if that tab was closed in the meantime.
 			Event::Changed { tab, path } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
@@ -58,10 +52,6 @@ impl Dispatcher {
 					t.on_completion_loaded(input, revision, result);
 				}
 			}
-
-			// Translated into a logical event by App::serve()'s loop before
-			// it ever reaches here; kept as a no-op so the match stays
-			// exhaustive if that ever changes.
 			Event::Term(_) => {}
 		}
 	}

@@ -1,9 +1,11 @@
+mod action;
 mod actor;
 mod app;
 mod config;
 mod core;
 mod event;
 mod fs;
+mod keymap;
 mod runner;
 mod scheduler;
 mod tui;

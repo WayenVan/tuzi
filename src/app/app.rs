@@ -5,9 +5,9 @@ use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView}}};
+use crate::{event::Event, keymap::{Key, KeyContext, Route, Router}, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView}}};
 
-use super::{Dispatcher, Router, Tab};
+use super::{Dispatcher, Tab};
 
 pub struct App {
 	pub tabs:    Vec<Tab>,
@@ -39,7 +39,7 @@ impl App {
 		let mut term = Raterm::start()?;
 		let mut router = Router::default();
 
-		let draw = |app: &mut App, term: &mut Raterm| -> io::Result<()> {
+		let draw = |app: &mut App, term: &mut Raterm, key_hint: &str| -> io::Result<()> {
 			// Collected as owned strings *before* grabbing the active tab
 			// mutably below — otherwise the tab bar's shared borrow of
 			// every tab and the active tab's exclusive borrow (needed for
@@ -64,7 +64,7 @@ impl App {
 			let mut input = tab.input.take();
 
 			let rows = tab.visible();
-			let (mut status, mut warn) = tab.status_line();
+			let (mut status, mut warn) = tab.status_line(key_hint);
 			if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
 				status = error.clone();
 				warn = true;
@@ -105,28 +105,30 @@ impl App {
 			Ok(())
 		};
 
-		draw(&mut app, &mut term)?;
+		draw(&mut app, &mut term, router.hint())?;
 		while let Some(event) = rx.recv().await {
-			let event = match event {
+			match event {
 				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
 					if app.active_tab().input.is_some() {
-						Event::InputKey(key)
+						app.active_tab_mut().handle_input_key(key);
 					} else {
-						match router.route(key.code) {
-							Some(event) => event,
-							None => continue,
+						match router.route(KeyContext::Manager, Key::from(key)) {
+							Route::Actions(actions) => {
+								for action in actions {
+									Dispatcher::dispatch(&mut app, action);
+								}
+							}
+							Route::Pending | Route::Unmatched => continue,
 						}
 					}
 				}
 				Event::Term(_) => continue,
-				event => event,
-			};
-
-			Dispatcher::dispatch(&mut app, event);
+				event => Dispatcher::dispatch_event(&mut app, event),
+			}
 			if app.quit {
 				break;
 			}
-			draw(&mut app, &mut term)?;
+			draw(&mut app, &mut term, router.hint())?;
 		}
 
 		Ok(())
@@ -169,14 +171,10 @@ impl App {
 		self.active = self.tabs[pos.min(self.tabs.len() - 1)].id;
 	}
 
-	pub fn next_tab(&mut self) {
+	pub fn switch_tab(&mut self, delta: isize) {
 		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else { return };
-		self.active = self.tabs[(pos + 1) % self.tabs.len()].id;
-	}
-
-	pub fn prev_tab(&mut self) {
-		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else { return };
-		self.active = self.tabs[(pos + self.tabs.len() - 1) % self.tabs.len()].id;
+		let next = (pos as isize + delta).rem_euclid(self.tabs.len() as isize) as usize;
+		self.active = self.tabs[next].id;
 	}
 }
 
@@ -193,7 +191,7 @@ mod tests {
 
 		// drain the root tab's initial listing so it's got visible rows
 		let event = rx.recv().await.unwrap();
-		Dispatcher::dispatch(&mut app, event);
+		Dispatcher::dispatch_event(&mut app, event);
 
 		(app, rx)
 	}
@@ -246,7 +244,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn next_and_prev_tab_wrap_around() {
+	async fn relative_tab_switch_wraps_around() {
 		let root = std::env::temp_dir().join("tuzi-app-test-cycletab");
 		fs::create_dir_all(&root).unwrap();
 		let root = root.canonicalize().unwrap();
@@ -256,14 +254,14 @@ mod tests {
 		app.new_tab(); // 2
 		app.active = 0;
 
-		app.next_tab();
+		app.switch_tab(1);
 		assert_eq!(app.active, 1);
-		app.next_tab();
+		app.switch_tab(1);
 		assert_eq!(app.active, 2);
-		app.next_tab();
+		app.switch_tab(1);
 		assert_eq!(app.active, 0, "wraps back to the first");
 
-		app.prev_tab();
+		app.switch_tab(-1);
 		assert_eq!(app.active, 2, "wraps the other way too");
 
 		fs::remove_dir_all(&root).unwrap();
@@ -285,7 +283,7 @@ mod tests {
 		// get received ahead of) the event this test cares about.
 		let event = rx.recv().await.unwrap();
 		assert!(matches!(event, Event::Loaded { tab: 1, .. }), "tab 1's own startup load");
-		Dispatcher::dispatch(&mut app, event);
+		Dispatcher::dispatch_event(&mut app, event);
 
 		// Expand a directory on the *inactive* tab 0 and route the
 		// resulting Loaded event straight through Dispatcher, the way the
@@ -303,7 +301,7 @@ mod tests {
 		};
 		assert_eq!(tab, 0, "tagged with the tab that asked for it, not whichever tab is active");
 
-		Dispatcher::dispatch(&mut app, event);
+		Dispatcher::dispatch_event(&mut app, event);
 		assert_eq!(app.active, 1, "dispatching a background event never changes which tab is active");
 		assert!(app.tab_mut(0).unwrap().tree.is_loaded(&root.join("a")), "but it still lands on the tab it was meant for");
 

@@ -458,7 +458,7 @@ impl Tab {
 		}
 	}
 
-	pub fn status_line(&self) -> (String, bool) {
+	pub fn status_line(&self, key_hint: &str) -> (String, bool) {
 		if let Some(visual) = self.visual {
 			let label = if visual.unset { "VISUAL UNSET" } else { "VISUAL SELECT" };
 			return (format!("-- {label} -- move to extend, Esc to apply"), true);
@@ -472,7 +472,7 @@ impl Tab {
 		if !self.clipboard.is_empty() {
 			return (format!("{} in clipboard — p to paste", self.clipboard.len()), false);
 		}
-		("j/k move  h/l collapse/expand  space select  y/p yank/paste  d delete  r rename  g<space> cd  tt new tab  [/] switch tab  w close tab  q quit".to_owned(), false)
+		(key_hint.to_owned(), false)
 	}
 }
 
