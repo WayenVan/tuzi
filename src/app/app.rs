@@ -5,7 +5,7 @@ use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, tui::{Raterm, widgets::{Prompt, StatusBar, TabBar, TreeView}}};
+use crate::{event::Event, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView}}};
 
 use super::{Dispatcher, Router, Tab};
 
@@ -22,7 +22,7 @@ impl App {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 
 		// Raw terminal events are wrapped, not translated, here — the
-		// background thread doesn't know whether a rename prompt is open,
+		// background thread doesn't know whether an input prompt is open,
 		// so the split between tree keymap and raw-key-to-edtui only
 		// happens once the event reaches the main loop below.
 		let input_tx = tx.clone();
@@ -43,7 +43,7 @@ impl App {
 			// Collected as owned strings *before* grabbing the active tab
 			// mutably below — otherwise the tab bar's shared borrow of
 			// every tab and the active tab's exclusive borrow (needed for
-			// the rename take/put-back trick) would overlap.
+			// the input take/put-back trick) would overlap.
 			let labels: Vec<(bool, String)> = app
 				.tabs
 				.iter()
@@ -59,12 +59,16 @@ impl App {
 			// overlap, for the borrow checker's purposes, with the `&Node`s
 			// `tab.visible()` lends out below — both ultimately borrow from
 			// `tab` through `&self` methods, which erases field-level
-			// disjointness even though `rename` and `tree` never actually
+			// disjointness even though `input` and `tree` never actually
 			// touch each other.
-			let mut rename = tab.rename.take();
+			let mut input = tab.input.take();
 
 			let rows = tab.visible();
-			let (status, warn) = tab.status_line();
+			let (mut status, mut warn) = tab.status_line();
+			if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
+				status = error.clone();
+				warn = true;
+			}
 			let visual = tab.visual_range();
 			term.terminal.draw(|frame| {
 				let [tab_area, tree_area, status_area] = Layout::default()
@@ -76,8 +80,12 @@ impl App {
 				TreeView::render(frame, tree_area, &rows, tab.cursor, &tab.selection, visual);
 				StatusBar::render(frame, status_area, &status, warn);
 
-				if let Some(rename) = &mut rename {
-					let (x, y) = Prompt::render(frame, frame.area(), "Rename", &mut rename.state);
+				if let Some(input) = &mut input {
+					let title = input.title();
+					let (x, y, rect) = Prompt::render(frame, frame.area(), title, &mut input.state);
+					if let Some(cmp) = &input.completion {
+						CompletionPopup::render(frame, frame.area(), rect, &cmp.candidates, cmp.selected);
+					}
 					frame.set_cursor_position((x, y));
 				}
 			})?;
@@ -87,13 +95,13 @@ impl App {
 			// flushed so it doesn't get interleaved with them. A bar in
 			// Insert mirrors vim's editing feel; a block otherwise (Normal,
 			// Visual, edtui's Search) makes clear you're issuing commands.
-			if let Some(rename) = &rename {
+			if let Some(input) = &input {
 				use crossterm::cursor::SetCursorStyle;
-				let style = if rename.state.mode == EditorMode::Insert { SetCursorStyle::SteadyBar } else { SetCursorStyle::SteadyBlock };
+				let style = if input.state.mode == EditorMode::Insert { SetCursorStyle::SteadyBar } else { SetCursorStyle::SteadyBlock };
 				crossterm::execute!(io::stdout(), style)?;
 			}
 
-			app.active_tab_mut().rename = rename;
+			app.active_tab_mut().input = input;
 			Ok(())
 		};
 
@@ -101,8 +109,8 @@ impl App {
 		while let Some(event) = rx.recv().await {
 			let event = match event {
 				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
-					if app.active_tab().rename.is_some() {
-						Event::RenameKey(key)
+					if app.active_tab().input.is_some() {
+						Event::InputKey(key)
 					} else {
 						match router.route(key.code) {
 							Some(event) => event,

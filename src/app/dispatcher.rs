@@ -27,7 +27,8 @@ impl Dispatcher {
 			Event::Paste => app.active_tab_mut().paste(),
 			Event::Escape => app.active_tab_mut().escape(),
 			Event::Rename => app.active_tab_mut().start_rename(),
-			Event::RenameKey(key) => app.active_tab_mut().handle_rename_key(key),
+			Event::CdInteractive => app.active_tab_mut().start_cd(),
+			Event::InputKey(key) => app.active_tab_mut().handle_input_key(key),
 
 			// Background events carry the id of the tab that requested
 			// them, which may not be the active one — and may not even
@@ -50,6 +51,11 @@ impl Dispatcher {
 			Event::Pasted { tab, target } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_pasted(target);
+				}
+			}
+			Event::CompletionLoaded { tab, input, revision, result } => {
+				if let Some(t) = app.tab_mut(tab) {
+					t.on_completion_loaded(input, revision, result);
 				}
 			}
 

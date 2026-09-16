@@ -2,7 +2,7 @@ use crossterm::event::KeyCode;
 
 use crate::event::Event;
 
-/// Tree-navigation keymap — while a rename prompt is open, `App::serve()`'s
+/// Tree-navigation keymap — while an input prompt is open, `App::serve()`'s
 /// loop hands raw key events to edtui directly instead of calling this at
 /// all. Press-vs-release filtering and key extraction happen once, at that
 /// same call site, rather than here.
@@ -21,6 +21,7 @@ impl Router {
 		if let Some(leader) = self.pending.take() {
 			return match (leader, code) {
 				('t', KeyCode::Char('t')) => Some(Event::TabNew),
+				('g', KeyCode::Char(' ')) => Some(Event::CdInteractive),
 				_ => None,
 			};
 		}
@@ -44,6 +45,10 @@ impl Router {
 			KeyCode::Char('[') => Event::TabPrev,
 			KeyCode::Char('t') => {
 				self.pending = Some('t');
+				return None;
+			}
+			KeyCode::Char('g') => {
+				self.pending = Some('g');
 				return None;
 			}
 			_ => return None,
@@ -80,5 +85,12 @@ mod tests {
 		assert!(matches!(router.route(KeyCode::Char(']')), Some(Event::TabNext)));
 		assert!(router.route(KeyCode::Tab).is_none());
 		assert!(router.route(KeyCode::BackTab).is_none());
+	}
+
+	#[test]
+	fn g_space_opens_interactive_cd() {
+		let mut router = Router::default();
+		assert!(router.route(KeyCode::Char('g')).is_none());
+		assert!(matches!(router.route(KeyCode::Char(' ')), Some(Event::CdInteractive)));
 	}
 }

@@ -18,7 +18,8 @@ pub enum Event {
 	Escape,
 
 	Rename,
-	RenameKey(crossterm::event::KeyEvent),
+	CdInteractive,
+	InputKey(crossterm::event::KeyEvent),
 
 	TabNew,
 	TabClose,
@@ -29,5 +30,6 @@ pub enum Event {
 	Loaded { tab: usize, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>> },
 	Deleted { tab: usize, paths: Vec<PathBuf> },
 	Pasted { tab: usize, target: PathBuf },
+	CompletionLoaded { tab: usize, input: u64, revision: u64, result: io::Result<Vec<String>> },
 	Quit,
 }

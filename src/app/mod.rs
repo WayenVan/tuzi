@@ -1,5 +1,6 @@
 mod app;
 mod dispatcher;
+mod input;
 mod router;
 mod tab;
 

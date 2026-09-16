@@ -1,20 +1,12 @@
-use std::{io, path::{Path, PathBuf}, sync::Arc};
+use std::{io, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
+use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{core::{Node, Selection, Tree, Visual}, event::Event, fs::{Cha, Engine, LocalEngine}, scheduler::Scheduler, watcher::Watcher};
 
-/// An open rename prompt: which path it targets, edtui's own buffer/cursor/
-/// mode state, and a per-session key handler (fresh each time, so a
-/// half-finished `d`-then-motion sequence from a previous rename can never
-/// bleed into the next one).
-pub(super) struct Rename {
-	target:            PathBuf,
-	pub(super) state:  EditorState,
-	handler:           EditorEventHandler,
-}
+use super::input::{Completion, InputPurpose, InputSession};
 
 /// One tab: its own tree, cursor, selection, clipboard and background
 /// workers — everything but whether the whole program should quit. `id` is
@@ -32,7 +24,9 @@ pub struct Tab {
 	pub visual:         Option<Visual>,
 	pub clipboard:      Vec<PathBuf>,
 	pub pending_delete: Option<Vec<PathBuf>>,
-	pub(super) rename:  Option<Rename>,
+	pub(super) input:   Option<InputSession>,
+	input_seq:          u64,
+	tx:                 UnboundedSender<Event>,
 }
 
 impl Tab {
@@ -45,7 +39,7 @@ impl Tab {
 		watcher.watch(&root_path)?;
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
-		let mut scheduler = Scheduler::new(id, tx, engine);
+		let mut scheduler = Scheduler::new(id, tx.clone(), engine);
 		if needs_fetch {
 			scheduler.refresh(root_path);
 		}
@@ -60,7 +54,9 @@ impl Tab {
 			visual: None,
 			clipboard: Vec::new(),
 			pending_delete: None,
-			rename: None,
+			input: None,
+			input_seq: 0,
+			tx,
 		})
 	}
 
@@ -183,30 +179,69 @@ impl Tab {
 		if node.path == self.tree.root.path {
 			return;
 		}
+		let target = node.path.clone();
 		let name = node.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
-		let mut state = EditorState::new(Lines::from(name.as_str()));
-		state.set_single_line(true);
-		state.mode = EditorMode::Insert;
-		state.cursor = Index2::new(0, name.chars().count());
-
-		self.rename = Some(Rename { target: node.path.clone(), state, handler: EditorEventHandler::vim_mode() });
+		self.input_seq += 1;
+		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Rename { target }, &name));
 	}
 
-	/// Enter confirms; Esc from edtui's own Normal mode closes the prompt
-	/// (Esc from Insert/Visual is forwarded instead, so edtui can drop it
-	/// to Normal itself, vim-style); everything else is handed straight to
-	/// edtui's own vim-modal key handler.
-	pub fn handle_rename_key(&mut self, key: KeyEvent) {
-		match key.code {
-			KeyCode::Enter => self.confirm_rename(),
-			KeyCode::Esc => {
-				let Some(rename) = &mut self.rename else { return };
-				if rename.state.mode != EditorMode::Normal {
-					rename.handler.on_key_event(key, &mut rename.state);
+	pub fn start_cd(&mut self) {
+		self.input_seq += 1;
+		let mut input = InputSession::new(self.input_seq, InputPurpose::Cd { base: self.tree.root.path.clone() }, "");
+		self.schedule_completion(&mut input);
+		self.input = Some(input);
+	}
+
+	/// Handles the common vim input used by rename and interactive cd.
+	pub fn handle_input_key(&mut self, key: KeyEvent) {
+		let Some(mut input) = self.input.take() else { return };
+
+		if input.is_cd() && input.completion.is_some() {
+			match key.code {
+				KeyCode::Up => {
+					input.move_completion(-1);
+					self.input = Some(input);
 					return;
 				}
-				self.rename = None;
+				KeyCode::Down => {
+					input.move_completion(1);
+					self.input = Some(input);
+					return;
+				}
+				KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+					input.move_completion(-1);
+					self.input = Some(input);
+					return;
+				}
+				KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+					input.move_completion(1);
+					self.input = Some(input);
+					return;
+				}
+				KeyCode::Tab => {
+					if input.complete_selected() {
+						self.schedule_completion(&mut input);
+					}
+					self.input = Some(input);
+					return;
+				}
+				_ => {}
+			}
+		}
+
+		match key.code {
+			KeyCode::Enter => {
+				if input.is_cd() {
+					input.complete_selected();
+				}
+				self.submit_input(input);
+			}
+			KeyCode::Esc => {
+				if input.state.mode != EditorMode::Normal {
+					input.handler.on_key_event(key, &mut input.state);
+					self.input = Some(input);
+				}
 			}
 			// edtui's vim_mode doesn't bind `C` (vim's "change to end of
 			// line") at all — synthesize it from what it does have: `D`
@@ -214,9 +249,8 @@ impl Tab {
 			// appending right where the cut happened. Only in Normal mode;
 			// typing a literal capital C elsewhere goes through untouched.
 			KeyCode::Char('C') => {
-				let Some(rename) = &mut self.rename else { return };
-				if rename.state.mode != EditorMode::Normal {
-					rename.handler.on_key_event(key, &mut rename.state);
+				if input.state.mode != EditorMode::Normal {
+					self.forward_input_key(input, key);
 					return;
 				}
 				// edtui's own uppercase-letter bindings (like this `D`) key
@@ -225,42 +259,113 @@ impl Tab {
 				// capitalized char with the modifier bit left unset, so it
 				// has to be set explicitly here rather than forwarded from
 				// whatever `key.modifiers` the incoming `C` carried.
-				rename.handler.on_key_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), &mut rename.state);
+				input.handler.on_key_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), &mut input.state);
 				// `D` leaves the Normal-mode cursor sitting *on* whatever's
 				// now the last character (or col 0, on an emptied line) —
 				// vim's `C` instead appends *after* it, so nudge to the
 				// line's current length rather than just flipping the mode.
-				rename.state.cursor.col = rename.state.lines.len_col(rename.state.cursor.row).unwrap_or(0);
-				rename.state.mode = EditorMode::Insert;
+				input.state.cursor.col = input.state.lines.len_col(input.state.cursor.row).unwrap_or(0);
+				input.state.mode = EditorMode::Insert;
+				if input.is_cd() {
+					self.schedule_completion(&mut input);
+				}
+				self.input = Some(input);
 			}
-			_ => {
-				let Some(rename) = &mut self.rename else { return };
-				rename.handler.on_key_event(key, &mut rename.state);
+			_ => self.forward_input_key(input, key),
+		}
+	}
+
+	fn forward_input_key(&mut self, mut input: InputSession, key: KeyEvent) {
+		let before = (input.value(), input.state.cursor.col);
+		input.handler.on_key_event(key, &mut input.state);
+		input.error = None;
+		if input.is_cd() && before != (input.value(), input.state.cursor.col) {
+			self.schedule_completion(&mut input);
+		}
+		self.input = Some(input);
+	}
+
+	fn submit_input(&mut self, mut input: InputSession) {
+		let value = input.value();
+		match &input.purpose {
+			InputPurpose::Rename { target } => self.confirm_rename(target.clone(), value),
+			InputPurpose::Cd { base } => {
+				if value.is_empty() {
+					return;
+				}
+				match resolve_path(base, &value).and_then(|path| self.change_root(path)) {
+					Ok(()) => {}
+					Err(err) => {
+						input.error = Some(err.to_string());
+						self.input = Some(input);
+					}
+				}
 			}
 		}
 	}
 
-	pub fn confirm_rename(&mut self) {
-		let Some(rename) = self.rename.take() else { return };
-		let name: String = rename.state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect();
-		let Some(parent) = rename.target.parent() else { return };
+	fn confirm_rename(&mut self, target: PathBuf, name: String) {
+		let Some(parent) = target.parent() else { return };
 		let dest = parent.join(&name);
-		if name.is_empty() || dest == rename.target || std::fs::rename(&rename.target, &dest).is_err() {
+		if name.is_empty() || dest == target || std::fs::rename(&target, &dest).is_err() {
 			return;
 		}
 
-		self.watcher.unwatch(&rename.target);
-		self.scheduler.forget(&rename.target);
-		self.selection.remove(&rename.target);
+		self.watcher.unwatch(&target);
+		self.scheduler.forget(&target);
+		self.selection.remove(&target);
 		if self.tree.is_loaded(parent) {
 			self.scheduler.refresh(parent.to_path_buf());
 		}
 	}
 
+	fn change_root(&mut self, path: PathBuf) -> io::Result<()> {
+		if path == self.tree.root.path {
+			return Ok(());
+		}
+		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
+		replacement.clipboard = std::mem::take(&mut self.clipboard);
+		replacement.input_seq = self.input_seq;
+		*self = replacement;
+		Ok(())
+	}
+
+	fn schedule_completion(&self, input: &mut InputSession) {
+		let InputPurpose::Cd { base } = &input.purpose else { return };
+		if let Some(task) = input.completion_task.take() {
+			task.abort();
+		}
+		input.revision += 1;
+		input.completion = None;
+		let tab = self.id;
+		let input_id = input.id;
+		let revision = input.revision;
+		let base = base.clone();
+		let value = input.value();
+		let cursor = input.state.cursor.col;
+		let tx = self.tx.clone();
+		input.completion_task = Some(tokio::spawn(async move {
+			tokio::time::sleep(Duration::from_millis(50)).await;
+			let result = tokio::task::spawn_blocking(move || complete_directories(&base, &value, cursor))
+				.await
+				.unwrap_or_else(|err| Err(io::Error::other(err)));
+			let _ = tx.send(Event::CompletionLoaded { tab, input: input_id, revision, result });
+		}));
+	}
+
+	pub fn on_completion_loaded(&mut self, input_id: u64, revision: u64, result: io::Result<Vec<String>>) {
+		let Some(input) = &mut self.input else { return };
+		if input.id != input_id || input.revision != revision {
+			return;
+		}
+		input.completion_task.take();
+		input.completion = result.ok().filter(|items| !items.is_empty()).map(|candidates| Completion { candidates, selected: 0 });
+	}
+
 	/// Esc cancels whatever's most "in progress": an open visual selection
 	/// (committing it), then an armed delete, then the selection. Reaching
-	/// here at all means no rename prompt was open — while one is, Esc
-	/// routes to `handle_rename_key` instead.
+	/// here at all means no input prompt was open — while one is, Esc
+	/// routes to `handle_input_key` instead.
 	pub fn escape(&mut self) {
 		if self.commit_visual() {
 			return;
@@ -367,8 +472,65 @@ impl Tab {
 		if !self.clipboard.is_empty() {
 			return (format!("{} in clipboard — p to paste", self.clipboard.len()), false);
 		}
-		("j/k move  h/l collapse/expand  space select  y/p yank/paste  d delete  r rename  tt new tab  [/] switch tab  w close tab  q quit".to_owned(), false)
+		("j/k move  h/l collapse/expand  space select  y/p yank/paste  d delete  r rename  g<space> cd  tt new tab  [/] switch tab  w close tab  q quit".to_owned(), false)
 	}
+}
+
+fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
+	let raw = if value == "~" {
+		home_dir()?
+	} else if let Some(rest) = value.strip_prefix("~/") {
+		home_dir()?.join(rest)
+	} else {
+		let path = PathBuf::from(value);
+		if path.is_absolute() { path } else { base.join(path) }
+	};
+	let path = raw.canonicalize()?;
+	if !path.is_dir() {
+		return Err(io::Error::new(io::ErrorKind::InvalidInput, "path is not a directory"));
+	}
+	Ok(path)
+}
+
+fn home_dir() -> io::Result<PathBuf> {
+	std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+fn complete_directories(base: &Path, value: &str, cursor: usize) -> io::Result<Vec<String>> {
+	let before: String = value.chars().take(cursor).collect();
+	let split = before.char_indices().rev().find(|(_, c)| *c == '/' || *c == '\\').map(|(i, _)| i + 1).unwrap_or(0);
+	let (parent_text, word) = before.split_at(split);
+	let parent = if parent_text == "~/" {
+		home_dir()?
+	} else if let Some(rest) = parent_text.strip_prefix("~/") {
+		home_dir()?.join(rest)
+	} else {
+		let path = PathBuf::from(parent_text);
+		if path.is_absolute() { path } else { base.join(path) }
+	};
+
+	let smart = !word.bytes().any(|b| b.is_ascii_uppercase());
+	let needle = if smart { word.to_ascii_lowercase() } else { word.to_owned() };
+	let mut exact = Vec::new();
+	let mut fuzzy = Vec::new();
+	for entry in std::fs::read_dir(parent)? {
+		let entry = entry?;
+		if !entry.file_type()?.is_dir() {
+			continue;
+		}
+		let name = entry.file_name().to_string_lossy().into_owned();
+		let candidate = if smart { name.to_ascii_lowercase() } else { name.clone() };
+		if candidate.starts_with(&needle) {
+			exact.push(name);
+		} else if candidate.contains(&needle) {
+			fuzzy.push(name);
+		}
+	}
+	exact.sort_by_key(|s| s.to_ascii_lowercase());
+	fuzzy.sort_by_key(|s| s.to_ascii_lowercase());
+	exact.extend(fuzzy);
+	exact.truncate(30);
+	Ok(exact)
 }
 
 #[cfg(test)]
@@ -410,7 +572,13 @@ mod tests {
 	fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
 
 	fn rename_value(tab: &Tab) -> String {
-		tab.rename.as_ref().unwrap().state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect()
+		tab.input.as_ref().unwrap().state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect()
+	}
+
+	fn set_input_value(tab: &mut Tab, value: &str) {
+		let input = tab.input.as_mut().unwrap();
+		input.state.lines = edtui::Lines::from(value);
+		input.state.cursor = edtui::Index2::new(0, value.chars().count());
 	}
 
 	#[tokio::test]
@@ -609,20 +777,20 @@ mod tests {
 
 		tab.start_rename();
 		assert_eq!(rename_value(&tab), "old.txt", "prefilled with the current name");
-		assert!(tab.rename.as_ref().unwrap().state.mode == EditorMode::Insert);
+		assert!(tab.input.as_ref().unwrap().state.mode == EditorMode::Insert);
 
 		// still in Insert mode (cursor at the end): clear the prefill and
 		// type the new name, one raw key event at a time through edtui.
 		for _ in 0..7 {
-			tab.handle_rename_key(key(KeyCode::Backspace));
+			tab.handle_input_key(key(KeyCode::Backspace));
 		}
 		for c in "new.txt".chars() {
-			tab.handle_rename_key(key(KeyCode::Char(c)));
+			tab.handle_input_key(key(KeyCode::Char(c)));
 		}
 		assert_eq!(rename_value(&tab), "new.txt");
 
-		tab.handle_rename_key(key(KeyCode::Enter)); // confirm
-		assert!(tab.rename.is_none());
+		tab.handle_input_key(key(KeyCode::Enter)); // confirm
+		assert!(tab.input.is_none());
 		pump(&mut tab, &mut rx).await; // parent's listing refreshes
 
 		assert!(!root.join("old.txt").exists());
@@ -644,12 +812,12 @@ mod tests {
 		tab.move_cursor(1); // onto "keep.txt"
 		tab.start_rename();
 
-		tab.handle_rename_key(key(KeyCode::Esc)); // Insert -> Normal, handled by edtui itself
-		assert!(tab.rename.is_some(), "first escape only drops to normal mode");
-		assert!(tab.rename.as_ref().unwrap().state.mode == EditorMode::Normal);
+		tab.handle_input_key(key(KeyCode::Esc)); // Insert -> Normal, handled by edtui itself
+		assert!(tab.input.is_some(), "first escape only drops to normal mode");
+		assert!(tab.input.as_ref().unwrap().state.mode == EditorMode::Normal);
 
-		tab.handle_rename_key(key(KeyCode::Esc)); // Normal -> we intercept and close
-		assert!(tab.rename.is_none());
+		tab.handle_input_key(key(KeyCode::Esc)); // Normal -> we intercept and close
+		assert!(tab.input.is_none());
 		assert!(root.join("keep.txt").exists(), "nothing was renamed");
 
 		fs::remove_dir_all(&root).unwrap();
@@ -666,23 +834,76 @@ mod tests {
 		tab.move_cursor(1); // onto "keep.txt"
 		tab.start_rename();
 
-		tab.handle_rename_key(key(KeyCode::Esc)); // Insert -> Normal, cursor lands on the last char ('t')
-		tab.handle_rename_key(key(KeyCode::Char('0'))); // BOL
+		tab.handle_input_key(key(KeyCode::Esc)); // Insert -> Normal, cursor lands on the last char ('t')
+		tab.handle_input_key(key(KeyCode::Char('0'))); // BOL
 		// edtui's `w` treats punctuation as its own word class, matching
 		// real vim: "keep" | "." | "txt" is three words, not one.
-		tab.handle_rename_key(key(KeyCode::Char('w'))); // -> the '.'
-		tab.handle_rename_key(key(KeyCode::Char('w'))); // -> start of "txt"
+		tab.handle_input_key(key(KeyCode::Char('w'))); // -> the '.'
+		tab.handle_input_key(key(KeyCode::Char('w'))); // -> start of "txt"
 
 		// edtui's vim_mode has no native `C` binding at all — this is our
 		// own synthesized delete-to-eol-then-insert.
-		tab.handle_rename_key(key(KeyCode::Char('C')));
+		tab.handle_input_key(key(KeyCode::Char('C')));
 		assert_eq!(rename_value(&tab), "keep.");
-		assert!(tab.rename.as_ref().unwrap().state.mode == EditorMode::Insert, "C drops straight into Insert");
+		assert!(tab.input.as_ref().unwrap().state.mode == EditorMode::Insert, "C drops straight into Insert");
 
 		for c in "md".chars() {
-			tab.handle_rename_key(key(KeyCode::Char(c)));
+			tab.handle_input_key(key(KeyCode::Char(c)));
 		}
 		assert_eq!(rename_value(&tab), "keep.md");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn interactive_cd_replaces_navigation_but_keeps_the_clipboard() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-cd");
+		let next = root.join("next");
+		fs::create_dir_all(&next).unwrap();
+		let root = root.canonicalize().unwrap();
+		let next = next.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.clipboard.push(root.join("keep.txt"));
+		tab.start_cd();
+		set_input_value(&mut tab, "next");
+		tab.handle_input_key(key(KeyCode::Enter));
+
+		assert_eq!(tab.tree.root.path, next);
+		assert_eq!(tab.cursor, 0);
+		assert_eq!(tab.clipboard, [root.join("keep.txt")]);
+		assert!(tab.input.is_none());
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn invalid_cd_keeps_the_input_open_with_an_error() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-cd-invalid");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.start_cd();
+		set_input_value(&mut tab, "missing");
+		tab.handle_input_key(key(KeyCode::Enter));
+
+		assert_eq!(tab.tree.root.path, root);
+		assert!(tab.input.as_ref().unwrap().error.is_some());
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[test]
+	fn completion_lists_only_matching_directories_with_smart_case() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-completion");
+		fs::create_dir_all(root.join("Projects")).unwrap();
+		fs::create_dir_all(root.join("profiles")).unwrap();
+		fs::write(root.join("prompt.txt"), b"not a directory").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		assert_eq!(complete_directories(&root, "pro", 3).unwrap(), ["profiles", "Projects"]);
+		assert_eq!(complete_directories(&root, "Pro", 3).unwrap(), ["Projects"]);
 
 		fs::remove_dir_all(&root).unwrap();
 	}

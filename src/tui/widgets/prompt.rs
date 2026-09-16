@@ -13,7 +13,7 @@ impl Prompt {
 	/// a popup dialog rather than a line squeezed into the status bar.
 	/// Border color and title both name edtui's own current vim mode.
 	/// Returns the screen column/row to park the terminal cursor at.
-	pub fn render(frame: &mut Frame, area: Rect, title: &str, state: &mut EditorState) -> (u16, u16) {
+	pub fn render(frame: &mut Frame, area: Rect, title: &str, state: &mut EditorState) -> (u16, u16, Rect) {
 		let width = area.width.saturating_sub(4).min(50);
 		let rect = Self::centered(width + 2, 3, area);
 
@@ -51,7 +51,7 @@ impl Prompt {
 		// of where the cursor actually is — column changes never show up.
 		// `state.cursor` itself tracks correctly, so derive the screen
 		// position from that instead.
-		(inner.x + state.cursor.col as u16, inner.y + state.cursor.row as u16)
+		(inner.x + state.cursor.col as u16, inner.y + state.cursor.row as u16, rect)
 	}
 
 	fn centered(width: u16, height: u16, area: Rect) -> Rect {
@@ -91,7 +91,10 @@ mod tests {
 
 		let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
 		let mut before = (0, 0);
-		terminal.draw(|frame| before = Prompt::render(frame, frame.area(), "Rename", &mut state)).unwrap();
+		terminal.draw(|frame| {
+			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state);
+			before = (x, y);
+		}).unwrap();
 
 		let mut handler = EditorEventHandler::vim_mode();
 		// Esc itself steps the cursor back one column too (vim's own
@@ -102,7 +105,10 @@ mod tests {
 		handler.on_key_event(key(KeyCode::Char('h')), &mut state);
 
 		let mut after = (0, 0);
-		terminal.draw(|frame| after = Prompt::render(frame, frame.area(), "Rename", &mut state)).unwrap();
+		terminal.draw(|frame| {
+			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state);
+			after = (x, y);
+		}).unwrap();
 
 		assert_eq!(before.0 - after.0, 3, "Esc plus two lefts should move the reported cursor left by three columns");
 		assert_eq!(before.1, after.1, "single line: the row never changes");
