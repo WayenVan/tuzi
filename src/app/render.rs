@@ -50,6 +50,8 @@ impl App {
 		let task_visible = self.tasks.visible;
 		let task_cursor = self.tasks.cursor;
 		let tasks = &self.tasks.tasks;
+		let running = tasks.len();
+		let pending_quit = self.pending_quit;
 		let notices = &self.notices;
 
 		// What goes in the status bar, and on which side, lives entirely
@@ -114,6 +116,9 @@ impl App {
 			}
 			if let Some((targets, mode)) = &pending_delete {
 				ConfirmPopup::render_delete(frame, frame.area(), targets, *mode);
+			}
+			if pending_quit {
+				ConfirmPopup::render_quit(frame, frame.area(), running);
 			}
 			if let Some(input) = &mut input {
 				let (x, y, rect) = Prompt::render(frame, frame.area(), input.title(), &mut input.state);

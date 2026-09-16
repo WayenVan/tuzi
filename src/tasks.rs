@@ -380,9 +380,15 @@ struct Counters {
 }
 
 impl Counters {
-	fn emit(&mut self, id: TaskId, tx: &UnboundedSender<Event>, force: bool) {
+	/// Throttled to at most once per 75ms — including per-file completions,
+	/// not just the byte-level updates within one file. Without that, a
+	/// task over many small files would emit (and force a full redraw)
+	/// once per file, scaling UI cost with file *count* for no benefit:
+	/// the progress bar looks identical whether it's told about every
+	/// single file or just sampled a few times a second.
+	fn emit(&mut self, id: TaskId, tx: &UnboundedSender<Event>) {
 		let now = Instant::now();
-		if !force && self.last_emit.is_some_and(|last| now.duration_since(last) < Duration::from_millis(75)) {
+		if self.last_emit.is_some_and(|last| now.duration_since(last) < Duration::from_millis(75)) {
 			return;
 		}
 		self.last_emit = Some(now);
@@ -396,7 +402,7 @@ fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx:
 	if meta.file_type().is_symlink() {
 		copy_symlink(source, target)?;
 		progress.files += 1;
-		progress.emit(id, tx, true);
+		progress.emit(id, tx);
 		return Ok(())
 	}
 	if meta.is_dir() {
@@ -423,13 +429,13 @@ fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx:
 			if read == 0 { break }
 			output.write_all(&buffer[..read])?;
 			progress.bytes += read as u64;
-			progress.emit(id, tx, false);
+			progress.emit(id, tx);
 		}
 		output.flush()?;
 		fs::rename(&temporary, target)?;
 		fs::set_permissions(target, fs::metadata(source)?.permissions())?;
 		progress.files += 1;
-		progress.emit(id, tx, true);
+		progress.emit(id, tx);
 		Ok(())
 	})();
 	if result.is_err() { let _ = fs::remove_file(&temporary); }
@@ -468,7 +474,7 @@ fn delete_entry(id: TaskId, path: &Path, cancel: &AtomicBool, tx: &UnboundedSend
 	} else {
 		fs::remove_file(path)?;
 		progress.files += 1;
-		progress.emit(id, tx, true);
+		progress.emit(id, tx);
 		Ok(())
 	}
 }
@@ -518,6 +524,39 @@ mod tests {
 		}
 		assert_eq!(fs::read(root.join("dst/a")).unwrap(), b"a");
 		assert_eq!(fs::read(root.join("dst/b")).unwrap(), b"bb");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn copying_many_small_files_does_not_emit_progress_once_per_file() {
+		let root = std::env::temp_dir().join(format!("tuzi-task-throttle-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::create_dir_all(root.join("dst")).unwrap();
+		for i in 0..50 {
+			fs::write(root.join(format!("src/file{i}")), b"x").unwrap();
+		}
+		let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+		let mut manager = TaskManager::new(tx);
+		manager.enqueue(vec![root.join("src")], root.join("dst"), false, 0);
+
+		let mut progress_events = 0;
+		while !manager.tasks.is_empty() {
+			let Event::Task(event) = rx.recv().await.unwrap() else { continue };
+			if matches!(event, TaskEvent::Progress { .. }) {
+				progress_events += 1;
+			}
+			manager.accept(event);
+		}
+
+		// One event per file (50) would mean every completion forces a full
+		// UI redraw — the whole point of throttling per-file completions
+		// the same as byte-level ones is that this stays a small, roughly
+		// constant number regardless of file count.
+		assert!(progress_events < 50, "expected per-file completions to be throttled together, got {progress_events} for 50 files");
+		for i in 0..50 {
+			assert!(root.join(format!("dst/src/file{i}")).exists());
+		}
 		fs::remove_dir_all(root).unwrap();
 	}
 

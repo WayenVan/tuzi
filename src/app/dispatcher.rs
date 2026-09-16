@@ -7,7 +7,7 @@ pub struct Dispatcher;
 impl Dispatcher {
 	pub fn dispatch(app: &mut App, action: Action) {
 		match action {
-			Action::Quit => app.quit = true,
+			Action::Quit => app.request_quit(),
 			Action::Escape => app.active_tab_mut().escape(),
 			Action::MoveCursor(delta) => app.active_tab_mut().move_cursor(delta),
 			Action::MovePage(percent) => app.move_page(percent),

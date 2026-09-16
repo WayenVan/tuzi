@@ -11,6 +11,10 @@ pub struct App {
 	pub tabs:    Vec<Tab>,
 	pub active:  usize,
 	pub quit:    bool,
+	/// Armed by `request_quit` when a task is still running — quitting
+	/// straight away would abandon whatever `.tuzi-part-*` temp file a
+	/// copy was mid-write on, so this asks first instead of just doing it.
+	pub(super) pending_quit: bool,
 	next_tab_id: usize,
 	/// The yanked files, shared by every tab: yank in one, paste in another.
 	pub(super) clipboard:     Vec<PathBuf>,
@@ -35,7 +39,7 @@ impl App {
 
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
 		let mut app = Self {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
+			tabs: vec![first], active: 0, quit: false, pending_quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
@@ -82,6 +86,17 @@ impl App {
 	}
 
 	fn handle_key(&mut self, key: crossterm::event::KeyEvent, router: &mut Router) -> bool {
+		if self.pending_quit {
+			let confirmed = match key.code {
+				KeyCode::Char('y') => Some(true),
+				KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => Some(false),
+				KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+				_ => None,
+			};
+			let Some(confirmed) = confirmed else { return false };
+			self.resolve_pending_quit(confirmed);
+			return true;
+		}
 		if self.tasks.visible {
 			return match key.code {
 				KeyCode::Up | KeyCode::Char('k') => { self.tasks.move_cursor(-1); true }
@@ -190,6 +205,25 @@ impl App {
 		self.active = self.tabs[next].id;
 	}
 
+	/// Quits outright when nothing's running; otherwise arms a confirmation
+	/// instead of just doing it — see `pending_quit`.
+	pub fn request_quit(&mut self) {
+		if self.tasks.tasks.is_empty() {
+			self.quit = true;
+		} else {
+			self.pending_quit = true;
+		}
+	}
+
+	/// Resolves an armed quit confirmation. Declining just clears it —
+	/// there's nothing to take or hand off, unlike a confirmed delete.
+	pub(super) fn resolve_pending_quit(&mut self, confirmed: bool) {
+		self.pending_quit = false;
+		if confirmed {
+			self.quit = true;
+		}
+	}
+
 	pub fn move_page(&mut self, percent: i8) {
 		let rows = self.tree_rows.max(1) as isize;
 		let mut delta = rows * percent as isize / 100;
@@ -289,7 +323,7 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
+			tabs: vec![first], active: 0, quit: false, pending_quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
@@ -398,6 +432,48 @@ mod tests {
 		pump(&mut app, &mut rx).await;
 
 		assert!(!root.join("leaf.txt").exists());
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn quitting_with_no_tasks_running_quits_immediately() {
+		let root = std::env::temp_dir().join("tuzi-app-test-quit-clean");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+
+		app.request_quit();
+
+		assert!(app.quit);
+		assert!(!app.pending_quit);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn quitting_with_a_running_task_asks_first_and_respects_the_answer() {
+		let root = std::env::temp_dir().join("tuzi-app-test-quit-guard");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("dst")).unwrap();
+		fs::write(root.join("a"), b"a").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+
+		// Enqueuing pushes the Task synchronously; nothing here awaits, so
+		// it's still there for request_quit to see regardless of whether
+		// the spawned copy itself has run yet.
+		app.tasks.enqueue(vec![root.join("a")], root.join("dst"), false, 0);
+		app.request_quit();
+		assert!(!app.quit, "asks first instead of quitting outright while a task is running");
+		assert!(app.pending_quit);
+
+		app.resolve_pending_quit(false);
+		assert!(!app.quit, "declining just clears the confirmation");
+		assert!(!app.pending_quit);
+
+		app.request_quit();
+		app.resolve_pending_quit(true);
+		assert!(app.quit, "confirming quits anyway");
+
 		fs::remove_dir_all(&root).unwrap();
 	}
 
