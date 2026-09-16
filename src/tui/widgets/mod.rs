@@ -21,5 +21,5 @@ pub use task_popup::TaskPopup;
 pub use tab_bar::TabBar;
 pub use toast::Toast;
 pub use tree_view::{TreeView, TreeViewState};
-pub use win_bar::WinBar;
+pub use win_bar::{WinBar, WinBarState};
 pub use which_popup::WhichPopup;

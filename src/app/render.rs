@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar}}};
+use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::App;
 
@@ -45,6 +45,8 @@ impl App {
 		let preview_visible = tab.preview.visible;
 		let pending_delete = tab.pending_delete.clone();
 		let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
+		let finder_query = tab.finder.as_ref().map(|finder| finder.query());
+		let filter_query = tab.filter.as_ref().map(|filter| filter.query());
 		let task_visible = self.tasks.visible;
 		let task_cursor = self.tasks.cursor;
 		let tasks = &self.tasks.tasks;
@@ -66,7 +68,7 @@ impl App {
 			};
 			tree_rows.set(tree_area.height as usize);
 
-			WinBar::render(frame, win_area, &cwd);
+			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query });
 			TabBar::render(frame, tab_area, &labels);
 			TreeView::render(
 				frame,

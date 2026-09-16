@@ -14,5 +14,7 @@ impl Filter {
 
 	pub fn matches(&self, name: &str) -> bool { self.0.matches(name) }
 
+	pub fn query(&self) -> &str { self.0.query() }
+
 	pub fn ranges(&self, name: &str) -> Vec<Range<usize>> { self.0.ranges(name) }
 }

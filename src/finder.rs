@@ -20,6 +20,8 @@ impl Finder {
 
 	pub fn previous(&self) -> bool { self.previous }
 
+	pub fn query(&self) -> &str { &self.query }
+
 	pub fn matches(&self, name: &str) -> bool { !self.ranges(name).is_empty() }
 
 	/// Non-overlapping character ranges, so callers can style Unicode names
