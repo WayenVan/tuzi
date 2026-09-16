@@ -4,7 +4,6 @@ mod selection;
 mod tree;
 mod visual;
 
-#[allow(unused_imports)]
 pub use filter::Filter;
 pub use node::Node;
 pub use selection::Selection;

@@ -76,6 +76,7 @@ impl App {
 					column_mode,
 					icon_theme,
 					finder: tab.finder.as_ref(),
+					filter: tab.filter.as_ref(),
 					scroll: &mut scroll,
 				},
 			);

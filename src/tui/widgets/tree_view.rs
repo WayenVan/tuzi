@@ -1,6 +1,6 @@
 use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{List, ListItem, ListState}};
 
-use crate::{column_mode::ColumnMode, core::{Node, Selection, Visual}, finder::Finder, icon::{Icon, IconTheme}};
+use crate::{column_mode::ColumnMode, core::{Filter, Node, Selection, Visual}, finder::Finder, icon::{Icon, IconTheme}};
 
 pub struct TreeView;
 
@@ -13,6 +13,7 @@ pub struct TreeViewState<'a> {
 	pub column_mode:   ColumnMode,
 	pub icon_theme:    &'a IconTheme,
 	pub finder:        Option<&'a Finder>,
+	pub filter:        Option<&'a Filter>,
 	/// The tab's persisted scroll offset — read to seed this frame's list,
 	/// then written back with whatever ratatui settled on, so it only
 	/// shifts when the cursor would otherwise leave the viewport.
@@ -46,7 +47,14 @@ impl TreeView {
 				None
 			};
 			let loading = if node.expanded && node.children.is_none() { " (loading…)" } else { "" };
-			let matches = state.finder.map_or_else(Vec::new, |finder| finder.ranges(&name));
+			// An active filter already decided this row belongs in the tree;
+			// highlighting why doubles as a hint once `find` isn't also
+			// pointing at the same name.
+			let matches = state
+				.finder
+				.map(|finder| finder.ranges(&name))
+				.or_else(|| state.filter.map(|filter| filter.ranges(&name)))
+				.unwrap_or_default();
 			let line = row_line(
 				"  ".repeat(*depth),
 				marker_style,

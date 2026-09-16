@@ -40,6 +40,7 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('?')], A::OpenInput(InputKind::Find { previous: true }), "Find previous file"),
 		Binding::manager(vec![Key::char('n')], A::RepeatFind { opposite: false }, "Repeat find"),
 		Binding::manager(vec![Key::char('N')], A::RepeatFind { opposite: true }, "Repeat find in reverse"),
+		Binding::manager(vec![Key::char('f')], A::OpenInput(InputKind::Filter), "Filter files"),
 		Binding::manager(vec![Key::char('z')], A::Fzf, "Jump with fzf"),
 		Binding::manager(vec![Key::char('o')], A::Open { interactive: false }, "Open selected files"),
 		Binding::manager(vec![Key::char('O')], A::Open { interactive: true }, "Open selected files interactively"),

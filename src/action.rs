@@ -6,6 +6,7 @@ pub enum InputKind {
 	Cd,
 	Create,
 	Find { previous: bool },
+	Filter,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{column_mode::ColumnMode, core::{Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
 use super::input::{Completion, InputPurpose, InputSession};
 
@@ -33,6 +33,7 @@ pub struct Tab {
 	pub visual:         Option<Visual>,
 	pub pending_delete: Option<Vec<PathBuf>>,
 	pub finder:         Option<Finder>,
+	pub filter:         Option<Filter>,
 	pub notice:         Option<String>,
 	pending_reveal:     Option<RevealState>,
 	pub(super) input:   Option<InputSession>,
@@ -73,6 +74,7 @@ impl Tab {
 			visual: None,
 			pending_delete: None,
 			finder: None,
+			filter: None,
 			notice: None,
 			pending_reveal: None,
 			input: None,
@@ -81,7 +83,15 @@ impl Tab {
 		})
 	}
 
-	pub fn visible(&self) -> Vec<(usize, &Node)> { self.tree.root.visible(0) }
+	/// The rows to draw: every row when no filter is active, otherwise only
+	/// rows that match it or have a visible descendant that does — with the
+	/// root kept regardless, so an empty result still shows where you are.
+	pub fn visible(&self) -> Vec<(usize, &Node)> {
+		match &self.filter {
+			Some(filter) => self.tree.root.visible_filtered(0, filter).unwrap_or_else(|| vec![(0, &self.tree.root)]),
+			None => self.tree.root.visible(0),
+		}
+	}
 
 	pub fn move_cursor(&mut self, delta: isize) {
 		let len = self.visible().len();
@@ -262,6 +272,12 @@ impl Tab {
 		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Find { previous }, ""));
 	}
 
+	pub fn start_filter(&mut self) {
+		self.filter = None;
+		self.input_seq += 1;
+		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Filter, ""));
+	}
+
 	pub fn find_arrow(&mut self, previous: bool, include_current: bool) {
 		let Some(finder) = &self.finder else { return };
 		let rows = self.visible();
@@ -379,7 +395,9 @@ impl Tab {
 		input.handler.on_key_event(key, &mut input.state);
 		input.error = None;
 		let after = (input.value(), input.state.cursor.col);
-		if (input.is_cd() && before != after) || (input.find_previous().is_some() && before.0 != after.0) {
+		if (input.is_cd() && before != after)
+			|| ((input.find_previous().is_some() || input.is_filter()) && before.0 != after.0)
+		{
 			self.input_changed(&mut input);
 		}
 		self.input = Some(input);
@@ -394,6 +412,9 @@ impl Tab {
 			if self.finder.is_some() {
 				self.find_arrow(previous, true);
 			}
+		}
+		if input.is_filter() {
+			self.filter = Filter::new(input.value());
 		}
 	}
 
@@ -412,6 +433,7 @@ impl Tab {
 					self.find_arrow(*previous, true);
 				}
 			}
+			InputPurpose::Filter => self.filter = Filter::new(value),
 			InputPurpose::Cd { base } => {
 				if value.is_empty() {
 					return;
@@ -554,14 +576,17 @@ impl Tab {
 	}
 
 	/// Esc cancels whatever's most "in progress": an open visual selection
-	/// (committing it), then an armed delete, then the selection. Reaching
-	/// here at all means no input prompt was open — while one is, Esc
-	/// routes to `handle_input_key` instead.
+	/// (committing it), then an active filter, then an armed delete, then
+	/// the selection. Reaching here at all means no input prompt was open —
+	/// while one is, Esc routes to `handle_input_key` instead.
 	pub fn escape(&mut self) {
 		if self.finder.take().is_some() {
 			return;
 		}
 		if self.commit_visual() {
+			return;
+		}
+		if self.filter.take().is_some() {
 			return;
 		}
 		if self.pending_delete.take().is_some() {
@@ -963,6 +988,77 @@ mod tests {
 			tab.handle_input_key(key(KeyCode::Backspace));
 		}
 		assert!(tab.finder.is_none(), "emptying the prompt clears live highlights");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn filter_hides_non_matching_entries_live() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-live-filter");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("alpha.txt"), b"").unwrap();
+		fs::write(root.join("gamma.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		assert_eq!(tab.visible().len(), 3, "root plus both files, unfiltered");
+
+		tab.start_filter();
+		for ch in "gamma".chars() {
+			tab.handle_input_key(key(KeyCode::Char(ch)));
+		}
+
+		let names: Vec<_> = tab.visible().iter().map(|(_, node)| node_name(node)).collect();
+		assert_eq!(names, [node_name(&tab.tree.root), "gamma.txt".to_owned()], "alpha.txt is hidden, the root stays");
+
+		for _ in 0..5 {
+			tab.handle_input_key(key(KeyCode::Backspace));
+		}
+		assert!(tab.filter.is_none(), "emptying the prompt clears the filter");
+		assert_eq!(tab.visible().len(), 3, "clearing it live restores every entry");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn filter_keeps_the_root_visible_even_when_nothing_matches() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-filter-no-match");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("alpha.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.start_filter();
+		for ch in "nope".chars() {
+			tab.handle_input_key(key(KeyCode::Char(ch)));
+		}
+
+		assert_eq!(tab.visible().len(), 1, "no matches, but the root is never filtered away");
+		assert_eq!(node_name(tab.visible()[0].1), node_name(&tab.tree.root));
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn escape_clears_the_filter_and_restores_hidden_entries() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-escape-filter");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("alpha.txt"), b"").unwrap();
+		fs::write(root.join("gamma.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.start_filter();
+		for ch in "gamma".chars() {
+			tab.handle_input_key(key(KeyCode::Char(ch)));
+		}
+		tab.handle_input_key(key(KeyCode::Enter));
+		assert!(tab.filter.is_some());
+		assert_eq!(tab.visible().len(), 2, "root plus the one match");
+
+		tab.escape();
+		assert!(tab.filter.is_none());
+		assert_eq!(tab.visible().len(), 3, "escape restores what the filter hid");
 
 		fs::remove_dir_all(root).unwrap();
 	}

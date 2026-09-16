@@ -27,6 +27,7 @@ impl Dispatcher {
 			Action::OpenInput(InputKind::Cd) => app.active_tab_mut().start_cd(),
 			Action::OpenInput(InputKind::Create) => app.active_tab_mut().start_create(),
 			Action::OpenInput(InputKind::Find { previous }) => app.active_tab_mut().start_find(previous),
+			Action::OpenInput(InputKind::Filter) => app.active_tab_mut().start_filter(),
 			Action::NewTab => app.new_tab(),
 			Action::CloseTab => app.close_tab(),
 			Action::SwitchTab(delta) => app.switch_tab(delta),
