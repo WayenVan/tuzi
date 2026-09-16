@@ -29,6 +29,9 @@ impl Watcher {
 	/// only while expanded, mirroring what's actually visible on screen.
 	pub fn watch(&mut self, path: &Path) -> io::Result<()> {
 		let path = path.canonicalize()?;
+		if self.watched.lock().unwrap().contains(&path) {
+			return Ok(());
+		}
 		self.inner.watch(&path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
 		self.watched.lock().unwrap().insert(path);
 		Ok(())

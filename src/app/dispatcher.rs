@@ -32,6 +32,8 @@ impl Dispatcher {
 			Action::TogglePreview => app.active_tab_mut().preview.toggle(),
 			Action::SeekPreview(units) => app.active_tab_mut().preview.seek(units),
 			Action::RepeatFind { opposite } => app.active_tab_mut().repeat_find(opposite),
+			Action::Fzf => app.start_fzf(),
+			Action::Open { interactive } => app.open_selected(interactive),
 		}
 	}
 
@@ -73,6 +75,7 @@ impl Dispatcher {
 					t.preview.accept(ticket, key, result);
 				}
 			}
+			Event::OpenResolved { tab, cwd, interactive, result } => app.on_open_resolved(tab, cwd, interactive, result),
 			Event::Term(_) => {}
 		}
 	}

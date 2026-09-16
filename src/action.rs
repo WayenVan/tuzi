@@ -37,4 +37,6 @@ pub enum Action {
 	TogglePreview,
 	SeekPreview(i16),
 	RepeatFind { opposite: bool },
+	Fzf,
+	Open { interactive: bool },
 }

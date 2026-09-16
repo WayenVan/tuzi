@@ -1,6 +1,8 @@
 mod app;
 mod dispatcher;
+mod external;
 mod input;
+mod render;
 mod tab;
 
 pub use app::App;

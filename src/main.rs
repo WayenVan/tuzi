@@ -9,6 +9,8 @@ mod finder;
 mod fs;
 mod icon;
 mod keymap;
+mod opener;
+mod process;
 mod preview;
 mod runner;
 mod scheduler;

@@ -173,4 +173,11 @@ mod tests {
 		assert_eq!(router.route(KeyContext::Manager, Key::char('n')), Route::Actions(vec![Action::RepeatFind { opposite: false }]));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('N')), Route::Actions(vec![Action::RepeatFind { opposite: true }]));
 	}
+
+	#[test]
+	fn o_opens_and_uppercase_o_chooses_an_opener() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char('o')), Route::Actions(vec![Action::Open { interactive: false }]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('O')), Route::Actions(vec![Action::Open { interactive: true }]));
+	}
 }

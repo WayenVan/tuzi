@@ -28,10 +28,16 @@ pub struct Tab {
 	pub clipboard_cut:  bool,
 	pub pending_delete: Option<Vec<PathBuf>>,
 	pub finder:         Option<Finder>,
-	pending_reveal:     Option<PathBuf>,
+	pub notice:         Option<String>,
+	pending_reveal:     Option<RevealState>,
 	pub(super) input:   Option<InputSession>,
 	input_seq:          u64,
 	tx:                 UnboundedSender<Event>,
+}
+
+struct RevealState {
+	target:           PathBuf,
+	refreshed_parent: bool,
 }
 
 impl Tab {
@@ -63,6 +69,7 @@ impl Tab {
 			clipboard_cut: false,
 			pending_delete: None,
 			finder: None,
+			notice: None,
 			pending_reveal: None,
 			input: None,
 			input_seq: 0,
@@ -406,7 +413,7 @@ impl Tab {
 				if value.is_empty() {
 					return;
 				}
-				match resolve_path(base, &value).and_then(|path| self.change_root(path)) {
+				match resolve_path(base, &value).and_then(|path| self.cd(path)) {
 					Ok(()) => {}
 					Err(err) => {
 						input.error = Some(err.to_string());
@@ -432,7 +439,10 @@ impl Tab {
 		}
 	}
 
-	fn change_root(&mut self, path: PathBuf) -> io::Result<()> {
+	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> {
+		if !std::fs::metadata(&path)?.is_dir() {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a directory"));
+		}
 		if path == self.tree.root.path {
 			return Ok(());
 		}
@@ -442,6 +452,58 @@ impl Tab {
 		replacement.input_seq = self.input_seq;
 		*self = replacement;
 		Ok(())
+	}
+
+	pub fn reveal(&mut self, target: PathBuf) -> io::Result<()> {
+		let target = target.canonicalize()?;
+		if !target.starts_with(&self.tree.root.path) {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is outside the tab root"));
+		}
+		self.pending_reveal = Some(RevealState { target, refreshed_parent: false });
+		self.continue_reveal();
+		Ok(())
+	}
+
+	fn continue_reveal(&mut self) {
+		let Some(state) = &self.pending_reveal else { return };
+		let target = state.target.clone();
+		if self.visible().iter().any(|(_, node)| node.path == target) {
+			self.select(&target);
+			self.pending_reveal = None;
+			self.preview.target_changed();
+			return;
+		}
+
+		let root = self.tree.root.path.clone();
+		let Some(parent) = target.parent().map(Path::to_path_buf) else {
+			self.pending_reveal = None;
+			return;
+		};
+		let Ok(_) = parent.strip_prefix(&root) else {
+			self.pending_reveal = None;
+			return;
+		};
+		for directory in ancestor_directories(&root, &parent) {
+			match self.tree.mark_expanded(&directory) {
+				Some(needs_fetch) => {
+					let _ = self.watcher.watch(&directory);
+					if needs_fetch {
+						self.fs_scheduler.refresh(directory);
+						return;
+					}
+				}
+				None => return,
+			}
+		}
+
+		let Some(state) = &mut self.pending_reveal else { return };
+		if !state.refreshed_parent {
+			state.refreshed_parent = true;
+			self.fs_scheduler.refresh(parent);
+		} else {
+			self.pending_reveal = None;
+			self.notice = Some("reveal target is no longer present".into());
+		}
 	}
 
 	fn schedule_completion(&self, input: &mut InputSession) {
@@ -512,12 +574,7 @@ impl Tab {
 		if let Ok(entries) = result {
 			self.tree.apply_listing(&path, entries);
 		}
-		if let Some(target) = self.pending_reveal.clone()
-			&& self.visible().iter().any(|(_, node)| node.path == target)
-		{
-			self.select(&target);
-			self.pending_reveal = None;
-		}
+		self.continue_reveal();
 		self.clamp_cursor();
 	}
 
@@ -530,7 +587,7 @@ impl Tab {
 			return;
 		}
 
-		self.pending_reveal = Some(target.clone());
+		self.pending_reveal = Some(RevealState { target: target.clone(), refreshed_parent: false });
 		let mut refresh = target.parent();
 		while let Some(path) = refresh {
 			if self.tree.is_loaded(path) {
@@ -576,6 +633,8 @@ impl Tab {
 		self.visible().into_iter().nth(self.cursor).map(|(_, node)| node.path.clone()).into_iter().collect()
 	}
 
+	pub fn open_targets(&self) -> Vec<PathBuf> { self.action_targets() }
+
 	/// Where paste drops files: the directory under the cursor, or its
 	/// parent if the cursor is on a file.
 	fn paste_target(&self) -> Option<PathBuf> {
@@ -612,7 +671,7 @@ impl Tab {
 		};
 		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return StatusLine::empty(mode) };
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
-		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: None }
+		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: self.notice.clone() }
 	}
 }
 
@@ -638,6 +697,17 @@ fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
 
 fn home_dir() -> io::Result<PathBuf> {
 	std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+fn ancestor_directories(root: &Path, parent: &Path) -> Vec<PathBuf> {
+	let mut directories = vec![root.to_path_buf()];
+	let Ok(relative) = parent.strip_prefix(root) else { return directories };
+	let mut path = root.to_path_buf();
+	for component in relative.components() {
+		path.push(component.as_os_str());
+		directories.push(path.clone());
+	}
+	directories
 }
 
 fn complete_directories(base: &Path, value: &str, cursor: usize) -> io::Result<Vec<String>> {

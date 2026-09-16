@@ -1,11 +1,9 @@
-use std::{cell::Cell, env, io, thread};
+use std::{collections::VecDeque, env, io};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use edtui::EditorMode;
-use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, TreeViewState, WhichPopup, WinBar}}};
+use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tui::TerminalSession};
 
 use super::{Dispatcher, Tab};
 
@@ -14,193 +12,116 @@ pub struct App {
 	pub active:  usize,
 	pub quit:    bool,
 	next_tab_id: usize,
-	tree_rows:   usize,
-	which:       Vec<WhichCandidate>,
-	icon_theme:  IconTheme,
-	tx:          mpsc::UnboundedSender<Event>,
+	pub(super) tree_rows:  usize,
+	pub(super) which:      Vec<WhichCandidate>,
+	pub(super) icon_theme: IconTheme,
+	pub(super) open:        OpenScheduler,
+	pub(super) open_picker: Option<OpenPicker>,
+	pub(super) processes:   VecDeque<ProcessRequest>,
+	pub(super) tx:         mpsc::UnboundedSender<Event>,
 }
 
 impl App {
 	pub async fn serve() -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 
-		// Raw terminal events are wrapped, not translated, here — the
-		// background thread doesn't know whether an input prompt is open,
-		// so the split between tree keymap and raw-key-to-edtui only
-		// happens once the event reaches the main loop below.
-		let input_tx = tx.clone();
-		thread::spawn(move || {
-			while let Ok(term_event) = crossterm::event::read() {
-				if input_tx.send(Event::Term(term_event)).is_err() {
-					break;
-				}
-			}
-		});
-
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
 		let mut app = Self {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme, tx,
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
 		};
-		let mut term = Raterm::start()?;
+		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::default();
 
-		let draw = |app: &mut App, term: &mut Raterm| -> io::Result<()> {
-			let tree_rows = Cell::new(app.tree_rows);
-			let preview_size = Cell::new((0, 0));
-			let redraw_tx = app.tx.clone();
-			let which = app.which.clone();
-			let icon_theme = &app.icon_theme;
-			let cwd = app.active_tab().tree.root.path.clone();
-			// Collected as owned strings *before* grabbing the active tab
-			// mutably below — otherwise the tab bar's shared borrow of
-			// every tab and the active tab's exclusive borrow (needed for
-			// the input take/put-back trick) would overlap.
-			let labels: Vec<(bool, String)> = app
-				.tabs
-				.iter()
-				.map(|t| {
-					let name =
-						t.tree.root.path.file_name().map_or_else(|| t.tree.root.path.display().to_string(), |n| n.to_string_lossy().into_owned());
-					(t.id == app.active, name)
-				})
-				.collect();
-
-			let active = app.active;
-			let tab = app.tabs.iter_mut().find(|tab| tab.id == active).expect("active tab exists");
-			// Taken out (and put back at the end) so that its `&mut` doesn't
-			// overlap, for the borrow checker's purposes, with the `&Node`s
-			// `tab.visible()` lends out below — both ultimately borrow from
-			// `tab` through `&self` methods, which erases field-level
-			// disjointness even though `input` and `tree` never actually
-			// touch each other.
-			let mut input = tab.input.take();
-
-			let rows = tab.visible();
-			let mut status = tab.status_line();
-			if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
-				status.error = Some(error.clone());
-			}
-			let column_mode = tab.column_mode;
-			let preview_visible = tab.preview.visible;
-			let pending_delete = tab.pending_delete.clone();
-			let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
-			term.terminal.draw(|frame| {
-				let [win_area, tab_area, body_area, status_area] = Layout::default()
-					.direction(Direction::Vertical)
-					.constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-					.areas(frame.area());
-				let (tree_area, preview_area) = if preview_visible {
-					let [tree, preview] = Layout::default()
-						.direction(Direction::Horizontal)
-						.constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-						.areas(body_area);
-					(tree, Some(preview))
-				} else {
-					(body_area, None)
-				};
-				tree_rows.set(tree_area.height as usize);
-
-				WinBar::render(frame, win_area, &cwd);
-				TabBar::render(frame, tab_area, &labels);
-				TreeView::render(
-					frame,
-					tree_area,
-					&rows,
-					TreeViewState {
-						cursor: tab.cursor,
-						selection: &tab.selection,
-						clipboard: &tab.clipboard,
-						clipboard_cut: tab.clipboard_cut,
-						column_mode,
-						icon_theme,
-						finder: tab.finder.as_ref(),
-					},
-				);
-				if let Some(area) = preview_area {
-					preview_size.set((area.width.saturating_sub(1), area.height));
-					PreviewView::render(
-						frame,
-						area,
-						rows.get(tab.cursor).map(|(_, node)| *node),
-						&tab.preview.state,
-						tab.preview.skip,
-					);
-				}
-				StatusBar::render(frame, status_area, &status);
-				WhichPopup::render(frame, frame.area(), &which);
-				if let Some(targets) = &pending_delete {
-					ConfirmPopup::render_delete(frame, frame.area(), targets);
-				}
-
-				if let Some(input) = &mut input {
-					let title = input.title();
-					let (x, y, rect) = Prompt::render(frame, frame.area(), title, &mut input.state);
-					if let Some(cmp) = &input.completion {
-						CompletionPopup::render(frame, frame.area(), rect, &cmp.candidates, cmp.selected);
-					}
-					frame.set_cursor_position((x, y));
-				}
-			})?;
-			let (preview_width, preview_height) = preview_size.get();
-			if tab.preview.sync(preview_target, preview_width, preview_height) {
-				let _ = redraw_tx.send(Event::Redraw);
-			}
-
-			// Cursor *shape* is a raw terminal escape, not something ratatui's
-			// buffer diffing covers — set it after the frame's own writes are
-			// flushed so it doesn't get interleaved with them. A bar in
-			// Insert mirrors vim's editing feel; a block otherwise (Normal,
-			// Visual, edtui's Search) makes clear you're issuing commands.
-			if let Some(input) = &input {
-				use crossterm::cursor::SetCursorStyle;
-				let style = if input.state.mode == EditorMode::Insert { SetCursorStyle::SteadyBar } else { SetCursorStyle::SteadyBlock };
-				crossterm::execute!(io::stdout(), style)?;
-			}
-
-			tab.input = input;
-			app.tree_rows = tree_rows.get();
-			Ok(())
-		};
-
-		draw(&mut app, &mut term)?;
-		while let Some(event) = rx.recv().await {
-			match event {
-				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
-					if app.active_tab().pending_delete.is_some() {
-						let submit = match key.code {
-							KeyCode::Char('y') => Some(true),
-							KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => Some(false),
-							KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
-							_ => None,
-						};
-						let Some(submit) = submit else { continue };
-						app.active_tab_mut().confirm_delete(submit);
-					} else if app.active_tab().input.is_some() {
-						app.active_tab_mut().handle_input_key(key);
-					} else {
-						match router.route(KeyContext::Manager, Key::from(key)) {
-							Route::Actions(actions) => {
-								app.which.clear();
-								for action in actions {
-									Dispatcher::dispatch(&mut app, action);
-								}
-							}
-							Route::Pending(candidates) => app.which = candidates,
-							Route::Unmatched if app.which.is_empty() => continue,
-							Route::Unmatched => app.which.clear(),
-						}
-					}
-				}
-				Event::Term(crossterm::event::Event::Resize(_, _)) => {}
-				Event::Term(_) => continue,
-				event => Dispatcher::dispatch_event(&mut app, event),
+		app.render(terminal.terminal())?;
+		loop {
+			let event = tokio::select! {
+				term_event = terminal.next_event() => match term_event? {
+					Some(event) => Event::Term(event),
+					None => break,
+				},
+				background_event = rx.recv() => match background_event {
+					Some(event) => event,
+					None => break,
+				},
+			};
+			if !app.handle_event(event, &mut router) {
+				continue;
 			}
 			if app.quit {
 				break;
 			}
-			draw(&mut app, &mut term)?;
+			app.run_pending_processes(&mut terminal).await?;
+			app.render(terminal.terminal())?;
 		}
 
+		Ok(())
+	}
+
+	fn handle_event(&mut self, event: Event, router: &mut Router) -> bool {
+		match event {
+			Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => self.handle_key(key, router),
+			Event::Term(crossterm::event::Event::Resize(_, _)) => true,
+			Event::Term(_) => false,
+			event => {
+				Dispatcher::dispatch_event(self, event);
+				true
+			}
+		}
+	}
+
+	fn handle_key(&mut self, key: crossterm::event::KeyEvent, router: &mut Router) -> bool {
+		if self.open_picker.is_some() {
+			return match key.code {
+				KeyCode::Up | KeyCode::Char('k') => { self.move_open_picker(-1); true }
+				KeyCode::Down | KeyCode::Char('j') => { self.move_open_picker(1); true }
+				KeyCode::Enter => { self.submit_open_picker(); true }
+				KeyCode::Esc | KeyCode::Char('q') => { self.open_picker = None; true }
+				_ => false,
+			};
+		}
+		if self.active_tab().pending_delete.is_some() {
+			let submit = match key.code {
+				KeyCode::Char('y') => Some(true),
+				KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n') => Some(false),
+				KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+				_ => None,
+			};
+			let Some(submit) = submit else { return false };
+			self.active_tab_mut().confirm_delete(submit);
+			return true;
+		}
+		if self.active_tab().input.is_some() {
+			self.active_tab_mut().handle_input_key(key);
+			return true;
+		}
+
+		match router.route(KeyContext::Manager, Key::from(key)) {
+			Route::Actions(actions) => {
+				self.which.clear();
+				for action in actions {
+					Dispatcher::dispatch(self, action);
+				}
+				true
+			}
+			Route::Pending(candidates) => { self.which = candidates; true }
+			Route::Unmatched if self.which.is_empty() => false,
+			Route::Unmatched => { self.which.clear(); true }
+		}
+	}
+
+	async fn run_pending_processes(&mut self, terminal: &mut TerminalSession) -> io::Result<()> {
+		while let Some(request) = self.processes.pop_front() {
+			let blocking = request.mode().blocks_terminal();
+			if blocking {
+				terminal.suspend();
+			}
+			let completion = request.execute().await;
+			if blocking {
+				terminal.resume()?;
+			}
+			self.on_process_completion(completion);
+		}
 		Ok(())
 	}
 
@@ -269,7 +190,8 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme, tx,
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
 		};
 
 		// drain the root tab's initial listing so it's got visible rows
@@ -386,6 +308,30 @@ mod tests {
 		app.switch_tab(-1);
 		assert!(app.active_tab().preview.visible, "each tab retains its own preview setting");
 
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn fzf_directory_changes_root_and_nested_file_is_revealed_lazily() {
+		let root = std::env::temp_dir().join("tuzi-app-test-fzf");
+		let nested = root.join("a/b");
+		fs::create_dir_all(&nested).unwrap();
+		fs::write(nested.join("target.txt"), b"target").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.apply_fzf_output(0, &root, false, b"a/b/target.txt\n");
+		for _ in 0..4 {
+			if app.active_tab().visible()[app.active_tab().cursor].1.path == root.join("a/b/target.txt") {
+				break;
+			}
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			Dispatcher::dispatch_event(&mut app, event);
+		}
+		assert_eq!(app.active_tab().visible()[app.active_tab().cursor].1.path, root.join("a/b/target.txt"));
+
+		app.apply_fzf_output(0, &root, false, b"a\n");
+		assert_eq!(app.active_tab().tree.root.path, root.join("a"));
 		fs::remove_dir_all(&root).unwrap();
 	}
 
