@@ -70,6 +70,10 @@ impl Tab {
 		self.cursor = (self.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
 	}
 
+	pub fn move_to_top(&mut self) { self.cursor = 0; }
+
+	pub fn move_to_bottom(&mut self) { self.cursor = self.visible().len().saturating_sub(1); }
+
 	/// Marks the directory open immediately (the triangle flips, the row
 	/// stays put) and, if it's never been listed, kicks off a background
 	/// read — the listing lands later as a `Loaded` event instead of

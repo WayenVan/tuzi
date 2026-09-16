@@ -1,11 +1,11 @@
-use std::{env, io, thread};
+use std::{cell::Cell, env, io, thread};
 
 use crossterm::event::KeyEventKind;
 use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, keymap::{Key, KeyContext, Route, Router}, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView}}};
+use crate::{event::Event, keymap::{Key, KeyContext, Route, Router}, tui::{Raterm, widgets::{CompletionPopup, Prompt, StatusBar, TabBar, TreeView, WinBar}}};
 
 use super::{Dispatcher, Tab};
 
@@ -14,6 +14,7 @@ pub struct App {
 	pub active:  usize,
 	pub quit:    bool,
 	next_tab_id: usize,
+	tree_rows:   usize,
 	tx:          mpsc::UnboundedSender<Event>,
 }
 
@@ -35,11 +36,13 @@ impl App {
 		});
 
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
-		let mut app = Self { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tx };
+		let mut app = Self { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, tx };
 		let mut term = Raterm::start()?;
 		let mut router = Router::default();
 
 		let draw = |app: &mut App, term: &mut Raterm, key_hint: &str| -> io::Result<()> {
+			let tree_rows = Cell::new(app.tree_rows);
+			let cwd = app.active_tab().tree.root.path.clone();
 			// Collected as owned strings *before* grabbing the active tab
 			// mutably below — otherwise the tab bar's shared borrow of
 			// every tab and the active tab's exclusive borrow (needed for
@@ -71,11 +74,13 @@ impl App {
 			}
 			let visual = tab.visual_range();
 			term.terminal.draw(|frame| {
-				let [tab_area, tree_area, status_area] = Layout::default()
+				let [win_area, tab_area, tree_area, status_area] = Layout::default()
 					.direction(Direction::Vertical)
-					.constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+					.constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
 					.areas(frame.area());
+				tree_rows.set(tree_area.height as usize);
 
+				WinBar::render(frame, win_area, &cwd);
 				TabBar::render(frame, tab_area, &labels);
 				TreeView::render(frame, tree_area, &rows, tab.cursor, &tab.selection, visual);
 				StatusBar::render(frame, status_area, &status, warn);
@@ -102,6 +107,7 @@ impl App {
 			}
 
 			app.active_tab_mut().input = input;
+			app.tree_rows = tree_rows.get();
 			Ok(())
 		};
 
@@ -122,6 +128,7 @@ impl App {
 						}
 					}
 				}
+				Event::Term(crossterm::event::Event::Resize(_, _)) => {}
 				Event::Term(_) => continue,
 				event => Dispatcher::dispatch_event(&mut app, event),
 			}
@@ -176,6 +183,15 @@ impl App {
 		let next = (pos as isize + delta).rem_euclid(self.tabs.len() as isize) as usize;
 		self.active = self.tabs[next].id;
 	}
+
+	pub fn move_page(&mut self, percent: i8) {
+		let rows = self.tree_rows.max(1) as isize;
+		let mut delta = rows * percent as isize / 100;
+		if delta == 0 && percent != 0 {
+			delta = percent.signum() as isize;
+		}
+		self.active_tab_mut().move_cursor(delta);
+	}
 }
 
 #[cfg(test)]
@@ -187,7 +203,7 @@ mod tests {
 	async fn app(root: &Path) -> (App, mpsc::UnboundedReceiver<Event>) {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
-		let mut app = App { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tx };
+		let mut app = App { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, tx };
 
 		// drain the root tab's initial listing so it's got visible rows
 		let event = rx.recv().await.unwrap();
@@ -263,6 +279,40 @@ mod tests {
 
 		app.switch_tab(-1);
 		assert_eq!(app.active, 2, "wraps the other way too");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn page_and_absolute_movement_use_visible_rows_and_clamp() {
+		let root = std::env::temp_dir().join("tuzi-app-test-page-movement");
+		fs::create_dir_all(&root).unwrap();
+		for index in 0..10 {
+			fs::create_dir_all(root.join(format!("dir-{index}"))).unwrap();
+		}
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		app.tree_rows = 4;
+
+		app.move_page(50);
+		assert_eq!(app.active_tab().cursor, 2);
+		app.move_page(100);
+		assert_eq!(app.active_tab().cursor, 6);
+		app.move_page(-50);
+		assert_eq!(app.active_tab().cursor, 4);
+		app.move_page(-100);
+		assert_eq!(app.active_tab().cursor, 0, "movement clamps at the first row");
+
+		app.move_page(100);
+		app.move_page(100);
+		app.move_page(100);
+		assert_eq!(app.active_tab().cursor, 10, "movement clamps at the last row");
+
+		app.active_tab_mut().move_to_top();
+		assert_eq!(app.active_tab().cursor, 0);
+		app.active_tab_mut().move_to_bottom();
+		assert_eq!(app.active_tab().cursor, 10);
 
 		fs::remove_dir_all(&root).unwrap();
 	}

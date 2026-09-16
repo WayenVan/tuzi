@@ -1,4 +1,4 @@
-use crate::{action::{Action, InputKind}, event::Event};
+use crate::{action::{Action, CursorTarget, InputKind}, event::Event};
 
 use super::App;
 
@@ -10,6 +10,9 @@ impl Dispatcher {
 			Action::Quit => app.quit = true,
 			Action::Escape => app.active_tab_mut().escape(),
 			Action::MoveCursor(delta) => app.active_tab_mut().move_cursor(delta),
+			Action::MovePage(percent) => app.move_page(percent),
+			Action::MoveTo(CursorTarget::Top) => app.active_tab_mut().move_to_top(),
+			Action::MoveTo(CursorTarget::Bottom) => app.active_tab_mut().move_to_bottom(),
 			Action::Expand => app.active_tab_mut().expand_selected(),
 			Action::Collapse => app.active_tab_mut().collapse_selected(),
 			Action::ToggleSelect => app.active_tab_mut().toggle_selected(),
