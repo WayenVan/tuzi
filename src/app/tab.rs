@@ -1,10 +1,10 @@
-use std::{collections::HashMap, io, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{action::DeleteMode, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{action::{CopyKind, DeleteMode}, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, SortBy, SortPolicy, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
 use super::{input::{Completion, InputPurpose, InputSession}, visible_projection::VisibleProjection};
 
@@ -27,6 +27,7 @@ pub struct Tab {
 	/// scratch — which would re-track the cursor on every move.
 	pub scroll:         usize,
 	pub column_mode:    ColumnMode,
+	pub sort_policy:    SortPolicy,
 	pub preview:        Preview,
 	pub watcher:        Watcher,
 	pub fs_scheduler:   FsScheduler,
@@ -58,6 +59,30 @@ enum PendingListing {
 	Buffered { ticket: u64, entries: Vec<(PathBuf, Cha)> },
 }
 
+/// What a completed listing needs done with it — the tree is already
+/// up to date for `Incremental` (batches were applied as they arrived),
+/// so it only needs the closing `finish_incremental_listing` pass, while
+/// `Full` still has to be handed its entries via `apply_listing`.
+enum ListingOutcome {
+	Incremental,
+	Full(Vec<(PathBuf, Cha)>),
+}
+
+impl PendingListing {
+	/// Resolves a `done` listing for `ticket` against whatever pending
+	/// record (if any) was tracking it. `None` means a newer request has
+	/// already superseded this one, so the caller should leave the tree
+	/// alone entirely rather than clobber it with a stale result.
+	fn finish(pending: Option<Self>, ticket: u64) -> Option<ListingOutcome> {
+		match pending {
+			None => Some(ListingOutcome::Full(Vec::new())),
+			Some(Self::Incremental { ticket: current }) if current == ticket => Some(ListingOutcome::Incremental),
+			Some(Self::Buffered { ticket: current, entries }) if current == ticket => Some(ListingOutcome::Full(entries)),
+			Some(_) => None,
+		}
+	}
+}
+
 impl Tab {
 	pub fn open(id: usize, path: PathBuf, tx: UnboundedSender<Event>) -> io::Result<Self> {
 		let mut tree = Tree::open(path)?;
@@ -81,6 +106,7 @@ impl Tab {
 			cursor: 0,
 			scroll: 0,
 			column_mode: ColumnMode::None,
+			sort_policy: SortPolicy::default(),
 			preview: Preview::new(id, tx.clone()),
 			watcher,
 			fs_scheduler,
@@ -152,6 +178,21 @@ impl Tab {
 		if cursor != self.cursor {
 			self.cursor = cursor;
 			self.preview.target_changed();
+		}
+	}
+
+	pub fn set_sort(&mut self, policy: SortPolicy) {
+		let hovered = self.visible_at(self.cursor).map(|(_, node)| node.path.clone());
+		self.sort_policy = policy;
+		self.tree.sort(policy);
+		self.rebuild_projection();
+		match policy.by {
+			SortBy::Modified => self.column_mode = ColumnMode::Modified,
+			SortBy::Size => self.column_mode = ColumnMode::Size,
+			SortBy::Name | SortBy::Extension => {}
+		}
+		if let Some(path) = hovered {
+			self.select(&path);
 		}
 	}
 
@@ -277,7 +318,8 @@ impl Tab {
 		targets
 	}
 
-	/// Copies or moves `paths` into the cursor's parent directory (see
+	/// Copies or moves `paths` into the directory under the cursor, or next
+	/// to the cursor when it is a file (see
 	/// `paste_target`). App hands this destination to its global task queue.
 	pub(super) fn paste_destination(&self) -> Option<PathBuf> { self.paste_target() }
 
@@ -524,6 +566,8 @@ impl Tab {
 		}
 		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
 		replacement.input_seq = self.input_seq;
+		replacement.sort_policy = self.sort_policy;
+		replacement.column_mode = self.column_mode;
 		*self = replacement;
 		Ok(())
 	}
@@ -608,13 +652,19 @@ impl Tab {
 		}
 	}
 
+	/// Requests a fresh completion list, debounced by 50ms. Deliberately
+	/// leaves the previous `input.completion` in place rather than clearing
+	/// it here — every keystroke reaches this function, so clearing
+	/// synchronously would blank the popup for the length of the debounce
+	/// on every single character, flashing it empty-then-full repeatedly.
+	/// `on_completion_loaded` replaces it once the fresh list actually
+	/// arrives (with `None` if that list turns out to be empty).
 	fn schedule_completion(&self, input: &mut InputSession) {
 		let InputPurpose::Cd { base } = &input.purpose else { return };
 		if let Some(task) = input.completion_task.take() {
 			task.abort();
 		}
 		input.revision += 1;
-		input.completion = None;
 		let tab = self.id;
 		let input_id = input.id;
 		let revision = input.revision;
@@ -670,70 +720,71 @@ impl Tab {
 		}
 	}
 
-	/// A background listing batch arrived. First loads are appended directly
-	/// so large directories become usable before their scan finishes; refreshes
-	/// keep the old listing visible and buffer batches until completion.
-	/// A failed listing (permission denied, the directory vanished, …)
-	/// collapses the node and pins the error to it (`Node::load_error`)
-	/// instead of leaving it stuck showing "(loading…)" forever — this is a
-	/// standing problem with that one directory, not a one-off toast.
+	/// A background listing message arrived — either one more batch, or the
+	/// final word on whether the whole listing succeeded. Just dispatches;
+	/// `on_listing_batch` and `on_listing_done` each own one concern.
 	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>, done: bool) {
 		if !self.fs_scheduler.accept(&path, ticket, done) {
 			return;
 		}
-
-		if !done {
-			let entries = match result {
-				Ok(entries) => entries,
-				Err(_) => return,
-			};
-			if !self.pending_listings.contains_key(&path) {
-				let listing = if self.tree.begin_incremental_listing(&path) {
-					PendingListing::Incremental { ticket }
-				} else {
-					PendingListing::Buffered { ticket, entries: Vec::new() }
-				};
-				self.pending_listings.insert(path.clone(), listing);
-			}
-			match self.pending_listings.get_mut(&path) {
-				Some(PendingListing::Incremental { ticket: current }) if *current == ticket => {
-					let start = self.tree.root.find(&path).and_then(|node| node.children.as_ref()).map_or(0, Vec::len);
-					self.tree.append_listing(&path, entries);
-					self.projection.append_children(&self.tree.root, &path, start, self.filter.as_ref());
-				}
-				Some(PendingListing::Buffered { ticket: current, entries: buffered }) if *current == ticket => buffered.extend(entries),
-				_ => return,
-			}
-			self.continue_reveal();
-			self.clamp_cursor();
-			return;
+		if done {
+			self.on_listing_done(path, ticket, result);
+		} else if let Ok(entries) = result {
+			self.on_listing_batch(path, ticket, entries);
 		}
+	}
 
+	/// First loads are appended directly so large directories become usable
+	/// before their scan finishes; refreshes keep the old listing visible
+	/// and buffer batches until `on_listing_done` completes.
+	fn on_listing_batch(&mut self, path: PathBuf, ticket: u64, entries: Vec<(PathBuf, Cha)>) {
+		if !self.pending_listings.contains_key(&path) {
+			let listing = if self.tree.begin_incremental_listing(&path) {
+				PendingListing::Incremental { ticket }
+			} else {
+				PendingListing::Buffered { ticket, entries: Vec::new() }
+			};
+			self.pending_listings.insert(path.clone(), listing);
+		}
+		match self.pending_listings.get_mut(&path) {
+			Some(PendingListing::Incremental { ticket: current }) if *current == ticket => {
+				let start = self.tree.root.find(&path).and_then(|node| node.children.as_ref()).map_or(0, Vec::len);
+				self.tree.append_listing(&path, entries);
+				self.projection.append_children(&self.tree.root, &path, start, self.filter.as_ref());
+			}
+			Some(PendingListing::Buffered { ticket: current, entries: buffered }) if *current == ticket => buffered.extend(entries),
+			_ => return,
+		}
+		self.continue_reveal();
+		self.clamp_cursor();
+	}
+
+	/// A listing finished, one way or another. A failed listing (permission
+	/// denied, the directory vanished, …) collapses the node and pins the
+	/// error to it (`Node::load_error`) instead of leaving it stuck showing
+	/// "(loading…)" forever — this is a standing problem with that one
+	/// directory, not a one-off toast.
+	fn on_listing_done(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>) {
 		let hovered = self.visible_at(self.cursor).map(|(_, node)| node.path.clone());
 		let pending = self.pending_listings.remove(&path);
 		match result {
 			Ok(_) => {
-				match pending {
-					Some(PendingListing::Incremental { ticket: current }) if current == ticket => {
-						self.tree.finish_incremental_listing(&path);
-						self.sync_projection(&path);
+				match PendingListing::finish(pending, ticket) {
+					Some(ListingOutcome::Incremental) => {
+						self.tree.finish_incremental_listing(&path, self.sort_policy);
 					}
-					Some(PendingListing::Buffered { ticket: current, entries }) if current == ticket => {
-						self.tree.apply_listing(&path, entries);
-						self.sync_projection(&path);
+					Some(ListingOutcome::Full(entries)) => {
+						self.tree.apply_listing(&path, entries, self.sort_policy);
 					}
-					None => {
-						self.tree.apply_listing(&path, Vec::new());
-						self.sync_projection(&path);
-					}
-					_ => return,
+					None => return,
 				}
+				self.sync_projection(&path);
 				if let Some(hovered) = hovered {
 					self.select(&hovered);
 				}
 			}
 			Err(error) => {
-				if matches!(pending, Some(PendingListing::Incremental { ticket: current }) if current == ticket) {
+				if matches!(&pending, Some(PendingListing::Incremental { ticket: current }) if *current == ticket) {
 					self.tree.discard_incremental_listing(&path);
 				}
 				self.tree.fail_listing(&path, error.to_string());
@@ -805,13 +856,39 @@ impl Tab {
 		self.action_targets()
 	}
 
-	/// Where paste drops files: always the parent of whatever's under the
-	/// cursor, never the cursor's own node — the cursor marks a position in
-	/// the tree, not a directory to descend into. `None` when the cursor is
-	/// on the tree's own root, which has no parent to paste into.
+	pub fn copy_text(&mut self, kind: CopyKind) -> Vec<u8> {
+		self.commit_visual();
+		let mut paths = self.action_targets();
+		paths.sort();
+		if matches!(kind, CopyKind::DirectoryPath | CopyKind::DirectoryUrl) {
+			let root = &self.tree.root.path;
+			paths = paths
+				.into_iter()
+				.filter_map(|path| if path == *root { Some(path) } else { path.parent().map(Path::to_path_buf) })
+				.collect();
+			paths.dedup();
+			if paths.is_empty() {
+				paths.push(root.clone());
+			}
+		}
+
+		paths
+			.iter()
+			.filter_map(|path| match kind {
+				CopyKind::Path | CopyKind::DirectoryPath => Some(path.as_os_str().as_bytes().to_vec()),
+				CopyKind::Url | CopyKind::DirectoryUrl => Some(file_url(path)),
+				CopyKind::Filename => path.file_name().map(|name| name.as_bytes().to_vec()),
+				CopyKind::Stem => path.file_stem().map(|name| name.as_bytes().to_vec()),
+			})
+			.collect::<Vec<_>>()
+			.join(&b'\n')
+	}
+
+	/// A directory is an explicit destination, including an empty directory
+	/// and the tree root. A file instead means "beside this file".
 	fn paste_target(&self) -> Option<PathBuf> {
 		let (_, node) = self.visible_at(self.cursor)?;
-		self.tree.parent_of(&node.path)
+		if node.cha.is_dir { Some(node.path.clone()) } else { self.tree.parent_of(&node.path) }
 	}
 
 	fn refresh_parents(&mut self, paths: &[PathBuf]) {
@@ -852,6 +929,18 @@ impl Tab {
 
 fn node_name(node: &Node) -> String {
 	node.path.file_name().map_or_else(|| node.path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+fn file_url(path: &Path) -> Vec<u8> {
+	let mut out = b"file://".to_vec();
+	for byte in path.as_os_str().as_bytes() {
+		if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+			out.push(*byte);
+		} else {
+			out.extend_from_slice(format!("%{byte:02X}").as_bytes());
+		}
+	}
+	out
 }
 
 fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
@@ -999,6 +1088,31 @@ mod tests {
 		let input = tab.input.as_mut().unwrap();
 		input.state.lines = edtui::Lines::from(value);
 		input.state.cursor = edtui::Index2::new(0, value.chars().count());
+	}
+
+	#[tokio::test]
+	async fn sorting_keeps_the_hovered_path_and_updates_related_columns() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-sort");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("a.txt"), b"a").unwrap();
+		fs::write(root.join("b.txt"), b"bbbb").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+		tab.cursor = tab.visible_position(&root.join("a.txt")).unwrap();
+
+		tab.set_sort(SortPolicy::new(SortBy::Size, true));
+
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("a.txt"));
+		assert_eq!(tab.visible()[1].1.path, root.join("b.txt"));
+		assert_eq!(tab.column_mode, ColumnMode::Size);
+
+		tab.set_sort(SortPolicy::new(SortBy::Modified, false));
+		assert_eq!(tab.column_mode, ColumnMode::Modified);
+		tab.set_sort(SortPolicy::new(SortBy::Extension, false));
+		assert_eq!(tab.column_mode, ColumnMode::Modified, "name-like sorting leaves the chosen column alone");
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
@@ -1395,7 +1509,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn paste_destination_is_the_cursors_parent_not_the_cursor_itself() {
+	async fn paste_destination_enters_directories_and_uses_a_files_parent() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into");
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
@@ -1407,14 +1521,14 @@ mod tests {
 		pump(&mut tab, &mut rx).await; // dst.children = [sub]
 		tab.move_cursor(1); // onto "dst/sub", itself a directory
 
-		// Pasting while the cursor sits on "sub" lands in "sub"'s parent,
-		// "dst" — not inside "sub", even though "sub" is a directory.
-		assert_eq!(tab.paste_destination(), Some(root.join("dst")));
+		assert_eq!(tab.paste_destination(), Some(root.join("dst/sub")));
+		tab.move_cursor(1); // source.txt
+		assert_eq!(tab.paste_destination(), Some(root.clone()));
 		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
-	async fn paste_destination_refuses_the_tree_root() {
+	async fn paste_destination_accepts_the_tree_root() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into-root");
 		fs::create_dir_all(&root).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
@@ -1423,9 +1537,32 @@ mod tests {
 		let (tab, _rx) = tab(&root).await;
 		assert_eq!(tab.cursor, 0, "starts on the tree's own root");
 
-		assert!(tab.paste_destination().is_none(), "the root has no parent to paste into");
-		assert!(root.join("source.txt").exists(), "nothing was moved");
+		assert_eq!(tab.paste_destination(), Some(root.clone()));
 
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn clipboard_copy_variants_match_the_yazi_chords() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-copy-text");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("folder")).unwrap();
+		fs::write(root.join("hello world.rs"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+		tab.select(&root.join("hello world.rs"));
+
+		assert_eq!(tab.copy_text(CopyKind::Path), root.join("hello world.rs").as_os_str().as_bytes());
+		assert_eq!(tab.copy_text(CopyKind::Filename), b"hello world.rs");
+		assert_eq!(tab.copy_text(CopyKind::Stem), b"hello world");
+		assert_eq!(tab.copy_text(CopyKind::DirectoryPath), root.as_os_str().as_bytes());
+		assert_eq!(tab.copy_text(CopyKind::Url), file_url(&root.join("hello world.rs")));
+
+		tab.select(&root.join("folder"));
+		assert_eq!(tab.copy_text(CopyKind::DirectoryPath), root.as_os_str().as_bytes(), "cd copies the containing directory");
+
+		tab.cursor = 0;
+		assert_eq!(tab.copy_text(CopyKind::DirectoryPath), root.as_os_str().as_bytes(), "the synthetic root row represents the cwd");
 		fs::remove_dir_all(root).unwrap();
 	}
 
