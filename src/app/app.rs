@@ -3,7 +3,7 @@ use std::{collections::VecDeque, env, io, path::PathBuf};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::{action::DeleteMode, event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskKind, TaskManager}, tui::TerminalSession};
+use crate::{action::DeleteMode, event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, notice::{Notice, NoticeLevel}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskKind, TaskManager}, tui::TerminalSession};
 
 use super::{Dispatcher, Tab};
 
@@ -23,6 +23,10 @@ pub struct App {
 	pub(super) processes:   VecDeque<ProcessRequest>,
 	pub(super) tx:         mpsc::UnboundedSender<Event>,
 	pub tasks:             TaskManager,
+	/// One-off toasts (invalid cd, refused delete, a failed external
+	/// process, …) — global, not tied to whichever tab is active, and
+	/// timeout-driven rather than something the user dismisses.
+	pub(super) notices:    Vec<Notice>,
 }
 
 impl App {
@@ -34,7 +38,7 @@ impl App {
 			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), tx,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
 		};
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::default();
@@ -242,6 +246,35 @@ impl App {
 			DeleteMode::Permanent => self.tasks.enqueue_delete(targets, tab),
 		}
 	}
+
+	/// Queues a toast. No animation, no dismiss key — it just sits until its
+	/// level's timeout elapses, at which point the scheduled redraw below
+	/// notices `prune_notices` dropped it, even if nothing else happens in
+	/// the meantime.
+	pub fn push_notice(&mut self, level: NoticeLevel, message: impl Into<String>) {
+		let notice = Notice::new(level, message);
+		let wakeup = notice.remaining();
+		self.notices.push(notice);
+
+		let tx = self.tx.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(wakeup).await;
+			let _ = tx.send(Event::Redraw);
+		});
+	}
+
+	pub(super) fn prune_notices(&mut self) { self.notices.retain(|n| !n.expired()); }
+
+	/// Moves whatever one-off message each tab has queued for itself (an
+	/// invalid cd, a refused delete, …) into the toast queue. Tabs can't
+	/// push a toast directly — only `App` owns `notices` — so this outbox
+	/// is drained after every dispatch, regardless of which tab set it.
+	pub(super) fn drain_tab_notices(&mut self) {
+		let pending: Vec<(NoticeLevel, String)> = self.tabs.iter_mut().filter_map(|tab| tab.pending_notice.take()).collect();
+		for (level, message) in pending {
+			self.push_notice(level, message);
+		}
+	}
 }
 
 #[cfg(test)]
@@ -259,7 +292,7 @@ mod tests {
 			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), tx,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
 		};
 
 		// drain the root tab's initial listing so it's got visible rows
@@ -365,6 +398,50 @@ mod tests {
 		pump(&mut app, &mut rx).await;
 
 		assert!(!root.join("leaf.txt").exists());
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_refused_operation_surfaces_as_a_toast_via_dispatch() {
+		let root = std::env::temp_dir().join("tuzi-app-test-toast");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		assert!(app.notices.is_empty());
+
+		// Cursor starts on the tab's own tree root, so this is refused
+		// outright — Tab queues the refusal, and an ordinary dispatch (not
+		// a manual drain) is what's supposed to turn it into a toast.
+		Dispatcher::dispatch(&mut app, Action::Delete);
+
+		assert!(app.active_tab().pending_delete.is_none(), "nothing was armed to confirm");
+		assert_eq!(app.notices.len(), 1);
+		assert_eq!(app.notices[0].message, "The current tree root cannot be deleted");
+		assert_eq!(app.notices[0].level, NoticeLevel::Warn);
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_directory_load_failure_pins_to_the_node_not_a_toast() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = std::env::temp_dir().join("tuzi-app-test-load-failure-no-toast");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("locked")).unwrap();
+		let root = root.canonicalize().unwrap();
+		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().move_cursor(1); // onto "locked"
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // Loaded(locked) -> permission denied
+
+		assert!(app.notices.is_empty(), "a directory load failure is pinned to its node, not turned into a toast");
+
+		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
 		fs::remove_dir_all(&root).unwrap();
 	}
 

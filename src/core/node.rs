@@ -4,20 +4,26 @@ use super::Filter;
 use crate::fs::{Cha, SortBy, sort};
 
 pub struct Node {
-	pub path:     PathBuf,
-	pub cha:      Cha,
-	pub expanded: bool,
-	pub children: Option<Vec<Node>>,
+	pub path:       PathBuf,
+	pub cha:        Cha,
+	pub expanded:   bool,
+	pub children:   Option<Vec<Node>>,
+	/// Set when the most recent listing attempt for this node failed
+	/// (permission denied, the directory vanished, …). Unlike a toast, this
+	/// stays pinned to the node — and thus visible in the tree — until the
+	/// next expand attempt either clears it or replaces it with a fresh one.
+	pub load_error: Option<String>,
 }
 
 impl Node {
-	pub fn new(path: PathBuf, cha: Cha) -> Self { Self { path, cha, expanded: false, children: None } }
+	pub fn new(path: PathBuf, cha: Cha) -> Self { Self { path, cha, expanded: false, children: None, load_error: None } }
 
 	/// Marks this node open immediately (so the UI reacts right away) without
 	/// touching disk. Returns whether a listing still needs to be fetched —
 	/// `false` if `children` is already cached from a previous expand.
 	pub fn mark_expanded(&mut self) -> bool {
 		self.expanded = true;
+		self.load_error = None;
 		self.children.is_none()
 	}
 
@@ -30,6 +36,7 @@ impl Node {
 	/// refreshes; the caller is responsible for actually fetching the
 	/// listing off-thread and only calling this once it has one.
 	pub fn apply_listing(&mut self, mut entries: Vec<(PathBuf, Cha)>) {
+		self.load_error = None;
 		sort(&mut entries, SortBy::Name);
 
 		let mut old = self.children.take().unwrap_or_default();

@@ -3,12 +3,13 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, TreeView, TreeViewState, WhichPopup, WinBar}}};
+use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar}}};
 
 use super::App;
 
 impl App {
 	pub(super) fn render(&mut self, term: &mut Raterm) -> io::Result<()> {
+		self.prune_notices();
 		let tree_rows = Cell::new(self.tree_rows);
 		let preview_size = Cell::new((0, 0));
 		let redraw_tx = self.tx.clone();
@@ -47,6 +48,7 @@ impl App {
 		let task_visible = self.tasks.visible;
 		let task_cursor = self.tasks.cursor;
 		let tasks = &self.tasks.tasks;
+		let notices = &self.notices;
 
 		term.terminal.draw(|frame| {
 			let [win_area, tab_area, body_area, status_area] = Layout::default()
@@ -109,6 +111,7 @@ impl App {
 				frame.set_cursor_position((x, y));
 			}
 			if task_visible { TaskPopup::render(frame, frame.area(), tasks, task_cursor); }
+			Toast::render(frame, body_area, notices);
 		})?;
 		tab.scroll = scroll;
 

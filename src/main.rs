@@ -9,6 +9,7 @@ mod finder;
 mod fs;
 mod icon;
 mod keymap;
+mod notice;
 mod opener;
 mod process;
 mod preview;

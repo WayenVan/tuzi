@@ -2,7 +2,7 @@ use std::{io, path::{Path, PathBuf}};
 
 use tokio::process::Command;
 
-use crate::{opener::{OpenMode, OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
+use crate::{notice::NoticeLevel, opener::{OpenMode, OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
 
 use super::App;
 
@@ -22,7 +22,7 @@ impl App {
 			}
 			match result {
 				Ok(targets) => self.open_picker = Some(OpenPicker { cwd, targets, selected: 0 }),
-				Err(error) => self.set_tab_notice(tab, error.to_string()),
+				Err(error) => self.raise_tab_notice(tab, NoticeLevel::Error, error.to_string()),
 			}
 			return;
 		}
@@ -42,7 +42,7 @@ impl App {
 	fn enqueue_open(&mut self, tab: usize, result: io::Result<Vec<ProcessRequest>>) {
 		match result {
 			Ok(requests) => self.processes.extend(requests),
-			Err(error) => self.set_tab_notice(tab, error.to_string()),
+			Err(error) => self.raise_tab_notice(tab, NoticeLevel::Error, error.to_string()),
 		}
 	}
 
@@ -75,12 +75,12 @@ impl App {
 			Ok(ProcessOutput::Detached) => return,
 			Ok(ProcessOutput::Completed { status, .. }) if status.code() == Some(130) => return,
 			Ok(ProcessOutput::Completed { status, .. }) if !status.success() => {
-				self.active_tab_mut().notice = Some(format!("{label} exited with {status}"));
+				self.active_tab_mut().raise(NoticeLevel::Warn, format!("{label} exited with {status}"));
 				return;
 			}
 			Ok(output) => output,
 			Err(error) => {
-				self.active_tab_mut().notice = Some(format!("{label}: {error}"));
+				self.active_tab_mut().raise(NoticeLevel::Error, format!("{label}: {error}"));
 				return;
 			}
 		};
@@ -98,7 +98,7 @@ impl App {
 		let paths = match resolve_paths(cwd, stdout) {
 			Ok(paths) => paths,
 			Err(error) => {
-				self.set_tab_notice(tab_id, error.to_string());
+				self.raise_tab_notice(tab_id, NoticeLevel::Error, error.to_string());
 				return;
 			}
 		};
@@ -119,13 +119,13 @@ impl App {
 			}
 		};
 		if let Err(error) = result {
-			tab.notice = Some(error.to_string());
+			tab.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
-	fn set_tab_notice(&mut self, tab: usize, message: String) {
+	fn raise_tab_notice(&mut self, tab: usize, level: NoticeLevel, message: String) {
 		if let Some(tab) = self.tab_mut(tab) {
-			tab.notice = Some(message);
+			tab.raise(level, message);
 		}
 	}
 }

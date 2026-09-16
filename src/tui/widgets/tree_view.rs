@@ -46,7 +46,17 @@ impl TreeView {
 			} else {
 				None
 			};
-			let loading = if node.expanded && node.children.is_none() { " (loading…)" } else { "" };
+			// A load failure is a standing problem with this node, not a
+			// transient toast, so it's pinned to the row itself — checked
+			// ahead of the loading indicator since a collapsed, failed node
+			// isn't "loading" anymore, just broken until retried.
+			let suffix = if let Some(error) = &node.load_error {
+				Some((format!(" (Error: {error})"), Style::new().fg(Color::Red)))
+			} else if node.expanded && node.children.is_none() {
+				Some((" (loading…)".to_string(), Style::new().fg(Color::DarkGray)))
+			} else {
+				None
+			};
 			// An active filter already decided this row belongs in the tree;
 			// highlighting why doubles as a hint once `find` isn't also
 			// pointing at the same name.
@@ -59,8 +69,9 @@ impl TreeView {
 				"  ".repeat(*depth),
 				marker_style,
 				icon,
-				format!("{name}{loading}"),
+				name,
 				matches,
+				suffix,
 				state.column_mode.text(node),
 				area.width as usize,
 			);
@@ -75,12 +86,14 @@ impl TreeView {
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_line(
 	indent: String,
 	marker: Option<Style>,
 	icon: Icon,
 	body: String,
 	matches: Vec<std::ops::Range<usize>>,
+	suffix: Option<(String, Style)>,
 	right: Option<String>,
 	width: usize,
 ) -> Line<'static> {
@@ -91,11 +104,15 @@ fn row_line(
 	let left_limit = if right.is_some() { width - right_width - 1 } else { width };
 	let prefix_width = Line::from(indent.as_str()).width() + 4;
 	if prefix_width > left_limit {
-		return Line::from(truncate(format!("{indent}  {} {body}", icon.text), left_limit));
+		let suffix_text = suffix.map_or_else(String::new, |(text, _)| text);
+		return Line::from(truncate(format!("{indent}  {} {body}{suffix_text}", icon.text), left_limit));
 	}
-	let body = truncate(body, left_limit - prefix_width);
-	let left_width = prefix_width + Line::from(body.as_str()).width();
-	let padding = right.as_ref().map_or(0, |_| width - left_width - right_width);
+	let available = left_limit - prefix_width;
+	let suffix = suffix.map(|(text, style)| (truncate(text, available), style));
+	let suffix_width = suffix.as_ref().map_or(0, |(text, _)| Line::from(text.as_str()).width());
+	let body = truncate(body, available.saturating_sub(suffix_width));
+	let left_width = prefix_width + Line::from(body.as_str()).width() + suffix_width;
+	let padding = right.as_ref().map_or(0, |_| width.saturating_sub(left_width + right_width));
 	let marker = marker.map_or_else(|| Span::raw(" "), |style| Span::styled("│", style));
 	let mut spans = vec![
 		Span::raw(indent),
@@ -105,6 +122,9 @@ fn row_line(
 		Span::raw(" "),
 	];
 	spans.extend(highlight_matches(body, &matches));
+	if let Some((text, style)) = suffix {
+		spans.push(Span::styled(text, style));
+	}
 	if let Some(right) = right {
 		spans.push(Span::raw(" ".repeat(padding)));
 		spans.push(Span::raw(right));

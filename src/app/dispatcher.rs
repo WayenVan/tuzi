@@ -41,6 +41,7 @@ impl Dispatcher {
 			Action::Open { interactive } => app.open_selected(interactive),
 			Action::ToggleTasks => app.tasks.visible = !app.tasks.visible,
 		}
+		app.drain_tab_notices();
 	}
 
 	pub fn dispatch_event(app: &mut App, event: Event) {
@@ -75,5 +76,6 @@ impl Dispatcher {
 			Event::Task(event) => app.on_task_event(event),
 			Event::Term(_) => {}
 		}
+		app.drain_tab_notices();
 	}
 }

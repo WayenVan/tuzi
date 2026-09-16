@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{action::DeleteMode, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{action::DeleteMode, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
 use super::input::{Completion, InputPurpose, InputSession};
 
@@ -34,7 +34,12 @@ pub struct Tab {
 	pub pending_delete: Option<(Vec<PathBuf>, DeleteMode)>,
 	pub finder:         Option<Finder>,
 	pub filter:         Option<Filter>,
-	pub notice:         Option<String>,
+	/// A one-off operational message (an invalid cd, a refused delete, …)
+	/// waiting to be drained into `App`'s toast queue — this is an outbox,
+	/// not something rendered from `Tab` directly. A directory listing
+	/// failure is a different, persistent kind of problem and lives on the
+	/// `Node` itself (`Node::load_error`) instead of here.
+	pub(super) pending_notice: Option<(NoticeLevel, String)>,
 	pending_reveal:     Option<RevealState>,
 	pub(super) input:   Option<InputSession>,
 	input_seq:          u64,
@@ -75,7 +80,7 @@ impl Tab {
 			pending_delete: None,
 			finder: None,
 			filter: None,
-			notice: None,
+			pending_notice: None,
 			pending_reveal: None,
 			input: None,
 			input_seq: 0,
@@ -194,6 +199,13 @@ impl Tab {
 		true
 	}
 
+	/// Queues a one-off toast for `App` to pick up on its next drain —
+	/// see `pending_notice`. A later call before that drain happens simply
+	/// replaces the earlier one; nothing here needs more than the latest.
+	pub(super) fn raise(&mut self, level: NoticeLevel, message: impl Into<String>) {
+		self.pending_notice = Some((level, message.into()));
+	}
+
 	/// Opens a modal confirmation for the current operation targets. The
 	/// event loop owns the modal keys and calls `take_pending_delete`;
 	/// another ordinary `d`/`D` can never submit the destructive action.
@@ -203,7 +215,7 @@ impl Tab {
 		let targets: Vec<_> = self.action_targets().into_iter().filter(|path| path != root).collect();
 		if targets.is_empty() {
 			self.pending_delete = None;
-			self.notice = Some("The current tree root cannot be deleted".into());
+			self.raise(NoticeLevel::Warn, "The current tree root cannot be deleted");
 			return;
 		}
 		self.pending_delete = (!targets.is_empty()).then_some((targets, mode));
@@ -481,14 +493,14 @@ impl Tab {
 	pub fn cd_parent(&mut self) {
 		let Some(parent) = self.tree.root.path.parent().map(Path::to_path_buf) else { return };
 		if let Err(error) = self.cd(parent) {
-			self.notice = Some(error.to_string());
+			self.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
 	pub fn cd_selected(&mut self) {
 		let Some(directory) = self.selected_dir() else { return };
 		if let Err(error) = self.cd(directory) {
-			self.notice = Some(error.to_string());
+			self.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
@@ -497,11 +509,11 @@ impl Tab {
 		let Some(path) = dirs.iter().position(|path| path == &self.tree.root.path)
 			.and_then(|index| dirs.get((index + 1) % dirs.len()))
 			.or_else(|| dirs.first()).cloned() else {
-			self.notice = Some("No trash location found for this platform".into());
+			self.raise(NoticeLevel::Warn, "No trash location found for this platform");
 			return;
 		};
 		if let Err(error) = self.cd(path) {
-			self.notice = Some(error.to_string());
+			self.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
@@ -553,7 +565,7 @@ impl Tab {
 			self.fs_scheduler.refresh(parent);
 		} else {
 			self.pending_reveal = None;
-			self.notice = Some("reveal target is no longer present".into());
+			self.raise(NoticeLevel::Info, "reveal target is no longer present");
 		}
 	}
 
@@ -622,8 +634,9 @@ impl Tab {
 	/// most recent request for that path — a superseded one is discarded
 	/// rather than clobbering a listing a newer request already applied.
 	/// A failed listing (permission denied, the directory vanished, …)
-	/// collapses the node instead of leaving it stuck showing "(loading…)"
-	/// forever, and reports why in the status line.
+	/// collapses the node and pins the error to it (`Node::load_error`)
+	/// instead of leaving it stuck showing "(loading…)" forever — this is a
+	/// standing problem with that one directory, not a one-off toast.
 	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>) {
 		if !self.fs_scheduler.accept(&path, ticket) {
 			return;
@@ -633,8 +646,7 @@ impl Tab {
 				self.tree.apply_listing(&path, entries);
 			}
 			Err(error) => {
-				self.tree.collapse(&path);
-				self.notice = Some(error.to_string());
+				self.tree.fail_listing(&path, error.to_string());
 			}
 		}
 		self.continue_reveal();
@@ -739,7 +751,10 @@ impl Tab {
 		};
 		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return StatusLine::empty(mode) };
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
-		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: self.notice.clone() }
+		// `error` here is left for `render.rs` to fill in from the active
+		// input's own validation error, if any — `pending_notice` is a
+		// separate, App-level toast now, not something the status line shows.
+		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: None }
 	}
 }
 
@@ -922,7 +937,7 @@ mod tests {
 		let locked = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("locked")).unwrap();
 		assert!(!locked.expanded, "collapses instead of staying stuck showing \"(loading…)\" forever");
 		assert!(locked.children.is_none());
-		assert!(tab.notice.is_some(), "reports why, instead of failing silently");
+		assert!(locked.load_error.is_some(), "pinned to the node, instead of failing silently");
 
 		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
 		fs::remove_dir_all(&root).unwrap();
@@ -1181,7 +1196,7 @@ mod tests {
 		for mode in [DeleteMode::Trash, DeleteMode::Permanent] {
 			tab.delete_selected(mode);
 			assert!(tab.pending_delete.is_none());
-			assert_eq!(tab.notice.as_deref(), Some("The current tree root cannot be deleted"));
+			assert_eq!(tab.pending_notice.as_ref().map(|(_, message)| message.as_str()), Some("The current tree root cannot be deleted"));
 		}
 		assert!(root.exists());
 		fs::remove_dir_all(root).unwrap();

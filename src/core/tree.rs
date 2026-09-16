@@ -43,6 +43,19 @@ impl Tree {
 		}
 	}
 
+	/// Records why a listing attempt for `path` failed, and collapses it so
+	/// re-expanding retries instead of just re-showing the stale attempt.
+	pub fn fail_listing(&mut self, path: &Path, error: String) -> bool {
+		match self.root.find_mut(path) {
+			Some(node) => {
+				node.collapse();
+				node.load_error = Some(error);
+				true
+			}
+			None => false,
+		}
+	}
+
 	pub fn parent_of(&self, path: &Path) -> Option<PathBuf> { self.root.find_parent(path).map(|node| node.path.clone()) }
 
 	pub fn is_loaded(&mut self, path: &Path) -> bool { self.root.find_mut(path).is_some_and(|node| node.children.is_some()) }
