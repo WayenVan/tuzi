@@ -158,4 +158,19 @@ mod tests {
 		assert_eq!(router.route(KeyContext::Manager, alt('j')), Route::Actions(vec![Action::SeekPreview(1)]));
 		assert_eq!(router.route(KeyContext::Manager, alt('k')), Route::Actions(vec![Action::SeekPreview(-1)]));
 	}
+
+	#[test]
+	fn slash_and_question_open_find_and_n_repeats_it() {
+		let mut router = Router::default();
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('/')),
+			Route::Actions(vec![Action::OpenInput(InputKind::Find { previous: false })])
+		);
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('?')),
+			Route::Actions(vec![Action::OpenInput(InputKind::Find { previous: true })])
+		);
+		assert_eq!(router.route(KeyContext::Manager, Key::char('n')), Route::Actions(vec![Action::RepeatFind { opposite: false }]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('N')), Route::Actions(vec![Action::RepeatFind { opposite: true }]));
+	}
 }

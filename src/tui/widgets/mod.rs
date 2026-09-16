@@ -14,6 +14,6 @@ pub use prompt::Prompt;
 pub use preview_view::PreviewView;
 pub use status_bar::StatusBar;
 pub use tab_bar::TabBar;
-pub use tree_view::TreeView;
+pub use tree_view::{TreeView, TreeViewState};
 pub use win_bar::WinBar;
 pub use which_popup::WhichPopup;

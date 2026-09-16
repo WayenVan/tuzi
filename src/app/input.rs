@@ -6,6 +6,7 @@ pub(super) enum InputPurpose {
 	Rename { target: PathBuf },
 	Cd { base: PathBuf },
 	Create { base: PathBuf },
+	Find { previous: bool },
 }
 
 pub(super) struct Completion {
@@ -38,6 +39,8 @@ impl InputSession {
 			InputPurpose::Rename { .. } => "Rename",
 			InputPurpose::Cd { .. } => "Go to directory",
 			InputPurpose::Create { .. } => "Create (end with / for directories)",
+			InputPurpose::Find { previous: false } => "Find next",
+			InputPurpose::Find { previous: true } => "Find previous",
 		}
 	}
 
@@ -46,6 +49,13 @@ impl InputSession {
 	}
 
 	pub(super) fn is_cd(&self) -> bool { matches!(self.purpose, InputPurpose::Cd { .. }) }
+
+	pub(super) fn find_previous(&self) -> Option<bool> {
+		match self.purpose {
+			InputPurpose::Find { previous } => Some(previous),
+			_ => None,
+		}
+	}
 
 	pub(super) fn move_completion(&mut self, delta: isize) {
 		let Some(cmp) = &mut self.completion else { return };

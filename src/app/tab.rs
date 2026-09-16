@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{column_mode::ColumnMode, core::{Node, Selection, Tree, Visual}, event::Event, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, watcher::Watcher};
+use crate::{column_mode::ColumnMode, core::{Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
 use super::input::{Completion, InputPurpose, InputSession};
 
@@ -25,7 +25,9 @@ pub struct Tab {
 	pub selection:      Selection,
 	pub visual:         Option<Visual>,
 	pub clipboard:      Vec<PathBuf>,
+	pub clipboard_cut:  bool,
 	pub pending_delete: Option<Vec<PathBuf>>,
+	pub finder:         Option<Finder>,
 	pending_reveal:     Option<PathBuf>,
 	pub(super) input:   Option<InputSession>,
 	input_seq:          u64,
@@ -58,7 +60,9 @@ impl Tab {
 			selection: Selection::default(),
 			visual: None,
 			clipboard: Vec::new(),
+			clipboard_cut: false,
 			pending_delete: None,
+			finder: None,
 			pending_reveal: None,
 			input: None,
 			input_seq: 0,
@@ -108,6 +112,21 @@ impl Tab {
 		}
 	}
 
+	pub fn toggle_expand_selected(&mut self) {
+		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return };
+		if !node.cha.is_dir {
+			return;
+		}
+		if node.expanded {
+			let path = node.path.clone();
+			self.tree.collapse(&path);
+			self.watcher.unwatch(&path);
+			self.fs_scheduler.forget(&path);
+		} else {
+			self.expand_selected();
+		}
+	}
+
 	/// Collapses the selected directory; if the selection isn't an open
 	/// directory (a file, or an already-collapsed one), collapses its parent
 	/// and moves the cursor there instead — pressing "collapse" always does
@@ -132,14 +151,6 @@ impl Tab {
 	}
 
 	pub fn enter_visual(&mut self, unset: bool) { self.visual = Some(Visual::new(self.cursor, unset)); }
-
-	/// The live range between the visual anchor and the cursor — for the
-	/// renderer to preview, before it's applied to the real selection.
-	pub fn visual_range(&self) -> Option<(usize, usize, bool)> {
-		let visual = self.visual?;
-		let (lo, hi) = visual.range(self.cursor);
-		Some((lo, hi, visual.unset))
-	}
 
 	/// Applies the pending visual range to the selection — adding every row
 	/// in it if this was a select, removing them if it was an unset — and
@@ -177,7 +188,15 @@ impl Tab {
 		}
 	}
 
-	pub fn yank_selected(&mut self) { self.clipboard = self.action_targets(); }
+	pub fn yank_selected(&mut self, cut: bool) {
+		let targets = self.action_targets();
+		if targets.is_empty() {
+			return;
+		}
+		self.clipboard = targets;
+		self.clipboard_cut = cut;
+		self.selection.clear();
+	}
 
 	/// Copies the clipboard into the directory under the cursor in the
 	/// background; the target's listing refreshes once `Pasted` comes back.
@@ -186,7 +205,13 @@ impl Tab {
 			return;
 		}
 		let Some(target_dir) = self.paste_target() else { return };
-		self.fs_scheduler.copy(self.clipboard.clone(), target_dir);
+		if self.clipboard_cut {
+			self.fs_scheduler.move_paths(self.clipboard.clone(), target_dir);
+			self.clipboard.clear();
+			self.clipboard_cut = false;
+		} else {
+			self.fs_scheduler.copy(self.clipboard.clone(), target_dir);
+		}
 	}
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
@@ -219,6 +244,42 @@ impl Tab {
 			InputPurpose::Create { base: self.tree.root.path.clone() },
 			"",
 		));
+	}
+
+	pub fn start_find(&mut self, previous: bool) {
+		self.finder = None;
+		self.input_seq += 1;
+		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Find { previous }, ""));
+	}
+
+	pub fn find_arrow(&mut self, previous: bool, include_current: bool) {
+		let Some(finder) = &self.finder else { return };
+		let rows = self.visible();
+		if rows.is_empty() {
+			return;
+		}
+		let len = rows.len();
+		let first = usize::from(!include_current);
+		let found = (first..len).find_map(|offset| {
+			let index = if previous {
+				(self.cursor + len - offset % len) % len
+			} else {
+				(self.cursor + offset) % len
+			};
+			let name = node_name(rows[index].1);
+			finder.matches(&name).then_some(index)
+		});
+		if let Some(cursor) = found
+			&& cursor != self.cursor
+		{
+			self.cursor = cursor;
+			self.preview.target_changed();
+		}
+	}
+
+	pub fn repeat_find(&mut self, opposite: bool) {
+		let Some(finder) = &self.finder else { return };
+		self.find_arrow(finder.previous() ^ opposite, false);
 	}
 
 	/// Handles the common vim input used by rename and interactive cd.
@@ -294,8 +355,8 @@ impl Tab {
 				// line's current length rather than just flipping the mode.
 				input.state.cursor.col = input.state.lines.len_col(input.state.cursor.row).unwrap_or(0);
 				input.state.mode = EditorMode::Insert;
-				if input.is_cd() {
-					self.schedule_completion(&mut input);
+				if input.is_cd() || input.find_previous().is_some() {
+					self.input_changed(&mut input);
 				}
 				self.input = Some(input);
 			}
@@ -307,10 +368,23 @@ impl Tab {
 		let before = (input.value(), input.state.cursor.col);
 		input.handler.on_key_event(key, &mut input.state);
 		input.error = None;
-		if input.is_cd() && before != (input.value(), input.state.cursor.col) {
-			self.schedule_completion(&mut input);
+		let after = (input.value(), input.state.cursor.col);
+		if (input.is_cd() && before != after) || (input.find_previous().is_some() && before.0 != after.0) {
+			self.input_changed(&mut input);
 		}
 		self.input = Some(input);
+	}
+
+	fn input_changed(&mut self, input: &mut InputSession) {
+		if input.is_cd() {
+			self.schedule_completion(input);
+		}
+		if let Some(previous) = input.find_previous() {
+				self.finder = Finder::new(input.value(), previous);
+			if self.finder.is_some() {
+				self.find_arrow(previous, true);
+			}
+		}
 	}
 
 	fn submit_input(&mut self, mut input: InputSession) {
@@ -320,6 +394,12 @@ impl Tab {
 			InputPurpose::Create { base } => {
 				if !value.is_empty() {
 					self.fs_scheduler.create(base.clone(), value);
+				}
+			}
+			InputPurpose::Find { previous } => {
+				self.finder = Finder::new(value, *previous);
+				if self.finder.is_some() {
+					self.find_arrow(*previous, true);
 				}
 			}
 			InputPurpose::Cd { base } => {
@@ -358,6 +438,7 @@ impl Tab {
 		}
 		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
 		replacement.clipboard = std::mem::take(&mut self.clipboard);
+		replacement.clipboard_cut = self.clipboard_cut;
 		replacement.input_seq = self.input_seq;
 		*self = replacement;
 		Ok(())
@@ -400,6 +481,9 @@ impl Tab {
 	/// here at all means no input prompt was open — while one is, Esc
 	/// routes to `handle_input_key` instead.
 	pub fn escape(&mut self) {
+		if self.finder.take().is_some() {
+			return;
+		}
 		if self.commit_visual() {
 			return;
 		}
@@ -517,24 +601,23 @@ impl Tab {
 		}
 	}
 
-	/// The confirmation/mode banners still take over the line when they're
-	/// live — they're state the user needs to act on, not a passive
-	/// hint — but otherwise this is dedicated to the hovered node: its
-	/// name, size, and permissions.
-	///
 	/// Both files and directories display the size reported by their own
 	/// filesystem metadata. This is deliberately not a recursive directory
 	/// total: rendering reads `Cha` only and never starts background I/O.
-	pub fn status_line(&self) -> (String, bool) {
-		if let Some(visual) = self.visual {
-			let label = if visual.unset { "VISUAL UNSET" } else { "VISUAL SELECT" };
-			return (format!("-- {label} -- move to extend, Esc to apply"), true);
-		}
-		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return (String::new(), false) };
+	pub fn status_line(&self) -> StatusLine {
+		let mode = match self.visual {
+			Some(visual) if visual.unset => StatusMode::Unset,
+			Some(_) => StatusMode::Select,
+			None => StatusMode::Normal,
+		};
+		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return StatusLine::empty(mode) };
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
-		let size = format_size(node.cha.len);
-		(format!("{name}  {size}  {}", node.cha.permissions()), false)
+		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: None }
 	}
+}
+
+fn node_name(node: &Node) -> String {
+	node.path.file_name().map_or_else(|| node.path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
 fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
@@ -662,6 +745,28 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn enter_toggles_a_directory_but_not_a_file() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-toggle-expand");
+		fs::create_dir_all(root.join("dir")).unwrap();
+		fs::write(root.join("file.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.move_cursor(1); // dir
+		tab.toggle_expand_selected();
+		assert!(tab.tree.root.children.as_ref().unwrap()[0].expanded);
+		tab.toggle_expand_selected();
+		assert!(!tab.tree.root.children.as_ref().unwrap()[0].expanded);
+
+		tab.move_cursor(1); // file.txt
+		let cursor = tab.cursor;
+		tab.toggle_expand_selected();
+		assert_eq!(tab.cursor, cursor);
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn collapse_from_a_child_jumps_to_and_closes_the_parent() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-child");
 		fs::create_dir_all(root.join("a/b")).unwrap();
@@ -702,6 +807,61 @@ mod tests {
 		assert!(!tab.selection.contains(&root.join("a")), "toggling again clears it");
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn find_moves_between_visible_matches_and_wraps() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-find");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("alpha.rs"), b"").unwrap();
+		fs::write(root.join("beta.txt"), b"").unwrap();
+		fs::write(root.join("gamma.rs"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.finder = Finder::new(".rs".into(), false);
+		tab.find_arrow(false, false);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "alpha.rs");
+		tab.find_arrow(false, false);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "gamma.rs");
+		tab.find_arrow(false, false);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "alpha.rs", "next wraps");
+		tab.find_arrow(true, false);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "gamma.rs", "previous wraps");
+
+		tab.finder = Finder::new(".rs".into(), true);
+		tab.repeat_find(false);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "alpha.rs", "n preserves the original previous direction");
+		tab.repeat_find(true);
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "gamma.rs", "N reverses the original direction");
+
+		tab.escape();
+		assert!(tab.finder.is_none());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn find_updates_while_the_prompt_is_being_edited() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-live-find");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("alpha.txt"), b"").unwrap();
+		fs::write(root.join("gamma.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.start_find(false);
+		for ch in "gamma".chars() {
+			tab.handle_input_key(key(KeyCode::Char(ch)));
+		}
+		assert_eq!(node_name(tab.visible()[tab.cursor].1), "gamma.txt");
+		assert!(tab.finder.as_ref().is_some_and(|finder| finder.matches("gamma.txt")));
+
+		for _ in 0..5 {
+			tab.handle_input_key(key(KeyCode::Backspace));
+		}
+		assert!(tab.finder.is_none(), "emptying the prompt clears live highlights");
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
@@ -769,8 +929,10 @@ mod tests {
 		tab.expand_selected();
 		pump(&mut tab, &mut rx).await; // src.children = [leaf.txt]
 		tab.move_cursor(1); // onto "src/leaf.txt"
-		tab.yank_selected();
+		tab.selection.insert(root.join("src/leaf.txt"));
+		tab.yank_selected(false);
 		assert_eq!(tab.clipboard, vec![root.join("src/leaf.txt")]);
+		assert!(tab.selection.is_empty(), "yanking converts selected markers into clipboard markers");
 
 		tab.move_cursor(-2); // back onto "dst"
 		tab.expand_selected();
@@ -788,6 +950,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn cut_then_paste_moves_the_file_and_clears_the_marker_state() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-cut-paste");
+		fs::create_dir_all(root.join("dst")).unwrap();
+		fs::write(root.join("source.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.clipboard = vec![root.join("source.txt")];
+		tab.clipboard_cut = true;
+		tab.move_cursor(1); // dst
+		tab.paste();
+		pump(&mut tab, &mut rx).await;
+
+		assert!(!root.join("source.txt").exists());
+		assert!(root.join("dst/source.txt").exists());
+		assert!(tab.clipboard.is_empty());
+		assert!(!tab.clipboard_cut);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn visual_select_commits_the_range_on_escape() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-visual-select");
 		fs::create_dir_all(root.join("a")).unwrap();
@@ -799,7 +982,6 @@ mod tests {
 		tab.move_cursor(1); // onto "a"
 		tab.enter_visual(false);
 		tab.move_cursor(1); // onto "b" — range is now a..=b
-		assert_eq!(tab.visual_range(), Some((1, 2, false)), "preview covers a and b, not c");
 
 		tab.escape();
 		assert!(tab.visual.is_none());
@@ -1039,8 +1221,14 @@ mod tests {
 		let dir = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("dir")).unwrap();
 		let expected = format_size(dir.cha.len);
 
-		let (line, _) = tab.status_line();
-		assert!(line.contains(&expected), "directories display Cha::len directly: {line}");
+		let line = tab.status_line();
+		assert_eq!(line.mode, StatusMode::Normal);
+		assert_eq!(line.size, expected, "directories display Cha::len directly");
+
+		tab.enter_visual(false);
+		assert_eq!(tab.status_line().mode, StatusMode::Select);
+		tab.visual = Some(Visual::new(tab.cursor, true));
+		assert_eq!(tab.status_line().mode, StatusMode::Unset);
 
 		fs::remove_dir_all(&root).unwrap();
 	}

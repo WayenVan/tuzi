@@ -5,7 +5,7 @@ use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, WhichPopup, WinBar}}};
+use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, TreeViewState, WhichPopup, WinBar}}};
 
 use super::{Dispatcher, Tab};
 
@@ -16,6 +16,7 @@ pub struct App {
 	next_tab_id: usize,
 	tree_rows:   usize,
 	which:       Vec<WhichCandidate>,
+	icon_theme:  IconTheme,
 	tx:          mpsc::UnboundedSender<Event>,
 }
 
@@ -37,7 +38,9 @@ impl App {
 		});
 
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
-		let mut app = Self { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), tx };
+		let mut app = Self {
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme, tx,
+		};
 		let mut term = Raterm::start()?;
 		let mut router = Router::default();
 
@@ -46,6 +49,7 @@ impl App {
 			let preview_size = Cell::new((0, 0));
 			let redraw_tx = app.tx.clone();
 			let which = app.which.clone();
+			let icon_theme = &app.icon_theme;
 			let cwd = app.active_tab().tree.root.path.clone();
 			// Collected as owned strings *before* grabbing the active tab
 			// mutably below — otherwise the tab bar's shared borrow of
@@ -61,7 +65,8 @@ impl App {
 				})
 				.collect();
 
-			let tab = app.active_tab_mut();
+			let active = app.active;
+			let tab = app.tabs.iter_mut().find(|tab| tab.id == active).expect("active tab exists");
 			// Taken out (and put back at the end) so that its `&mut` doesn't
 			// overlap, for the borrow checker's purposes, with the `&Node`s
 			// `tab.visible()` lends out below — both ultimately borrow from
@@ -71,12 +76,10 @@ impl App {
 			let mut input = tab.input.take();
 
 			let rows = tab.visible();
-			let (mut status, mut warn) = tab.status_line();
+			let mut status = tab.status_line();
 			if let Some(error) = input.as_ref().and_then(|input| input.error.as_ref()) {
-				status = error.clone();
-				warn = true;
+				status.error = Some(error.clone());
 			}
-			let visual = tab.visual_range();
 			let column_mode = tab.column_mode;
 			let preview_visible = tab.preview.visible;
 			let pending_delete = tab.pending_delete.clone();
@@ -99,7 +102,20 @@ impl App {
 
 				WinBar::render(frame, win_area, &cwd);
 				TabBar::render(frame, tab_area, &labels);
-				TreeView::render(frame, tree_area, &rows, tab.cursor, &tab.selection, visual, column_mode);
+				TreeView::render(
+					frame,
+					tree_area,
+					&rows,
+					TreeViewState {
+						cursor: tab.cursor,
+						selection: &tab.selection,
+						clipboard: &tab.clipboard,
+						clipboard_cut: tab.clipboard_cut,
+						column_mode,
+						icon_theme,
+						finder: tab.finder.as_ref(),
+					},
+				);
 				if let Some(area) = preview_area {
 					preview_size.set((area.width.saturating_sub(1), area.height));
 					PreviewView::render(
@@ -110,7 +126,7 @@ impl App {
 						tab.preview.skip,
 					);
 				}
-				StatusBar::render(frame, status_area, &status, warn);
+				StatusBar::render(frame, status_area, &status);
 				WhichPopup::render(frame, frame.area(), &which);
 				if let Some(targets) = &pending_delete {
 					ConfirmPopup::render_delete(frame, frame.area(), targets);
@@ -252,7 +268,9 @@ mod tests {
 	async fn app(root: &Path) -> (App, mpsc::UnboundedReceiver<Event>) {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
-		let mut app = App { tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), tx };
+		let mut app = App {
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme, tx,
+		};
 
 		// drain the root tab's initial listing so it's got visible rows
 		let event = rx.recv().await.unwrap();

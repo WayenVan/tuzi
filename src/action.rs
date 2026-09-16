@@ -5,6 +5,7 @@ pub enum InputKind {
 	Rename,
 	Cd,
 	Create,
+	Find { previous: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,11 +22,12 @@ pub enum Action {
 	MovePage(i8),
 	MoveTo(CursorTarget),
 	Expand,
+	ToggleExpand,
 	Collapse,
 	ToggleSelect,
 	VisualSelect { unset: bool },
 	Delete,
-	Yank,
+	Yank { cut: bool },
 	Paste,
 	OpenInput(InputKind),
 	NewTab,
@@ -34,4 +36,5 @@ pub enum Action {
 	SetColumnMode(ColumnMode),
 	TogglePreview,
 	SeekPreview(i16),
+	RepeatFind { opposite: bool },
 }
