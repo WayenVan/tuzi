@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, env, io};
+use std::{collections::VecDeque, env, io, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
@@ -12,6 +12,9 @@ pub struct App {
 	pub active:  usize,
 	pub quit:    bool,
 	next_tab_id: usize,
+	/// The yanked files, shared by every tab: yank in one, paste in another.
+	pub(super) clipboard:     Vec<PathBuf>,
+	pub(super) clipboard_cut: bool,
 	pub(super) tree_rows:  usize,
 	pub(super) which:      Vec<WhichCandidate>,
 	pub(super) icon_theme: IconTheme,
@@ -27,7 +30,9 @@ impl App {
 
 		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
 		let mut app = Self {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
+			clipboard: Vec::new(), clipboard_cut: false,
+			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
 		};
 		let mut terminal = TerminalSession::start()?;
@@ -176,6 +181,31 @@ impl App {
 		}
 		self.active_tab_mut().move_cursor(delta);
 	}
+
+	/// Yanks the active tab's targets onto the shared clipboard, so any tab
+	/// can paste them afterward.
+	pub fn yank_selected(&mut self, cut: bool) {
+		let targets = self.active_tab_mut().take_yank_targets();
+		if targets.is_empty() {
+			return;
+		}
+		self.clipboard = targets;
+		self.clipboard_cut = cut;
+	}
+
+	/// Pastes the shared clipboard into the active tab. A cut clipboard is
+	/// consumed on the first successful paste; a copy can be pasted again.
+	pub fn paste(&mut self) {
+		if self.clipboard.is_empty() {
+			return;
+		}
+		let paths = self.clipboard.clone();
+		let cut = self.clipboard_cut;
+		if self.active_tab_mut().paste_into(paths, cut) && cut {
+			self.clipboard.clear();
+			self.clipboard_cut = false;
+		}
+	}
 }
 
 #[cfg(test)]
@@ -190,7 +220,9 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
-			tabs: vec![first], active: 0, quit: false, next_tab_id: 1, tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
+			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
+			clipboard: Vec::new(), clipboard_cut: false,
+			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
 		};
 
@@ -199,6 +231,107 @@ mod tests {
 		Dispatcher::dispatch_event(&mut app, event);
 
 		(app, rx)
+	}
+
+	async fn pump(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>) {
+		let event = rx.recv().await.unwrap();
+		Dispatcher::dispatch_event(app, event);
+	}
+
+	#[tokio::test]
+	async fn yank_then_paste_copies_into_the_cursors_parent_directory() {
+		let root = std::env::temp_dir().join("tuzi-app-test-paste");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::create_dir_all(root.join("dst/sub")).unwrap();
+		fs::write(root.join("src/leaf.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().move_cursor(1); // onto "dst" or "src", sorted alphabetically: dst, src
+		app.active_tab_mut().move_cursor(1); // onto "src"
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // src.children = [leaf.txt]
+		app.active_tab_mut().move_cursor(1); // onto "src/leaf.txt"
+		app.active_tab_mut().selection.insert(root.join("src/leaf.txt"));
+		app.yank_selected(false);
+		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")]);
+		assert!(app.active_tab().selection.is_empty(), "yanking converts selected markers into clipboard markers");
+
+		app.active_tab_mut().move_cursor(-2); // back onto "dst"
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // dst.children = [sub]
+		app.active_tab_mut().move_cursor(1); // onto "dst/sub", itself a directory
+
+		app.paste();
+		pump(&mut app, &mut rx).await; // Pasted(dst) -> requests a fresh listing
+		pump(&mut app, &mut rx).await; // Loaded(dst) -> dst.children now includes leaf.txt
+
+		// The cursor sat on "sub", but the file lands in "sub"'s parent,
+		// "dst" — not inside "sub" itself.
+		assert!(root.join("dst/leaf.txt").exists());
+		assert!(!root.join("dst/sub/leaf.txt").exists());
+		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")], "a copy stays on the clipboard for another paste");
+		let dst = app.active_tab().tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("dst")).unwrap();
+		assert!(dst.children.as_ref().unwrap().iter().any(|n| n.path == root.join("dst/leaf.txt")));
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn cut_then_paste_moves_the_file_and_clears_the_marker_state() {
+		let root = std::env::temp_dir().join("tuzi-app-test-cut-paste");
+		fs::create_dir_all(root.join("dst/sub")).unwrap();
+		fs::write(root.join("source.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.clipboard = vec![root.join("source.txt")];
+		app.clipboard_cut = true;
+		app.active_tab_mut().move_cursor(1); // dst
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // dst.children = [sub]
+		app.active_tab_mut().move_cursor(1); // onto "dst/sub"
+		app.paste();
+		pump(&mut app, &mut rx).await;
+
+		assert!(!root.join("source.txt").exists());
+		assert!(root.join("dst/source.txt").exists());
+		assert!(app.clipboard.is_empty());
+		assert!(!app.clipboard_cut);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn yanking_in_one_tab_pastes_in_another() {
+		let root = std::env::temp_dir().join("tuzi-app-test-cross-tab-paste");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::create_dir_all(root.join("dst/sub")).unwrap();
+		fs::write(root.join("src/leaf.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().move_cursor(2); // onto "src" (dst, src sorted alphabetically)
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // src.children = [leaf.txt]
+		app.active_tab_mut().move_cursor(1); // onto "src/leaf.txt"
+		app.yank_selected(false);
+		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")]);
+
+		app.new_tab(); // a second tab, also rooted at `root`
+		pump(&mut app, &mut rx).await; // its own initial listing
+		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")], "the clipboard isn't tied to the tab that filled it");
+
+		app.active_tab_mut().move_cursor(1); // onto "dst" in the new tab
+		app.active_tab_mut().expand_selected();
+		pump(&mut app, &mut rx).await; // dst.children = [sub]
+		app.active_tab_mut().move_cursor(1); // onto "dst/sub"
+		app.paste();
+		pump(&mut app, &mut rx).await; // Pasted(dst) -> requests a fresh listing
+		pump(&mut app, &mut rx).await; // Loaded(dst) -> dst.children now includes leaf.txt
+
+		assert!(root.join("dst/leaf.txt").exists(), "pasting in a different tab than the one that yanked should still work");
+
+		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]

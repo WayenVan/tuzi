@@ -40,6 +40,7 @@ impl App {
 			status.error = Some(error.clone());
 		}
 		let column_mode = tab.column_mode;
+		let mut scroll = tab.scroll;
 		let preview_visible = tab.preview.visible;
 		let pending_delete = tab.pending_delete.clone();
 		let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
@@ -69,11 +70,13 @@ impl App {
 				TreeViewState {
 					cursor: tab.cursor,
 					selection: &tab.selection,
-					clipboard: &tab.clipboard,
-					clipboard_cut: tab.clipboard_cut,
+					visual: tab.visual,
+					clipboard: &self.clipboard,
+					clipboard_cut: self.clipboard_cut,
 					column_mode,
 					icon_theme,
 					finder: tab.finder.as_ref(),
+					scroll: &mut scroll,
 				},
 			);
 			if let Some(area) = preview_area {
@@ -96,6 +99,7 @@ impl App {
 				frame.set_cursor_position((x, y));
 			}
 		})?;
+		tab.scroll = scroll;
 
 		let (preview_width, preview_height) = preview_size.get();
 		if tab.preview.sync(preview_target, preview_width, preview_height) {

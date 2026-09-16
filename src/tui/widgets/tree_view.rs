@@ -1,17 +1,22 @@
 use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{List, ListItem, ListState}};
 
-use crate::{column_mode::ColumnMode, core::{Node, Selection}, finder::Finder, icon::{Icon, IconTheme}};
+use crate::{column_mode::ColumnMode, core::{Node, Selection, Visual}, finder::Finder, icon::{Icon, IconTheme}};
 
 pub struct TreeView;
 
 pub struct TreeViewState<'a> {
 	pub cursor:        usize,
 	pub selection:     &'a Selection,
+	pub visual:        Option<Visual>,
 	pub clipboard:     &'a [std::path::PathBuf],
 	pub clipboard_cut: bool,
 	pub column_mode:   ColumnMode,
 	pub icon_theme:    &'a IconTheme,
 	pub finder:        Option<&'a Finder>,
+	/// The tab's persisted scroll offset — read to seed this frame's list,
+	/// then written back with whatever ratatui settled on, so it only
+	/// shifts when the cursor would otherwise leave the viewport.
+	pub scroll:        &'a mut usize,
 }
 
 impl TreeView {
@@ -22,7 +27,15 @@ impl TreeView {
 			if index == state.cursor {
 				icon.style = Style::new();
 			}
-			let selected = state.selection.contains(&node.path);
+			// A pending visual range previews the outcome of committing it
+			// (Esc) rather than the current selection: rows inside it show
+			// as selected for a plain visual, or unselected for a visual
+			// unset, even before `commit_visual` actually touches `selection`.
+			let visual_preview = state.visual.and_then(|visual| {
+				let (lo, hi) = visual.range(state.cursor);
+				(lo..=hi).contains(&index).then_some(!visual.unset)
+			});
+			let selected = visual_preview.unwrap_or_else(|| state.selection.contains(&node.path));
 			let marker_style = if selected {
 				Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow))
 			} else if state.clipboard.contains(&node.path) && state.clipboard_cut {
@@ -48,8 +61,9 @@ impl TreeView {
 		});
 
 		let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-		let mut list_state = ListState::default().with_selected(Some(state.cursor));
+		let mut list_state = ListState::default().with_selected(Some(state.cursor)).with_offset(*state.scroll);
 		frame.render_stateful_widget(list, area, &mut list_state);
+		*state.scroll = list_state.offset();
 	}
 }
 

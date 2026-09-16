@@ -8,24 +8,29 @@ use crate::{column_mode::ColumnMode, core::{Node, Selection, Tree, Visual}, even
 
 use super::input::{Completion, InputPurpose, InputSession};
 
-/// One tab: its own tree, cursor, selection, clipboard and background
-/// workers — everything but whether the whole program should quit. `id` is
-/// assigned once at creation and never reused or renumbered, so that
-/// background events tagged with it (`Loaded`/`Deleted`/`Pasted`/`Changed`)
-/// keep routing to the right tab even after some *other* tab closes and
-/// every tab after it would otherwise shift position in `App::tabs`.
+/// One tab: its own tree, cursor, selection and background workers —
+/// everything but whether the whole program should quit. The clipboard
+/// lives on `App` instead, shared by every tab (yank in one, paste in
+/// another). `id` is assigned once at creation and never reused or
+/// renumbered, so that background events tagged with it
+/// (`Loaded`/`Deleted`/`Pasted`/`Changed`) keep routing to the right tab
+/// even after some *other* tab closes and every tab after it would
+/// otherwise shift position in `App::tabs`.
 pub struct Tab {
 	pub id:             usize,
 	pub tree:           Tree,
 	pub cursor:         usize,
+	/// The tree view's scroll offset (index of its first visible row),
+	/// persisted across frames so ratatui only nudges it when the cursor
+	/// would otherwise leave the viewport, instead of recomputing it from
+	/// scratch — which would re-track the cursor on every move.
+	pub scroll:         usize,
 	pub column_mode:    ColumnMode,
 	pub preview:        Preview,
 	pub watcher:        Watcher,
 	pub fs_scheduler:   FsScheduler,
 	pub selection:      Selection,
 	pub visual:         Option<Visual>,
-	pub clipboard:      Vec<PathBuf>,
-	pub clipboard_cut:  bool,
 	pub pending_delete: Option<Vec<PathBuf>>,
 	pub finder:         Option<Finder>,
 	pub notice:         Option<String>,
@@ -59,14 +64,13 @@ impl Tab {
 			id,
 			tree,
 			cursor: 0,
+			scroll: 0,
 			column_mode: ColumnMode::None,
 			preview: Preview::new(id, tx.clone()),
 			watcher,
 			fs_scheduler,
 			selection: Selection::default(),
 			visual: None,
-			clipboard: Vec::new(),
-			clipboard_cut: false,
 			pending_delete: None,
 			finder: None,
 			notice: None,
@@ -195,30 +199,29 @@ impl Tab {
 		}
 	}
 
-	pub fn yank_selected(&mut self, cut: bool) {
+	/// The action targets to yank (the current selection, or the hovered
+	/// node), with the selection then cleared since it converts into
+	/// clipboard markers held by `App`.
+	pub(super) fn take_yank_targets(&mut self) -> Vec<PathBuf> {
 		let targets = self.action_targets();
-		if targets.is_empty() {
-			return;
+		if !targets.is_empty() {
+			self.selection.clear();
 		}
-		self.clipboard = targets;
-		self.clipboard_cut = cut;
-		self.selection.clear();
+		targets
 	}
 
-	/// Copies the clipboard into the directory under the cursor in the
-	/// background; the target's listing refreshes once `Pasted` comes back.
-	pub fn paste(&mut self) {
-		if self.clipboard.is_empty() {
-			return;
-		}
-		let Some(target_dir) = self.paste_target() else { return };
-		if self.clipboard_cut {
-			self.fs_scheduler.move_paths(self.clipboard.clone(), target_dir);
-			self.clipboard.clear();
-			self.clipboard_cut = false;
+	/// Copies or moves `paths` into the cursor's parent directory (see
+	/// `paste_target`) in the background; the target's listing refreshes
+	/// once `Pasted` comes back. Returns whether there was a parent to
+	/// paste into.
+	pub(super) fn paste_into(&mut self, paths: Vec<PathBuf>, cut: bool) -> bool {
+		let Some(target_dir) = self.paste_target() else { return false };
+		if cut {
+			self.fs_scheduler.move_paths(paths, target_dir);
 		} else {
-			self.fs_scheduler.copy(self.clipboard.clone(), target_dir);
+			self.fs_scheduler.copy(paths, target_dir);
 		}
+		true
 	}
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
@@ -447,8 +450,6 @@ impl Tab {
 			return Ok(());
 		}
 		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
-		replacement.clipboard = std::mem::take(&mut self.clipboard);
-		replacement.clipboard_cut = self.clipboard_cut;
 		replacement.input_seq = self.input_seq;
 		*self = replacement;
 		Ok(())
@@ -649,11 +650,13 @@ impl Tab {
 
 	pub fn open_targets(&self) -> Vec<PathBuf> { self.action_targets() }
 
-	/// Where paste drops files: the directory under the cursor, or its
-	/// parent if the cursor is on a file.
+	/// Where paste drops files: always the parent of whatever's under the
+	/// cursor, never the cursor's own node — the cursor marks a position in
+	/// the tree, not a directory to descend into. `None` when the cursor is
+	/// on the tree's own root, which has no parent to paste into.
 	fn paste_target(&self) -> Option<PathBuf> {
 		let (_, node) = self.visible().into_iter().nth(self.cursor)?;
-		if node.cha.is_dir { Some(node.path.clone()) } else { self.tree.parent_of(&node.path) }
+		self.tree.parent_of(&node.path)
 	}
 
 	fn refresh_parents(&mut self, paths: &[PathBuf]) {
@@ -1016,57 +1019,63 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn yank_then_paste_copies_into_the_target_directory() {
-		let root = std::env::temp_dir().join("tuzi-tab-test-paste");
+	async fn take_yank_targets_returns_the_selection_and_clears_it() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-yank-targets");
 		fs::create_dir_all(root.join("src")).unwrap();
-		fs::create_dir_all(root.join("dst")).unwrap();
 		fs::write(root.join("src/leaf.txt"), b"hi").unwrap();
 		let root = root.canonicalize().unwrap();
 
 		let (mut tab, mut rx) = tab(&root).await;
-		tab.move_cursor(1); // onto "dst" or "src", sorted alphabetically: dst, src
 		tab.move_cursor(1); // onto "src"
 		tab.expand_selected();
 		pump(&mut tab, &mut rx).await; // src.children = [leaf.txt]
 		tab.move_cursor(1); // onto "src/leaf.txt"
 		tab.selection.insert(root.join("src/leaf.txt"));
-		tab.yank_selected(false);
-		assert_eq!(tab.clipboard, vec![root.join("src/leaf.txt")]);
+
+		let targets = tab.take_yank_targets();
+		assert_eq!(targets, vec![root.join("src/leaf.txt")]);
 		assert!(tab.selection.is_empty(), "yanking converts selected markers into clipboard markers");
-
-		tab.move_cursor(-2); // back onto "dst"
-		tab.expand_selected();
-		pump(&mut tab, &mut rx).await; // dst.children = []
-
-		tab.paste();
-		pump(&mut tab, &mut rx).await; // Pasted(dst) -> requests a fresh listing
-		pump(&mut tab, &mut rx).await; // Loaded(dst) -> dst.children now includes leaf.txt
-
-		assert!(root.join("dst/leaf.txt").exists());
-		let dst = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("dst")).unwrap();
-		assert!(dst.children.as_ref().unwrap().iter().any(|n| n.path == root.join("dst/leaf.txt")));
 
 		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]
-	async fn cut_then_paste_moves_the_file_and_clears_the_marker_state() {
-		let root = std::env::temp_dir().join("tuzi-tab-test-cut-paste");
-		fs::create_dir_all(root.join("dst")).unwrap();
+	async fn paste_into_targets_the_cursors_parent_not_the_cursor_itself() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into");
+		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
 		let root = root.canonicalize().unwrap();
 
 		let (mut tab, mut rx) = tab(&root).await;
-		tab.clipboard = vec![root.join("source.txt")];
-		tab.clipboard_cut = true;
 		tab.move_cursor(1); // dst
-		tab.paste();
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await; // dst.children = [sub]
+		tab.move_cursor(1); // onto "dst/sub", itself a directory
+
+		// Pasting while the cursor sits on "sub" lands in "sub"'s parent,
+		// "dst" — not inside "sub", even though "sub" is a directory.
+		assert!(tab.paste_into(vec![root.join("source.txt")], true));
 		pump(&mut tab, &mut rx).await;
 
 		assert!(!root.join("source.txt").exists());
 		assert!(root.join("dst/source.txt").exists());
-		assert!(tab.clipboard.is_empty());
-		assert!(!tab.clipboard_cut);
+		assert!(!root.join("dst/sub/source.txt").exists());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn paste_into_refuses_when_the_cursor_is_on_the_tree_root() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into-root");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("source.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		assert_eq!(tab.cursor, 0, "starts on the tree's own root");
+
+		assert!(!tab.paste_into(vec![root.join("source.txt")], true), "the root has no parent to paste into");
+		assert!(root.join("source.txt").exists(), "nothing was moved");
+
 		fs::remove_dir_all(root).unwrap();
 	}
 
@@ -1257,7 +1266,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn interactive_cd_replaces_navigation_but_keeps_the_clipboard() {
+	async fn interactive_cd_replaces_navigation() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-cd");
 		let next = root.join("next");
 		fs::create_dir_all(&next).unwrap();
@@ -1265,14 +1274,12 @@ mod tests {
 		let next = next.canonicalize().unwrap();
 
 		let (mut tab, _rx) = tab(&root).await;
-		tab.clipboard.push(root.join("keep.txt"));
 		tab.start_cd();
 		set_input_value(&mut tab, "next");
 		tab.handle_input_key(key(KeyCode::Enter));
 
 		assert_eq!(tab.tree.root.path, next);
 		assert_eq!(tab.cursor, 0);
-		assert_eq!(tab.clipboard, [root.join("keep.txt")]);
 		assert!(tab.input.is_none());
 
 		fs::remove_dir_all(&root).unwrap();
