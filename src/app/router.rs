@@ -40,8 +40,8 @@ impl Router {
 			KeyCode::Char('p') => Event::Paste,
 			KeyCode::Char('r') => Event::Rename,
 			KeyCode::Char('w') => Event::TabClose,
-			KeyCode::Tab => Event::TabNext,
-			KeyCode::BackTab => Event::TabPrev,
+			KeyCode::Char(']') => Event::TabNext,
+			KeyCode::Char('[') => Event::TabPrev,
 			KeyCode::Char('t') => {
 				self.pending = Some('t');
 				return None;
@@ -71,5 +71,14 @@ mod tests {
 		// and the router isn't left "stuck" waiting — the next key is
 		// interpreted fresh, not as another follow-up.
 		assert!(matches!(router.route(KeyCode::Char('q')), Some(Event::Quit)));
+	}
+
+	#[test]
+	fn brackets_switch_tabs_left_and_right() {
+		let mut router = Router::default();
+		assert!(matches!(router.route(KeyCode::Char('[')), Some(Event::TabPrev)));
+		assert!(matches!(router.route(KeyCode::Char(']')), Some(Event::TabNext)));
+		assert!(router.route(KeyCode::Tab).is_none());
+		assert!(router.route(KeyCode::BackTab).is_none());
 	}
 }

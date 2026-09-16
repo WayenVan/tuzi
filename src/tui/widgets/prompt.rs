@@ -37,7 +37,12 @@ impl Prompt {
 		// own border title, so hide edtui's copy. Its default theme also
 		// hard-codes a black background regardless of the terminal's own
 		// theme; clear that so the popup matches everything else we draw.
-		let theme = EditorTheme::default().hide_status_line().base(Style::default());
+		// edtui draws its own cursor by styling the whole character cell
+		// (white background by default). That painted cell looks like a block
+		// even when the real terminal cursor is configured as a bar. Hide the
+		// painted cursor and let the terminal cursor set by App::draw provide
+		// the mode-dependent shape instead.
+		let theme = EditorTheme::default().hide_status_line().base(Style::default()).hide_cursor();
 		frame.render_widget(EditorView::new(state).single_line(true).theme(theme), inner);
 
 		// Not `state.cursor_screen_position()`: for a single-line editor

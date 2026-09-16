@@ -42,7 +42,7 @@ impl Tab {
 		let needs_fetch = tree.mark_expanded(&root_path).unwrap_or(false);
 
 		let mut watcher = Watcher::new(id, tx.clone())?;
-		watcher.watch(&root_path);
+		watcher.watch(&root_path)?;
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
 		let mut scheduler = Scheduler::new(id, tx, engine);
@@ -81,7 +81,7 @@ impl Tab {
 	pub fn expand_selected(&mut self) {
 		let Some(path) = self.selected_dir() else { return };
 		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
-		self.watcher.watch(&path);
+		let _ = self.watcher.watch(&path);
 		if needs_fetch {
 			self.scheduler.refresh(path);
 		}
@@ -367,7 +367,7 @@ impl Tab {
 		if !self.clipboard.is_empty() {
 			return (format!("{} in clipboard — p to paste", self.clipboard.len()), false);
 		}
-		("j/k move  h/l collapse/expand  space select  y/p yank/paste  d delete  r rename  tt new tab  w close tab  q quit".to_owned(), false)
+		("j/k move  h/l collapse/expand  space select  y/p yank/paste  d delete  r rename  tt new tab  [/] switch tab  w close tab  q quit".to_owned(), false)
 	}
 }
 
