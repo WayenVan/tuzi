@@ -1,48 +1,71 @@
-use std::{collections::VecDeque, env, io, path::PathBuf};
+use std::{collections::VecDeque, io, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::{action::DeleteMode, event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, notice::{Notice, NoticeLevel}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskKind, TaskManager}, tui::TerminalSession};
+use crate::{
+	action::{CopyKind, DeleteMode},
+	event::Event,
+	icon::IconTheme,
+	keymap::{Key, KeyContext, Route, Router, WhichCandidate},
+	notice::{Notice, NoticeLevel},
+	opener::OpenPicker,
+	process::ProcessRequest,
+	scheduler::OpenScheduler,
+	tasks::{TaskEvent, TaskKind, TaskManager},
+	tui::TerminalSession,
+};
 
 use super::{Dispatcher, Tab};
 
 pub struct App {
-	pub tabs:    Vec<Tab>,
-	pub active:  usize,
-	pub quit:    bool,
+	pub tabs: Vec<Tab>,
+	pub active: usize,
+	pub quit: bool,
 	/// Armed by `request_quit` when a task is still running — quitting
 	/// straight away would abandon whatever `.tuzi-part-*` temp file a
 	/// copy was mid-write on, so this asks first instead of just doing it.
 	pub(super) pending_quit: bool,
 	next_tab_id: usize,
 	/// The yanked files, shared by every tab: yank in one, paste in another.
-	pub(super) clipboard:     Vec<PathBuf>,
+	pub(super) clipboard: Vec<PathBuf>,
 	pub(super) clipboard_cut: bool,
-	pub(super) tree_rows:  usize,
-	pub(super) which:      Vec<WhichCandidate>,
+	pub(super) tree_rows: usize,
+	pub(super) which: Vec<WhichCandidate>,
 	pub(super) icon_theme: IconTheme,
-	pub(super) open:        OpenScheduler,
+	pub(super) open: OpenScheduler,
 	pub(super) open_picker: Option<OpenPicker>,
-	pub(super) processes:   VecDeque<ProcessRequest>,
-	pub(super) tx:         mpsc::UnboundedSender<Event>,
-	pub tasks:             TaskManager,
+	pub(super) processes: VecDeque<ProcessRequest>,
+	pub(super) tx: mpsc::UnboundedSender<Event>,
+	pub tasks: TaskManager,
 	/// One-off toasts (invalid cd, refused delete, a failed external
 	/// process, …) — global, not tied to whichever tab is active, and
 	/// timeout-driven rather than something the user dismisses.
-	pub(super) notices:    Vec<Notice>,
+	pub(super) notices: Vec<Notice>,
 }
 
 impl App {
-	pub async fn serve() -> io::Result<()> {
+	pub async fn serve(path: PathBuf) -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 
-		let first = Tab::open(0, env::current_dir()?, tx.clone())?;
+		let first = Tab::open(0, path, tx.clone())?;
 		let mut app = Self {
-			tabs: vec![first], active: 0, quit: false, pending_quit: false, next_tab_id: 1,
-			clipboard: Vec::new(), clipboard_cut: false,
-			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
+			tabs: vec![first],
+			active: 0,
+			quit: false,
+			pending_quit: false,
+			next_tab_id: 1,
+			clipboard: Vec::new(),
+			clipboard_cut: false,
+			tree_rows: 0,
+			which: Vec::new(),
+			icon_theme: IconTheme,
+			open: OpenScheduler::new(tx.clone()),
+			open_picker: None,
+			processes: VecDeque::new(),
+			tasks: TaskManager::new(tx.clone()),
+			notices: Vec::new(),
+			tx,
 		};
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::default();
@@ -93,25 +116,51 @@ impl App {
 				KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
 				_ => None,
 			};
-			let Some(confirmed) = confirmed else { return false };
+			let Some(confirmed) = confirmed else {
+				return false;
+			};
 			self.resolve_pending_quit(confirmed);
 			return true;
 		}
 		if self.tasks.visible {
 			return match key.code {
-				KeyCode::Up | KeyCode::Char('k') => { self.tasks.move_cursor(-1); true }
-				KeyCode::Down | KeyCode::Char('j') => { self.tasks.move_cursor(1); true }
-				KeyCode::Char('x') => { self.tasks.cancel_selected(); true }
-				KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => { self.tasks.visible = false; true }
+				KeyCode::Up | KeyCode::Char('k') => {
+					self.tasks.move_cursor(-1);
+					true
+				}
+				KeyCode::Down | KeyCode::Char('j') => {
+					self.tasks.move_cursor(1);
+					true
+				}
+				KeyCode::Char('x') => {
+					self.tasks.cancel_selected();
+					true
+				}
+				KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => {
+					self.tasks.visible = false;
+					true
+				}
 				_ => false,
 			};
 		}
 		if self.open_picker.is_some() {
 			return match key.code {
-				KeyCode::Up | KeyCode::Char('k') => { self.move_open_picker(-1); true }
-				KeyCode::Down | KeyCode::Char('j') => { self.move_open_picker(1); true }
-				KeyCode::Enter => { self.submit_open_picker(); true }
-				KeyCode::Esc | KeyCode::Char('q') => { self.open_picker = None; true }
+				KeyCode::Up | KeyCode::Char('k') => {
+					self.move_open_picker(-1);
+					true
+				}
+				KeyCode::Down | KeyCode::Char('j') => {
+					self.move_open_picker(1);
+					true
+				}
+				KeyCode::Enter => {
+					self.submit_open_picker();
+					true
+				}
+				KeyCode::Esc | KeyCode::Char('q') => {
+					self.open_picker = None;
+					true
+				}
 				_ => false,
 			};
 		}
@@ -141,9 +190,15 @@ impl App {
 				}
 				true
 			}
-			Route::Pending(candidates) => { self.which = candidates; true }
+			Route::Pending(candidates) => {
+				self.which = candidates;
+				true
+			}
 			Route::Unmatched if self.which.is_empty() => false,
-			Route::Unmatched => { self.which.clear(); true }
+			Route::Unmatched => {
+				self.which.clear();
+				true
+			}
 		}
 	}
 
@@ -173,7 +228,9 @@ impl App {
 	/// For routing a background event tagged with a tab id — unlike
 	/// `active_tab_mut`, `None` is a normal outcome (the tab it was headed
 	/// for closed before the event arrived), not a bug.
-	pub(super) fn tab_mut(&mut self, id: usize) -> Option<&mut Tab> { self.tabs.iter_mut().find(|t| t.id == id) }
+	pub(super) fn tab_mut(&mut self, id: usize) -> Option<&mut Tab> {
+		self.tabs.iter_mut().find(|t| t.id == id)
+	}
 
 	/// Opens a new tab rooted at wherever the active one currently is,
 	/// yazi-style (`tt`), and switches to it.
@@ -194,13 +251,17 @@ impl App {
 		if self.tabs.len() <= 1 {
 			return;
 		}
-		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else { return };
+		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else {
+			return;
+		};
 		self.tabs.remove(pos);
 		self.active = self.tabs[pos.min(self.tabs.len() - 1)].id;
 	}
 
 	pub fn switch_tab(&mut self, delta: isize) {
-		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else { return };
+		let Some(pos) = self.tabs.iter().position(|t| t.id == self.active) else {
+			return;
+		};
 		let next = (pos as isize + delta).rem_euclid(self.tabs.len() as isize) as usize;
 		self.active = self.tabs[next].id;
 	}
@@ -253,7 +314,9 @@ impl App {
 		let paths = self.clipboard.clone();
 		let cut = self.clipboard_cut;
 		let tab = self.active;
-		let Some(target) = self.active_tab().paste_destination() else { return };
+		let Some(target) = self.active_tab().paste_destination() else {
+			return;
+		};
 		self.tasks.enqueue(paths, target, cut, tab);
 		if cut {
 			self.clipboard.clear();
@@ -261,8 +324,19 @@ impl App {
 		}
 	}
 
+	pub fn copy_to_system_clipboard(&mut self, kind: CopyKind) {
+		let content = self.active_tab_mut().copy_text(kind);
+		if content.is_empty() {
+			self.active_tab_mut().raise(NoticeLevel::Warn, "Nothing to copy");
+			return;
+		}
+		crate::clipboard::set(content);
+	}
+
 	pub(super) fn on_task_event(&mut self, event: TaskEvent) {
-		let Some((tab, kind, subject)) = self.tasks.accept(event) else { return };
+		let Some((tab, kind, subject)) = self.tasks.accept(event) else {
+			return;
+		};
 		let Some(tab) = self.tab_mut(tab) else { return };
 		match kind {
 			TaskKind::Copy | TaskKind::Move => tab.on_pasted(subject),
@@ -297,7 +371,9 @@ impl App {
 		});
 	}
 
-	pub(super) fn prune_notices(&mut self) { self.notices.retain(|n| !n.expired()); }
+	pub(super) fn prune_notices(&mut self) {
+		self.notices.retain(|n| !n.expired());
+	}
 
 	/// Moves whatever one-off message each tab has queued for itself (an
 	/// invalid cd, a refused delete, …) into the toast queue. Tabs can't
@@ -323,10 +399,22 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
-			tabs: vec![first], active: 0, quit: false, pending_quit: false, next_tab_id: 1,
-			clipboard: Vec::new(), clipboard_cut: false,
-			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), notices: Vec::new(), tx,
+			tabs: vec![first],
+			active: 0,
+			quit: false,
+			pending_quit: false,
+			next_tab_id: 1,
+			clipboard: Vec::new(),
+			clipboard_cut: false,
+			tree_rows: 0,
+			which: Vec::new(),
+			icon_theme: IconTheme,
+			open: OpenScheduler::new(tx.clone()),
+			open_picker: None,
+			processes: VecDeque::new(),
+			tasks: TaskManager::new(tx.clone()),
+			notices: Vec::new(),
+			tx,
 		};
 
 		// drain the root tab's initial listing so it's got visible rows
@@ -349,7 +437,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn yank_then_paste_copies_into_the_cursors_parent_directory() {
+	async fn yank_then_paste_copies_into_the_directory_under_the_cursor() {
 		let root = std::env::temp_dir().join("tuzi-app-test-paste");
 		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(root.join("src")).unwrap();
@@ -366,7 +454,10 @@ mod tests {
 		app.active_tab_mut().selection.insert(root.join("src/leaf.txt"));
 		app.yank_selected(false);
 		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")]);
-		assert!(app.active_tab().selection.is_empty(), "yanking converts selected markers into clipboard markers");
+		assert!(
+			app.active_tab().selection.is_empty(),
+			"yanking converts selected markers into clipboard markers"
+		);
 
 		app.active_tab_mut().move_cursor(-2); // back onto "dst"
 		app.active_tab_mut().expand_selected();
@@ -374,16 +465,15 @@ mod tests {
 		app.active_tab_mut().move_cursor(1); // onto "dst/sub", itself a directory
 
 		app.paste();
-		pump(&mut app, &mut rx).await; // Pasted(dst) -> requests a fresh listing
-		pump(&mut app, &mut rx).await; // Loaded(dst) -> dst.children now includes leaf.txt
+		pump(&mut app, &mut rx).await;
 
-		// The cursor sat on "sub", but the file lands in "sub"'s parent,
-		// "dst" — not inside "sub" itself.
-		assert!(root.join("dst/leaf.txt").exists());
-		assert!(!root.join("dst/sub/leaf.txt").exists());
-		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")], "a copy stays on the clipboard for another paste");
-		let dst = app.active_tab().tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("dst")).unwrap();
-		assert!(dst.children.as_ref().unwrap().iter().any(|n| n.path == root.join("dst/leaf.txt")));
+		assert!(!root.join("dst/leaf.txt").exists());
+		assert!(root.join("dst/sub/leaf.txt").exists());
+		assert_eq!(
+			app.clipboard,
+			vec![root.join("src/leaf.txt")],
+			"a copy stays on the clipboard for another paste"
+		);
 
 		fs::remove_dir_all(&root).unwrap();
 	}
@@ -407,7 +497,7 @@ mod tests {
 		pump(&mut app, &mut rx).await;
 
 		assert!(!root.join("source.txt").exists());
-		assert!(root.join("dst/source.txt").exists());
+		assert!(root.join("dst/sub/source.txt").exists());
 		assert!(app.clipboard.is_empty());
 		assert!(!app.clipboard_cut);
 		fs::remove_dir_all(root).unwrap();
@@ -515,7 +605,10 @@ mod tests {
 		app.active_tab_mut().expand_selected();
 		pump(&mut app, &mut rx).await; // Loaded(locked) -> permission denied
 
-		assert!(app.notices.is_empty(), "a directory load failure is pinned to its node, not turned into a toast");
+		assert!(
+			app.notices.is_empty(),
+			"a directory load failure is pinned to its node, not turned into a toast"
+		);
 
 		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
 		fs::remove_dir_all(&root).unwrap();
@@ -540,17 +633,23 @@ mod tests {
 
 		app.new_tab(); // a second tab, also rooted at `root`
 		pump(&mut app, &mut rx).await; // its own initial listing
-		assert_eq!(app.clipboard, vec![root.join("src/leaf.txt")], "the clipboard isn't tied to the tab that filled it");
+		assert_eq!(
+			app.clipboard,
+			vec![root.join("src/leaf.txt")],
+			"the clipboard isn't tied to the tab that filled it"
+		);
 
 		app.active_tab_mut().move_cursor(1); // onto "dst" in the new tab
 		app.active_tab_mut().expand_selected();
 		pump(&mut app, &mut rx).await; // dst.children = [sub]
 		app.active_tab_mut().move_cursor(1); // onto "dst/sub"
 		app.paste();
-		pump(&mut app, &mut rx).await; // Pasted(dst) -> requests a fresh listing
-		pump(&mut app, &mut rx).await; // Loaded(dst) -> dst.children now includes leaf.txt
+		pump(&mut app, &mut rx).await;
 
-		assert!(root.join("dst/leaf.txt").exists(), "pasting in a different tab than the one that yanked should still work");
+		assert!(
+			root.join("dst/sub/leaf.txt").exists(),
+			"pasting in a different tab than the one that yanked should still work"
+		);
 
 		fs::remove_dir_all(&root).unwrap();
 	}
@@ -771,7 +870,10 @@ mod tests {
 
 		Dispatcher::dispatch_event(&mut app, event);
 		assert_eq!(app.active, 1, "dispatching a background event never changes which tab is active");
-		assert!(app.tab_mut(0).unwrap().tree.is_loaded(&root.join("a")), "but it still lands on the tab it was meant for");
+		assert!(
+			app.tab_mut(0).unwrap().tree.is_loaded(&root.join("a")),
+			"but it still lands on the tab it was meant for"
+		);
 
 		fs::remove_dir_all(&root).unwrap();
 	}

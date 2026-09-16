@@ -4,7 +4,7 @@ use super::{Key, KeyContext, Keymap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhichCandidate {
-	pub keys:        Vec<Key>,
+	pub keys: Vec<Key>,
 	pub description: String,
 }
 
@@ -17,7 +17,7 @@ pub enum Route {
 
 #[derive(Default)]
 pub struct Router {
-	keymap:  Keymap,
+	keymap: Keymap,
 	pending: Vec<Key>,
 }
 
@@ -58,7 +58,11 @@ impl Router {
 mod tests {
 	use crossterm::event::{KeyCode, KeyModifiers};
 
-	use crate::{action::{Action, CursorTarget, InputKind}, column_mode::ColumnMode};
+	use crate::{
+		action::{Action, CopyKind, CursorTarget, InputKind},
+		column_mode::ColumnMode,
+		fs::{SortBy, SortPolicy},
+	};
 
 	use super::*;
 
@@ -111,15 +115,24 @@ mod tests {
 	fn shares_the_g_prefix_between_top_and_directory_navigation() {
 		let mut router = Router::default();
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('g')), Route::Actions(vec![Action::MoveTo(CursorTarget::Top)]));
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('g')),
+			Route::Actions(vec![Action::MoveTo(CursorTarget::Top)])
+		);
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Actions(vec![Action::OpenInput(InputKind::Cd)]));
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char(' ')),
+			Route::Actions(vec![Action::OpenInput(InputKind::Cd)])
+		);
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Actions(vec![Action::CdParent]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Actions(vec![Action::CdSelected]));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('G')), Route::Actions(vec![Action::MoveTo(CursorTarget::Bottom)]));
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('G')),
+			Route::Actions(vec![Action::MoveTo(CursorTarget::Bottom)])
+		);
 	}
 
 	#[test]
@@ -132,7 +145,47 @@ mod tests {
 			('m', ColumnMode::Modified),
 		] {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char('m')), Route::Pending(_)));
-			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![Action::SetColumnMode(mode)]));
+			assert_eq!(
+				router.route(KeyContext::Manager, Key::char(key)),
+				Route::Actions(vec![Action::SetColumnMode(mode)])
+			);
+		}
+	}
+
+	#[test]
+	fn comma_prefix_selects_yazi_style_sorting() {
+		let mut router = Router::default();
+		for (key, by, reverse) in [
+			('a', SortBy::Name, false),
+			('A', SortBy::Name, true),
+			('m', SortBy::Modified, false),
+			('M', SortBy::Modified, true),
+			('s', SortBy::Size, false),
+			('S', SortBy::Size, true),
+			('e', SortBy::Extension, false),
+			('E', SortBy::Extension, true),
+		] {
+			assert!(matches!(router.route(KeyContext::Manager, Key::char(',')), Route::Pending(_)));
+			assert_eq!(
+				router.route(KeyContext::Manager, Key::char(key)),
+				Route::Actions(vec![Action::SetSort(SortPolicy::new(by, reverse))])
+			);
+		}
+	}
+
+	#[test]
+	fn c_prefix_exposes_yazi_style_clipboard_copies() {
+		let mut router = Router::default();
+		for (key, kind) in [
+			('c', CopyKind::Path),
+			('C', CopyKind::Url),
+			('d', CopyKind::DirectoryPath),
+			('D', CopyKind::DirectoryUrl),
+			('f', CopyKind::Filename),
+			('n', CopyKind::Stem),
+		] {
+			assert!(matches!(router.route(KeyContext::Manager, Key::char('c')), Route::Pending(_)));
+			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![Action::Copy(kind)]));
 		}
 	}
 
@@ -144,8 +197,16 @@ mod tests {
 		};
 
 		assert_eq!(candidates.len(), 4);
-		assert!(candidates.iter().any(|candidate| candidate.keys == [Key::char('s')] && candidate.description == "Show size column"));
-		assert!(candidates.iter().any(|candidate| candidate.keys == [Key::char('n')] && candidate.description == "Hide column"));
+		assert!(
+			candidates
+				.iter()
+				.any(|candidate| candidate.keys == [Key::char('s')] && candidate.description == "Show size column")
+		);
+		assert!(
+			candidates
+				.iter()
+				.any(|candidate| candidate.keys == [Key::char('n')] && candidate.description == "Hide column")
+		);
 	}
 
 	#[test]
@@ -174,14 +235,26 @@ mod tests {
 			router.route(KeyContext::Manager, Key::char('?')),
 			Route::Actions(vec![Action::OpenInput(InputKind::Find { previous: true })])
 		);
-		assert_eq!(router.route(KeyContext::Manager, Key::char('n')), Route::Actions(vec![Action::RepeatFind { opposite: false }]));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('N')), Route::Actions(vec![Action::RepeatFind { opposite: true }]));
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('n')),
+			Route::Actions(vec![Action::RepeatFind { opposite: false }])
+		);
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('N')),
+			Route::Actions(vec![Action::RepeatFind { opposite: true }])
+		);
 	}
 
 	#[test]
 	fn o_opens_and_uppercase_o_chooses_an_opener() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char('o')), Route::Actions(vec![Action::Open { interactive: false }]));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('O')), Route::Actions(vec![Action::Open { interactive: true }]));
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('o')),
+			Route::Actions(vec![Action::Open { interactive: false }])
+		);
+		assert_eq!(
+			router.route(KeyContext::Manager, Key::char('O')),
+			Route::Actions(vec![Action::Open { interactive: true }])
+		);
 	}
 }

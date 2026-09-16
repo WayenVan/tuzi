@@ -6,4 +6,5 @@ mod sorter;
 pub use cha::{Cha, format_size};
 pub use engine::{Engine, LocalEngine};
 pub use ops::{remove, unique_dest_avoiding};
-pub use sorter::{SortBy, sort};
+pub(crate) use sorter::compare as compare_for_sort;
+pub use sorter::{SortBy, SortPolicy, sort};

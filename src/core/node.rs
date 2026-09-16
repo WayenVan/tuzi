@@ -4,14 +4,14 @@ use std::{
 };
 
 use super::Filter;
-use crate::fs::{Cha, SortBy, sort};
+use crate::fs::{Cha, SortPolicy, compare_for_sort, sort};
 
 pub struct Node {
-	pub path:       PathBuf,
-	pub cha:        Cha,
-	pub expanded:   bool,
-	pub children:   Option<Vec<Node>>,
-	pub loading:    bool,
+	pub path: PathBuf,
+	pub cha: Cha,
+	pub expanded: bool,
+	pub children: Option<Vec<Node>>,
+	pub loading: bool,
 	/// Set when the most recent listing attempt for this node failed
 	/// (permission denied, the directory vanished, …). Unlike a toast, this
 	/// stays pinned to the node — and thus visible in the tree — until the
@@ -20,7 +20,16 @@ pub struct Node {
 }
 
 impl Node {
-	pub fn new(path: PathBuf, cha: Cha) -> Self { Self { path, cha, expanded: false, children: None, loading: false, load_error: None } }
+	pub fn new(path: PathBuf, cha: Cha) -> Self {
+		Self {
+			path,
+			cha,
+			expanded: false,
+			children: None,
+			loading: false,
+			load_error: None,
+		}
+	}
 
 	/// Marks this node open immediately (so the UI reacts right away) without
 	/// touching disk. Returns whether a listing still needs to be fetched —
@@ -44,10 +53,10 @@ impl Node {
 	/// identity. Used both for a node's first load and for watcher-driven
 	/// refreshes; the caller is responsible for actually fetching the
 	/// listing off-thread and only calling this once it has one.
-	pub fn apply_listing(&mut self, mut entries: Vec<(PathBuf, Cha)>) {
+	pub fn apply_listing(&mut self, mut entries: Vec<(PathBuf, Cha)>, policy: SortPolicy) {
 		self.load_error = None;
 		self.loading = false;
-		sort(&mut entries, SortBy::Name);
+		sort(&mut entries, policy);
 
 		let mut old: HashMap<_, _> = self
 			.children
@@ -95,14 +104,25 @@ impl Node {
 	}
 
 	pub fn append_listing(&mut self, entries: Vec<(PathBuf, Cha)>) {
-		self.children.get_or_insert_with(Vec::new).extend(entries.into_iter().map(|(path, cha)| Node::new(path, cha)));
+		self.children
+			.get_or_insert_with(Vec::new)
+			.extend(entries.into_iter().map(|(path, cha)| Node::new(path, cha)));
 	}
 
-	pub fn finish_incremental_listing(&mut self) {
+	pub fn finish_incremental_listing(&mut self, policy: SortPolicy) {
 		if let Some(children) = &mut self.children {
-			children.sort_by(|a, b| b.cha.is_dir.cmp(&a.cha.is_dir).then_with(|| a.path.file_name().cmp(&b.path.file_name())));
+			children.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
 		}
 		self.loading = false;
+	}
+
+	pub fn sort_recursive(&mut self, policy: SortPolicy) {
+		if let Some(children) = &mut self.children {
+			for child in children.iter_mut() {
+				child.sort_recursive(policy);
+			}
+			children.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
+		}
 	}
 
 	pub fn discard_incremental_listing(&mut self) {
@@ -126,7 +146,9 @@ impl Node {
 		if !visitor(depth, self) {
 			return false;
 		}
-		if self.expanded && let Some(children) = &self.children {
+		if self.expanded
+			&& let Some(children) = &self.children
+		{
 			for child in children {
 				if !child.visit_visible(depth + 1, visitor) {
 					return false;
@@ -139,7 +161,10 @@ impl Node {
 	pub fn has_visible_match(&self, filter: &Filter) -> bool {
 		self.path.file_name().is_some_and(|name| filter.matches(&name.to_string_lossy()))
 			|| (self.expanded
-				&& self.children.as_ref().is_some_and(|children| children.iter().any(|child| child.has_visible_match(filter))))
+				&& self
+					.children
+					.as_ref()
+					.is_some_and(|children| children.iter().any(|child| child.has_visible_match(filter))))
 	}
 
 	/// Like `visible`, but a node only appears if it matches `filter` itself
@@ -153,7 +178,9 @@ impl Node {
 
 		let mut rows = vec![(depth, self)];
 		let mut kept = matches;
-		if self.expanded && let Some(children) = &self.children {
+		if self.expanded
+			&& let Some(children) = &self.children
+		{
 			for child in children {
 				if let Some(child_rows) = child.visible_filtered(depth + 1, filter) {
 					kept = true;
@@ -169,9 +196,19 @@ impl Node {
 mod tests {
 	use super::*;
 
-	fn cha(is_dir: bool) -> Cha { Cha { len: 0, is_dir, is_link: false, modified: None, mode: 0 } }
+	fn cha(is_dir: bool) -> Cha {
+		Cha {
+			len: 0,
+			is_dir,
+			is_link: false,
+			modified: None,
+			mode: 0,
+		}
+	}
 
-	fn file(name: &str) -> Node { Node::new(PathBuf::from(name), cha(false)) }
+	fn file(name: &str) -> Node {
+		Node::new(PathBuf::from(name), cha(false))
+	}
 
 	fn dir(name: &str, children: Vec<Node>) -> Node {
 		let mut node = Node::new(PathBuf::from(name), cha(true));
@@ -208,7 +245,10 @@ mod tests {
 		root.children.as_mut().unwrap()[0].expanded = false;
 		let filter = Filter::new("target".into()).unwrap();
 
-		assert!(root.visible_filtered(0, &filter).is_none(), "a collapsed subtree's contents aren't visible to filter into");
+		assert!(
+			root.visible_filtered(0, &filter).is_none(),
+			"a collapsed subtree's contents aren't visible to filter into"
+		);
 	}
 
 	#[test]
@@ -227,10 +267,13 @@ mod tests {
 
 		let mut refreshed = cha(true);
 		refreshed.len = 42;
-		root.apply_listing(vec![(PathBuf::from("new.txt"), cha(false)), (PathBuf::from("kept"), refreshed)]);
+		root.apply_listing(vec![(PathBuf::from("new.txt"), cha(false)), (PathBuf::from("kept"), refreshed)], SortPolicy::default());
 
 		let children = root.children.as_ref().unwrap();
-		assert_eq!(children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("kept"), Path::new("new.txt")]);
+		assert_eq!(
+			children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(),
+			[Path::new("kept"), Path::new("new.txt")]
+		);
 
 		let kept = &children[0];
 		assert!(kept.expanded);
@@ -264,8 +307,29 @@ mod tests {
 		assert_eq!(root.children.as_ref().unwrap().len(), 3);
 		assert!(root.loading);
 
-		root.finish_incremental_listing();
+		root.finish_incremental_listing(SortPolicy::default());
 		assert!(!root.loading);
-		assert_eq!(root.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("dir"), Path::new("a.txt"), Path::new("z.txt")]);
+		assert_eq!(
+			root.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(),
+			[Path::new("dir"), Path::new("a.txt"), Path::new("z.txt")]
+		);
+	}
+
+	#[test]
+	fn sorting_recurses_per_directory_without_flattening_the_tree() {
+		let mut root = dir(
+			"root",
+			vec![dir("nested", vec![file("small"), file("large")]), file("sibling")],
+		);
+		root.children.as_mut().unwrap()[0].children.as_mut().unwrap()[0].cha.len = 1;
+		root.children.as_mut().unwrap()[0].children.as_mut().unwrap()[1].cha.len = 2;
+
+		root.sort_recursive(SortPolicy::new(crate::fs::SortBy::Size, true));
+
+		let nested = &root.children.as_ref().unwrap()[0];
+		assert_eq!(
+			nested.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(),
+			[Path::new("large"), Path::new("small")]
+		);
 	}
 }

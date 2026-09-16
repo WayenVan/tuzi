@@ -1,6 +1,10 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::{action::{Action, CursorTarget, InputKind}, column_mode::ColumnMode};
+use crate::{
+	action::{Action, CopyKind, CursorTarget, InputKind},
+	column_mode::ColumnMode,
+	fs::{SortBy, SortPolicy},
+};
 
 use super::{Binding, Key};
 
@@ -15,9 +19,17 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('k')], A::MoveCursor(-1), "Move up"),
 		Binding::manager(vec![Key::plain(KeyCode::Up)], A::MoveCursor(-1), "Move up"),
 		Binding::manager(vec![Key::new(KeyCode::Char('u'), KeyModifiers::CONTROL)], A::MovePage(-50), "Move up half page"),
-		Binding::manager(vec![Key::new(KeyCode::Char('d'), KeyModifiers::CONTROL)], A::MovePage(50), "Move down half page"),
+		Binding::manager(
+			vec![Key::new(KeyCode::Char('d'), KeyModifiers::CONTROL)],
+			A::MovePage(50),
+			"Move down half page",
+		),
 		Binding::manager(vec![Key::new(KeyCode::Char('b'), KeyModifiers::CONTROL)], A::MovePage(-100), "Move up one page"),
-		Binding::manager(vec![Key::new(KeyCode::Char('f'), KeyModifiers::CONTROL)], A::MovePage(100), "Move down one page"),
+		Binding::manager(
+			vec![Key::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+			A::MovePage(100),
+			"Move down one page",
+		),
 		Binding::manager(vec![Key::char('g'), Key::char('g')], A::MoveTo(CursorTarget::Top), "Move to top"),
 		Binding::manager(vec![Key::char('g'), Key::char('h')], A::CdParent, "Go to parent directory"),
 		Binding::manager(vec![Key::char('g'), Key::char('l')], A::CdSelected, "Enter selected directory"),
@@ -36,8 +48,18 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('y')], A::Yank { cut: false }, "Yank selected files (copy)"),
 		Binding::manager(vec![Key::char('x')], A::Yank { cut: true }, "Yank selected files (cut)"),
 		Binding::manager(vec![Key::char('p')], A::Paste, "Paste"),
+		Binding::manager(vec![Key::char('c'), Key::char('c')], A::Copy(CopyKind::Path), "Copy file path"),
+		Binding::manager(vec![Key::char('c'), Key::char('C')], A::Copy(CopyKind::Url), "Copy file URL"),
+		Binding::manager(vec![Key::char('c'), Key::char('d')], A::Copy(CopyKind::DirectoryPath), "Copy directory path"),
+		Binding::manager(vec![Key::char('c'), Key::char('D')], A::Copy(CopyKind::DirectoryUrl), "Copy directory URL"),
+		Binding::manager(vec![Key::char('c'), Key::char('f')], A::Copy(CopyKind::Filename), "Copy filename"),
+		Binding::manager(vec![Key::char('c'), Key::char('n')], A::Copy(CopyKind::Stem), "Copy filename without extension"),
 		Binding::manager(vec![Key::char('r')], A::OpenInput(InputKind::Rename), "Rename"),
-		Binding::manager(vec![Key::char('a')], A::OpenInput(InputKind::Create), "Create a file (end with / for directories)"),
+		Binding::manager(
+			vec![Key::char('a')],
+			A::OpenInput(InputKind::Create),
+			"Create a file (end with / for directories)",
+		),
 		Binding::manager(vec![Key::char('/')], A::OpenInput(InputKind::Find { previous: false }), "Find next file"),
 		Binding::manager(vec![Key::char('?')], A::OpenInput(InputKind::Find { previous: true }), "Find previous file"),
 		Binding::manager(vec![Key::char('n')], A::RepeatFind { opposite: false }, "Repeat find"),
@@ -54,8 +76,56 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('g'), Key::char(' ')], A::OpenInput(InputKind::Cd), "Go to directory"),
 		Binding::manager(vec![Key::char('m'), Key::char('n')], A::SetColumnMode(ColumnMode::None), "Hide column"),
 		Binding::manager(vec![Key::char('m'), Key::char('s')], A::SetColumnMode(ColumnMode::Size), "Show size column"),
-		Binding::manager(vec![Key::char('m'), Key::char('p')], A::SetColumnMode(ColumnMode::Permissions), "Show permissions column"),
-		Binding::manager(vec![Key::char('m'), Key::char('m')], A::SetColumnMode(ColumnMode::Modified), "Show modified column"),
+		Binding::manager(
+			vec![Key::char('m'), Key::char('p')],
+			A::SetColumnMode(ColumnMode::Permissions),
+			"Show permissions column",
+		),
+		Binding::manager(
+			vec![Key::char('m'), Key::char('m')],
+			A::SetColumnMode(ColumnMode::Modified),
+			"Show modified column",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('a')],
+			A::SetSort(SortPolicy::new(SortBy::Name, false)),
+			"Sort alphabetically",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('A')],
+			A::SetSort(SortPolicy::new(SortBy::Name, true)),
+			"Sort alphabetically (reverse)",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('m')],
+			A::SetSort(SortPolicy::new(SortBy::Modified, false)),
+			"Sort by modified time",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('M')],
+			A::SetSort(SortPolicy::new(SortBy::Modified, true)),
+			"Sort by modified time (reverse)",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('s')],
+			A::SetSort(SortPolicy::new(SortBy::Size, false)),
+			"Sort by size",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('S')],
+			A::SetSort(SortPolicy::new(SortBy::Size, true)),
+			"Sort by size (reverse)",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('e')],
+			A::SetSort(SortPolicy::new(SortBy::Extension, false)),
+			"Sort by extension",
+		),
+		Binding::manager(
+			vec![Key::char(','), Key::char('E')],
+			A::SetSort(SortPolicy::new(SortBy::Extension, true)),
+			"Sort by extension (reverse)",
+		),
 		Binding::manager(vec![Key::new(KeyCode::Char('p'), KeyModifiers::CONTROL)], A::TogglePreview, "Toggle preview"),
 		Binding::manager(vec![Key::new(KeyCode::Char('j'), KeyModifiers::ALT)], A::SeekPreview(1), "Scroll preview down"),
 		Binding::manager(vec![Key::new(KeyCode::Char('k'), KeyModifiers::ALT)], A::SeekPreview(-1), "Scroll preview up"),

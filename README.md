@@ -2,6 +2,16 @@
 
 A tree-style TUI file manager, inspired by [yazi](https://github.com/sxyazi/yazi).
 
+## Usage
+
+```sh
+tuzi [PATH]
+tuzi --help
+tuzi --version
+```
+
+`PATH` must be a directory and defaults to the current directory.
+
 ## Layout
 
 Modules mirror the crate boundaries yazi eventually grew into; each one

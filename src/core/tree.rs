@@ -1,6 +1,9 @@
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+	fs, io,
+	path::{Path, PathBuf},
+};
 
-use crate::fs::Cha;
+use crate::fs::{Cha, SortPolicy};
 
 use super::Node;
 
@@ -14,14 +17,20 @@ impl Tree {
 		// plain join off of it, so the whole tree then agrees with whatever
 		// realpath-resolved form the OS filesystem watcher reports back.
 		let path = path.canonicalize()?;
-		let cha = Cha::from(fs::metadata(&path)?);
+		let metadata = fs::metadata(&path)?;
+		if !metadata.is_dir() {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a directory: {}", path.display())));
+		}
+		let cha = Cha::from(metadata);
 		Ok(Self { root: Node::new(path, cha) })
 	}
 
 	/// Marks a node open right away; returns `Some(true)` if its listing
 	/// still needs to be fetched, `Some(false)` if it's already cached, or
 	/// `None` if the path isn't in the tree.
-	pub fn mark_expanded(&mut self, path: &Path) -> Option<bool> { Some(self.root.find_mut(path)?.mark_expanded()) }
+	pub fn mark_expanded(&mut self, path: &Path) -> Option<bool> {
+		Some(self.root.find_mut(path)?.mark_expanded())
+	}
 
 	pub fn collapse(&mut self, path: &Path) -> bool {
 		match self.root.find_mut(path) {
@@ -33,10 +42,10 @@ impl Tree {
 		}
 	}
 
-	pub fn apply_listing(&mut self, path: &Path, entries: Vec<(PathBuf, Cha)>) -> bool {
+	pub fn apply_listing(&mut self, path: &Path, entries: Vec<(PathBuf, Cha)>, policy: SortPolicy) -> bool {
 		match self.root.find_mut(path) {
 			Some(node) => {
-				node.apply_listing(entries);
+				node.apply_listing(entries, policy);
 				true
 			}
 			None => false,
@@ -62,26 +71,40 @@ impl Tree {
 	}
 
 	pub fn append_listing(&mut self, path: &Path, entries: Vec<(PathBuf, Cha)>) -> bool {
-		let Some(node) = self.root.find_mut(path) else { return false };
+		let Some(node) = self.root.find_mut(path) else {
+			return false;
+		};
 		node.append_listing(entries);
 		true
 	}
 
-	pub fn finish_incremental_listing(&mut self, path: &Path) -> bool {
-		let Some(node) = self.root.find_mut(path) else { return false };
-		node.finish_incremental_listing();
+	pub fn finish_incremental_listing(&mut self, path: &Path, policy: SortPolicy) -> bool {
+		let Some(node) = self.root.find_mut(path) else {
+			return false;
+		};
+		node.finish_incremental_listing(policy);
 		true
 	}
 
 	pub fn discard_incremental_listing(&mut self, path: &Path) -> bool {
-		let Some(node) = self.root.find_mut(path) else { return false };
+		let Some(node) = self.root.find_mut(path) else {
+			return false;
+		};
 		node.discard_incremental_listing();
 		true
 	}
 
-	pub fn parent_of(&self, path: &Path) -> Option<PathBuf> { self.root.find_parent(path).map(|node| node.path.clone()) }
+	pub fn parent_of(&self, path: &Path) -> Option<PathBuf> {
+		self.root.find_parent(path).map(|node| node.path.clone())
+	}
 
-	pub fn is_loaded(&self, path: &Path) -> bool { self.root.find(path).is_some_and(|node| node.children.is_some()) }
+	pub fn is_loaded(&self, path: &Path) -> bool {
+		self.root.find(path).is_some_and(|node| node.children.is_some())
+	}
+
+	pub fn sort(&mut self, policy: SortPolicy) {
+		self.root.sort_recursive(policy);
+	}
 }
 
 #[cfg(test)]
@@ -96,7 +119,7 @@ mod tests {
 	/// need to be async).
 	fn load(tree: &mut Tree, path: &Path) {
 		tree.mark_expanded(path);
-		tree.apply_listing(path, LocalEngine.read_dir(path).unwrap());
+		tree.apply_listing(path, LocalEngine.read_dir(path).unwrap(), SortPolicy::default());
 	}
 
 	#[test]

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 devicons = "0.6.13"
 edtui = { version = "0.11.7", default-features = false }

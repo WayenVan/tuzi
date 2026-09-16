@@ -1,4 +1,4 @@
-use crate::column_mode::ColumnMode;
+use crate::{column_mode::ColumnMode, fs::SortPolicy};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InputKind {
@@ -18,7 +18,20 @@ pub enum CursorTarget {
 /// Whether an armed delete confirmation sends its targets to the system
 /// trash (recoverable) or removes them outright.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DeleteMode { Trash, Permanent }
+pub enum DeleteMode {
+	Trash,
+	Permanent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyKind {
+	Path,
+	Url,
+	DirectoryPath,
+	DirectoryUrl,
+	Filename,
+	Stem,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -39,11 +52,13 @@ pub enum Action {
 	DeletePermanently,
 	Yank { cut: bool },
 	Paste,
+	Copy(CopyKind),
 	OpenInput(InputKind),
 	NewTab,
 	CloseTab,
 	SwitchTab(isize),
 	SetColumnMode(ColumnMode),
+	SetSort(SortPolicy),
 	TogglePreview,
 	SeekPreview(i16),
 	RepeatFind { opposite: bool },

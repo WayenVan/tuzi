@@ -1,4 +1,7 @@
-use crate::{action::{Action, CursorTarget, DeleteMode, InputKind}, event::Event};
+use crate::{
+	action::{Action, CursorTarget, DeleteMode, InputKind},
+	event::Event,
+};
 
 use super::App;
 
@@ -25,6 +28,7 @@ impl Dispatcher {
 			Action::DeletePermanently => app.active_tab_mut().delete_selected(DeleteMode::Permanent),
 			Action::Yank { cut } => app.yank_selected(cut),
 			Action::Paste => app.paste(),
+			Action::Copy(kind) => app.copy_to_system_clipboard(kind),
 			Action::OpenInput(InputKind::Rename) => app.active_tab_mut().start_rename(),
 			Action::OpenInput(InputKind::Cd) => app.active_tab_mut().start_cd(),
 			Action::OpenInput(InputKind::Create) => app.active_tab_mut().start_create(),
@@ -34,6 +38,7 @@ impl Dispatcher {
 			Action::CloseTab => app.close_tab(),
 			Action::SwitchTab(delta) => app.switch_tab(delta),
 			Action::SetColumnMode(mode) => app.active_tab_mut().column_mode = mode,
+			Action::SetSort(policy) => app.active_tab_mut().set_sort(policy),
 			Action::TogglePreview => app.active_tab_mut().preview.toggle(),
 			Action::SeekPreview(units) => app.active_tab_mut().preview.seek(units),
 			Action::RepeatFind { opposite } => app.active_tab_mut().repeat_find(opposite),
@@ -46,18 +51,30 @@ impl Dispatcher {
 
 	pub fn dispatch_event(app: &mut App, event: Event) {
 		match event {
-			Event::Redraw => {},
+			Event::Redraw => {}
 			Event::Changed { tab, path } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
 				}
 			}
-			Event::Loaded { tab, path, ticket, result, done } => {
+			Event::Loaded {
+				tab,
+				path,
+				ticket,
+				result,
+				done,
+			} => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_loaded(path, ticket, result, done);
 				}
 			}
-			Event::Created { tab, base, value, target, result } => {
+			Event::Created {
+				tab,
+				base,
+				value,
+				target,
+				result,
+			} => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_created(base, value, target, result);
 				}
