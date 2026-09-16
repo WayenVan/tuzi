@@ -1,9 +1,9 @@
 use std::{cell::Cell, io};
 
 use edtui::EditorMode;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::{layout::{Constraint, Direction, Layout}, style::{Color, Modifier, Style}};
 
-use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
+use crate::{event::Event, preview::PreviewTarget, status::Segment, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::App;
 
@@ -52,6 +52,22 @@ impl App {
 		let tasks = &self.tasks.tasks;
 		let notices = &self.notices;
 
+		// What goes in the status bar, and on which side, lives entirely
+		// here — `StatusBar` itself just lays these two lists out. Adding a
+		// clock, a git branch, anything else later is just pushing another
+		// `Segment` into whichever of these two it belongs in.
+		let mut status_left = vec![Segment::new(format!(" {} ", status.mode.label()), status.mode.style().add_modifier(Modifier::BOLD))];
+		if let Some(error) = &status.error {
+			status_left.push(Segment::new(format!(" {error}"), Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)));
+		} else if !status.name.is_empty() {
+			status_left.push(Segment::new(format!(" {}", status.name), Style::new().fg(Color::Gray)));
+			status_left.push(Segment::new(format!("  {}  {}", status.size, status.permissions), Style::new().fg(Color::DarkGray)));
+		}
+		let mut status_right = Vec::new();
+		if let Some((count, percent)) = self.tasks.summary() {
+			status_right.push(Segment::new(format!(" {percent:3.0}% · {count} tasks "), Style::new().fg(Color::Black).bg(Color::Blue)));
+		}
+
 		term.terminal.draw(|frame| {
 			let [win_area, tab_area, body_area, status_area] = Layout::default()
 				.direction(Direction::Vertical)
@@ -91,13 +107,7 @@ impl App {
 				preview_size.set((area.width.saturating_sub(1), area.height));
 				PreviewView::render(frame, area, rows.get(tab.cursor).map(|(_, node)| *node), &tab.preview.state, tab.preview.skip);
 			}
-			StatusBar::render(frame, status_area, &status);
-			if let Some((count, percent)) = self.tasks.summary() {
-				let text = format!(" {:3.0}% · {count} tasks ", percent);
-				let width = text.len().min(status_area.width as usize) as u16;
-				let area = ratatui::layout::Rect::new(status_area.right().saturating_sub(width), status_area.y, width, 1);
-				frame.render_widget(ratatui::widgets::Paragraph::new(text).style(ratatui::style::Style::new().fg(ratatui::style::Color::Black).bg(ratatui::style::Color::Blue)), area);
-			}
+			StatusBar::render(frame, status_area, &status_left, &status_right);
 			WhichPopup::render(frame, frame.area(), &which);
 			if let Some(picker) = &self.open_picker {
 				OpenPopup::render(frame, frame.area(), picker);
