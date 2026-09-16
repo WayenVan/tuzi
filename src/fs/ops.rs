@@ -4,11 +4,12 @@ pub fn remove(path: &Path) -> io::Result<()> {
 	if fs::symlink_metadata(path)?.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) }
 }
 
-/// Picks a free name in `dir` for `name`, appending "(copy)", "(copy 2)", …
-/// so pasting into the folder you copied from duplicates instead of failing.
-pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
+/// Picks a free name in `dir` for `name`, appending "(copy)", "(copy 2)", …;
+/// paths reserved by queued/running operations are unavailable even before
+/// they exist on disk.
+pub fn unique_dest_avoiding(dir: &Path, name: &OsStr, reserved: impl Fn(&Path) -> bool) -> PathBuf {
 	let direct = dir.join(name);
-	if !direct.exists() {
+	if !direct.exists() && !reserved(&direct) {
 		return direct;
 	}
 
@@ -19,7 +20,7 @@ pub fn unique_dest(dir: &Path, name: &OsStr) -> PathBuf {
 	loop {
 		let suffix = if n == 1 { "copy".to_owned() } else { format!("copy {n}") };
 		let candidate = dir.join(if ext.is_empty() { format!("{stem} ({suffix})") } else { format!("{stem} ({suffix}).{ext}") });
-		if !candidate.exists() {
+		if !candidate.exists() && !reserved(&candidate) {
 			return candidate;
 		}
 		n += 1;

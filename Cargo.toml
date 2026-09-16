@@ -14,3 +14,4 @@ notify = "8.2.0"
 ratatui = "0.30.2"
 syntect-no-panic = "6.0.0"
 tokio = { version = "1.53.1", features = ["io-util", "rt-multi-thread", "macros", "process", "sync", "time"] }
+trash = "5.2.9"

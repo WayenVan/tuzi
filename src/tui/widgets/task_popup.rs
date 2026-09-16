@@ -21,7 +21,7 @@ impl TaskPopup {
 			if y + 1 >= inner.bottom() { break }
 			let selected = index == cursor;
 			let color = if task.state == TaskState::Failed { Color::Red } else if selected { Color::LightCyan } else { Color::Gray };
-			let icon = match task.kind { TaskKind::Copy => "", TaskKind::Move => "" };
+			let icon = match task.kind { TaskKind::Copy => "", TaskKind::Move => "", TaskKind::Trash => "", TaskKind::Delete => "" };
 			let modifier = if selected { Modifier::BOLD } else { Modifier::empty() };
 			frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {icon}  "), Style::new().fg(color)), Span::styled(&task.title, Style::new().fg(color).add_modifier(modifier))])), Rect::new(inner.x, y, inner.width, 1));
 			if task.state == TaskState::Running {

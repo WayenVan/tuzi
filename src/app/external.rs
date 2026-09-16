@@ -7,9 +7,12 @@ use crate::{opener::{OpenMode, OpenPicker, OpenTarget}, process::{ProcessComplet
 use super::App;
 
 impl App {
-	pub(super) fn open_selected(&self, interactive: bool) {
-		let tab = self.active_tab();
-		self.open.open(tab.id, tab.tree.root.path.clone(), tab.open_targets(), interactive);
+	pub(super) fn open_selected(&mut self, interactive: bool) {
+		let (id, cwd, targets) = {
+			let tab = self.active_tab_mut();
+			(tab.id, tab.tree.root.path.clone(), tab.take_open_targets())
+		};
+		self.open.open(id, cwd, targets, interactive);
 	}
 
 	pub(super) fn on_open_resolved(&mut self, tab: usize, cwd: PathBuf, interactive: bool, result: io::Result<Vec<OpenTarget>>) {

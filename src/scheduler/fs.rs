@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{event::Event, fs::{self, Engine}};
+use crate::{event::Event, fs::Engine};
 
 #[derive(Default)]
 struct Entry {
@@ -60,22 +60,6 @@ impl FsScheduler {
 	}
 
 	pub fn forget(&mut self, path: &Path) { self.entries.remove(path); }
-
-	pub fn delete(&self, paths: Vec<PathBuf>) {
-		let tab = self.tab;
-		let tx = self.tx.clone();
-		let targets = paths.clone();
-		tokio::spawn(async move {
-			tokio::task::spawn_blocking(move || {
-				for path in &targets {
-					let _ = fs::remove(path);
-				}
-			})
-			.await
-			.ok();
-			let _ = tx.send(Event::Deleted { tab, paths });
-		});
-	}
 
 	pub fn create(&self, base: PathBuf, value: String) {
 		let tab = self.tab;

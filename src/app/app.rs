@@ -3,7 +3,7 @@ use std::{collections::VecDeque, env, io, path::PathBuf};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskManager}, tui::TerminalSession};
+use crate::{action::DeleteMode, event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskKind, TaskManager}, tui::TerminalSession};
 
 use super::{Dispatcher, Tab};
 
@@ -104,7 +104,9 @@ impl App {
 				_ => None,
 			};
 			let Some(submit) = submit else { return false };
-			self.active_tab_mut().confirm_delete(submit);
+			if let Some((targets, mode)) = self.active_tab_mut().take_pending_delete(submit) {
+				self.enqueue_delete(targets, mode);
+			}
 			return true;
 		}
 		if self.active_tab().input.is_some() {
@@ -222,9 +224,22 @@ impl App {
 	}
 
 	pub(super) fn on_task_event(&mut self, event: TaskEvent) {
-		if let Some((tab, target)) = self.tasks.accept(event)
-			&& let Some(tab) = self.tab_mut(tab) {
-			tab.on_pasted(target);
+		let Some((tab, kind, subject)) = self.tasks.accept(event) else { return };
+		let Some(tab) = self.tab_mut(tab) else { return };
+		match kind {
+			TaskKind::Copy | TaskKind::Move => tab.on_pasted(subject),
+			TaskKind::Trash | TaskKind::Delete => tab.on_deleted(vec![subject]),
+		}
+	}
+
+	/// Sends a confirmed delete to the task queue: trash by default, or a
+	/// permanent removal for `DeleteMode::Permanent`. Both become
+	/// observable, cancelable tasks the same way paste does.
+	fn enqueue_delete(&mut self, targets: Vec<PathBuf>, mode: DeleteMode) {
+		let tab = self.active;
+		match mode {
+			DeleteMode::Trash => self.tasks.enqueue_trash(targets, tab),
+			DeleteMode::Permanent => self.tasks.enqueue_delete(targets, tab),
 		}
 	}
 }
@@ -329,6 +344,28 @@ mod tests {
 		assert!(app.clipboard.is_empty());
 		assert!(!app.clipboard_cut);
 		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn confirmed_delete_permanently_removes_the_target_as_a_task() {
+		let root = std::env::temp_dir().join("tuzi-app-test-delete-permanent");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("leaf.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().move_cursor(1); // onto "leaf.txt"
+		app.active_tab_mut().delete_selected(DeleteMode::Permanent);
+		assert!(app.active_tab().pending_delete.is_some(), "arms the confirmation without deleting yet");
+		assert!(root.join("leaf.txt").exists());
+
+		let (targets, mode) = app.active_tab_mut().take_pending_delete(true).unwrap();
+		app.enqueue_delete(targets, mode);
+		pump(&mut app, &mut rx).await;
+
+		assert!(!root.join("leaf.txt").exists());
+		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]

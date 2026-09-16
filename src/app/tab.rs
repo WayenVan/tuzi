@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{action::DeleteMode, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, format_size}, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
 use super::input::{Completion, InputPurpose, InputSession};
 
@@ -31,7 +31,7 @@ pub struct Tab {
 	pub fs_scheduler:   FsScheduler,
 	pub selection:      Selection,
 	pub visual:         Option<Visual>,
-	pub pending_delete: Option<Vec<PathBuf>>,
+	pub pending_delete: Option<(Vec<PathBuf>, DeleteMode)>,
 	pub finder:         Option<Finder>,
 	pub filter:         Option<Filter>,
 	pub notice:         Option<String>,
@@ -195,18 +195,26 @@ impl Tab {
 	}
 
 	/// Opens a modal confirmation for the current operation targets. The
-	/// event loop owns the modal keys and calls `confirm_delete`; another
-	/// ordinary `d` can never submit the destructive action.
-	pub fn delete_selected(&mut self) {
-		let targets = self.action_targets();
-		self.pending_delete = (!targets.is_empty()).then_some(targets);
+	/// event loop owns the modal keys and calls `take_pending_delete`;
+	/// another ordinary `d`/`D` can never submit the destructive action.
+	pub fn delete_selected(&mut self, mode: DeleteMode) {
+		self.commit_visual();
+		let root = &self.tree.root.path;
+		let targets: Vec<_> = self.action_targets().into_iter().filter(|path| path != root).collect();
+		if targets.is_empty() {
+			self.pending_delete = None;
+			self.notice = Some("The current tree root cannot be deleted".into());
+			return;
+		}
+		self.pending_delete = (!targets.is_empty()).then_some((targets, mode));
 	}
 
-	pub fn confirm_delete(&mut self, submit: bool) {
-		let Some(targets) = self.pending_delete.take() else { return };
-		if submit {
-			self.fs_scheduler.delete(targets);
-		}
+	/// Takes the armed confirmation, handing the targets and mode to the
+	/// caller (which owns the task queue) only if the user actually
+	/// confirmed — declining or canceling just clears it.
+	pub(super) fn take_pending_delete(&mut self, submit: bool) -> Option<(Vec<PathBuf>, DeleteMode)> {
+		let pending = self.pending_delete.take()?;
+		submit.then_some(pending)
 	}
 
 	/// The action targets to yank (the current selection, or the hovered
@@ -484,6 +492,19 @@ impl Tab {
 		}
 	}
 
+	pub fn cd_trash(&mut self) {
+		let dirs = trash_dirs();
+		let Some(path) = dirs.iter().position(|path| path == &self.tree.root.path)
+			.and_then(|index| dirs.get((index + 1) % dirs.len()))
+			.or_else(|| dirs.first()).cloned() else {
+			self.notice = Some("No trash location found for this platform".into());
+			return;
+		};
+		if let Err(error) = self.cd(path) {
+			self.notice = Some(error.to_string());
+		}
+	}
+
 	pub fn reveal(&mut self, target: PathBuf) -> io::Result<()> {
 		let target = target.canonicalize()?;
 		if !target.starts_with(&self.tree.root.path) {
@@ -600,12 +621,21 @@ impl Tab {
 	/// A background listing finished. `accept` first checks it's still the
 	/// most recent request for that path — a superseded one is discarded
 	/// rather than clobbering a listing a newer request already applied.
+	/// A failed listing (permission denied, the directory vanished, …)
+	/// collapses the node instead of leaving it stuck showing "(loading…)"
+	/// forever, and reports why in the status line.
 	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>) {
 		if !self.fs_scheduler.accept(&path, ticket) {
 			return;
 		}
-		if let Ok(entries) = result {
-			self.tree.apply_listing(&path, entries);
+		match result {
+			Ok(entries) => {
+				self.tree.apply_listing(&path, entries);
+			}
+			Err(error) => {
+				self.tree.collapse(&path);
+				self.notice = Some(error.to_string());
+			}
 		}
 		self.continue_reveal();
 		self.clamp_cursor();
@@ -666,7 +696,10 @@ impl Tab {
 		self.visible().into_iter().nth(self.cursor).map(|(_, node)| node.path.clone()).into_iter().collect()
 	}
 
-	pub fn open_targets(&self) -> Vec<PathBuf> { self.action_targets() }
+	pub fn take_open_targets(&mut self) -> Vec<PathBuf> {
+		self.commit_visual();
+		self.action_targets()
+	}
 
 	/// Where paste drops files: always the parent of whatever's under the
 	/// cursor, never the cursor's own node — the cursor marks a position in
@@ -732,6 +765,33 @@ fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
 
 fn home_dir() -> io::Result<PathBuf> {
 	std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+}
+
+/// The current platform's default trash location, queried through the
+/// `trash` crate's own platform code wherever it exposes one — hand-rolling
+/// `.Trash`/XDG paths ourselves would just reinvent (and risk getting
+/// wrong) exactly what that crate already handles for `delete_selected`.
+/// macOS is the one exception: its `os_limited` module (and the folder
+/// listing it would otherwise provide) isn't compiled there at all, because
+/// macOS trashes files through an OS API that never needs a path from us —
+/// so `~/.Trash` is `cd_trash`'s only option, not a choice we're avoiding.
+fn trash_dirs() -> Vec<PathBuf> {
+	#[cfg(target_os = "macos")]
+	{
+		home_dir().ok().map(|home| vec![home.join(".Trash")]).unwrap_or_default()
+	}
+	#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
+	{
+		let Ok(folders) = trash::os_limited::trash_folders() else { return Vec::new() };
+		let home = home_dir().ok();
+		let mut folders: Vec<_> = folders.into_iter().collect();
+		folders.sort_by_key(|folder| (!home.as_deref().is_some_and(|home| folder.starts_with(home)), folder.clone()));
+		folders
+	}
+	#[cfg(not(any(target_os = "macos", all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))))]
+	{
+		Vec::new()
+	}
 }
 
 fn ancestor_directories(root: &Path, parent: &Path) -> Vec<PathBuf> {
@@ -812,7 +872,6 @@ mod tests {
 		match event {
 			Event::Changed { path, .. } => tab.on_changed(path),
 			Event::Loaded { path, ticket, result, .. } => tab.on_loaded(path, ticket, result),
-			Event::Deleted { paths, .. } => tab.on_deleted(paths),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			_ => panic!("unexpected event in a single-tab test"),
 		}
@@ -843,6 +902,29 @@ mod tests {
 
 		tab.cd_parent();
 		assert_eq!(tab.tree.root.path, root);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_failed_listing_collapses_the_node_and_reports_why() {
+		use std::os::unix::fs::PermissionsExt;
+
+		let root = std::env::temp_dir().join("tuzi-tab-test-load-failure");
+		fs::create_dir_all(root.join("locked")).unwrap();
+		let root = root.canonicalize().unwrap();
+		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.move_cursor(1); // onto "locked"
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await; // Loaded(locked) -> permission denied
+
+		let locked = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("locked")).unwrap();
+		assert!(!locked.expanded, "collapses instead of staying stuck showing \"(loading…)\" forever");
+		assert!(locked.children.is_none());
+		assert!(tab.notice.is_some(), "reports why, instead of failing silently");
+
+		fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
 		fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -1062,23 +1144,47 @@ mod tests {
 		fs::write(root.join("leaf.txt"), b"hi").unwrap();
 		let root = root.canonicalize().unwrap();
 
-		let (mut tab, mut rx) = tab(&root).await;
+		let (mut tab, _rx) = tab(&root).await;
 		tab.move_cursor(1); // onto "leaf.txt"
 
-		tab.delete_selected();
+		tab.delete_selected(DeleteMode::Trash);
 		assert!(root.join("leaf.txt").exists(), "opening the confirmation does not delete");
 		assert!(tab.pending_delete.is_some());
 
-		tab.delete_selected();
+		tab.delete_selected(DeleteMode::Trash);
 		assert!(root.join("leaf.txt").exists(), "a second d still does not submit the modal");
 		assert!(tab.pending_delete.is_some());
 
-		tab.confirm_delete(true);
-		pump(&mut tab, &mut rx).await; // wait for the background removal to actually land
-		assert!(!root.join("leaf.txt").exists());
+		// Declining just clears the confirmation — actually removing the
+		// file is the caller's job once it gets `Some(_)` back from a
+		// confirmed take, which owns the task queue this hands off to.
+		assert!(tab.take_pending_delete(false).is_none());
+		assert!(root.join("leaf.txt").exists());
+
+		tab.delete_selected(DeleteMode::Permanent);
+		let (targets, mode) = tab.take_pending_delete(true).unwrap();
+		assert_eq!(targets, vec![root.join("leaf.txt")]);
+		assert_eq!(mode, DeleteMode::Permanent);
 		assert!(tab.pending_delete.is_none());
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn delete_refuses_to_target_the_current_tree_root() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-protect-root");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+
+		for mode in [DeleteMode::Trash, DeleteMode::Permanent] {
+			tab.delete_selected(mode);
+			assert!(tab.pending_delete.is_none());
+			assert_eq!(tab.notice.as_deref(), Some("The current tree root cannot be deleted"));
+		}
+		assert!(root.exists());
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
@@ -1092,7 +1198,7 @@ mod tests {
 		tab.move_cursor(1); // onto "leaf.txt"
 		tab.toggle_selected();
 		tab.move_cursor(-1);
-		tab.delete_selected(); // arms, targeting the selection
+		tab.delete_selected(DeleteMode::Trash); // arms, targeting the selection
 		assert!(tab.pending_delete.is_some());
 
 		tab.escape();
@@ -1147,6 +1253,33 @@ mod tests {
 		assert!(tab.selection.is_empty(), "and the range converts straight into clipboard markers, same as a committed selection");
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn delete_and_open_commit_the_pending_visual_range() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-actions-visual");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("a"), b"a").unwrap();
+		fs::write(root.join("b"), b"b").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.move_cursor(1);
+		tab.enter_visual(false);
+		tab.move_cursor(1);
+		tab.delete_selected(DeleteMode::Trash);
+		assert_eq!(tab.pending_delete.as_ref().unwrap().0.len(), 2);
+		assert!(tab.visual.is_none());
+
+		tab.pending_delete = None;
+		tab.selection.clear();
+		tab.move_cursor(-1);
+		tab.enter_visual(false);
+		tab.move_cursor(1);
+		assert_eq!(tab.take_open_targets().len(), 2);
+		assert!(tab.visual.is_none());
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]

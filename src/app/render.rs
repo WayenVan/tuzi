@@ -98,8 +98,8 @@ impl App {
 			if let Some(picker) = &self.open_picker {
 				OpenPopup::render(frame, frame.area(), picker);
 			}
-			if let Some(targets) = &pending_delete {
-				ConfirmPopup::render_delete(frame, frame.area(), targets);
+			if let Some((targets, mode)) = &pending_delete {
+				ConfirmPopup::render_delete(frame, frame.area(), targets, *mode);
 			}
 			if let Some(input) = &mut input {
 				let (x, y, rect) = Prompt::render(frame, frame.area(), input.title(), &mut input.state);

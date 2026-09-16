@@ -1,4 +1,4 @@
-use crate::{action::{Action, CursorTarget, InputKind}, event::Event};
+use crate::{action::{Action, CursorTarget, DeleteMode, InputKind}, event::Event};
 
 use super::App;
 
@@ -15,12 +15,14 @@ impl Dispatcher {
 			Action::MoveTo(CursorTarget::Bottom) => app.active_tab_mut().move_to_bottom(),
 			Action::CdParent => app.active_tab_mut().cd_parent(),
 			Action::CdSelected => app.active_tab_mut().cd_selected(),
+			Action::CdTrash => app.active_tab_mut().cd_trash(),
 			Action::Expand => app.active_tab_mut().expand_selected(),
 			Action::ToggleExpand => app.active_tab_mut().toggle_expand_selected(),
 			Action::Collapse => app.active_tab_mut().collapse_selected(),
 			Action::ToggleSelect => app.active_tab_mut().toggle_selected(),
 			Action::VisualSelect { unset } => app.active_tab_mut().enter_visual(unset),
-			Action::Delete => app.active_tab_mut().delete_selected(),
+			Action::Delete => app.active_tab_mut().delete_selected(DeleteMode::Trash),
+			Action::DeletePermanently => app.active_tab_mut().delete_selected(DeleteMode::Permanent),
 			Action::Yank { cut } => app.yank_selected(cut),
 			Action::Paste => app.paste(),
 			Action::OpenInput(InputKind::Rename) => app.active_tab_mut().start_rename(),
@@ -52,11 +54,6 @@ impl Dispatcher {
 			Event::Loaded { tab, path, ticket, result } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_loaded(path, ticket, result);
-				}
-			}
-			Event::Deleted { tab, paths } => {
-				if let Some(t) = app.tab_mut(tab) {
-					t.on_deleted(paths);
 				}
 			}
 			Event::Created { tab, base, value, target, result } => {

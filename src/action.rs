@@ -15,6 +15,11 @@ pub enum CursorTarget {
 	Bottom,
 }
 
+/// Whether an armed delete confirmation sends its targets to the system
+/// trash (recoverable) or removes them outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteMode { Trash, Permanent }
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
 	Quit,
@@ -24,12 +29,14 @@ pub enum Action {
 	MoveTo(CursorTarget),
 	CdParent,
 	CdSelected,
+	CdTrash,
 	Expand,
 	ToggleExpand,
 	Collapse,
 	ToggleSelect,
 	VisualSelect { unset: bool },
 	Delete,
+	DeletePermanently,
 	Yank { cut: bool },
 	Paste,
 	OpenInput(InputKind),
