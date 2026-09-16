@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 crossterm = "=0.29.0"
+edtui = { version = "0.11.7", default-features = false }
 notify = "8.2.0"
 ratatui = "0.30.2"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }

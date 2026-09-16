@@ -1,11 +1,23 @@
 use std::{env, io, path::{Path, PathBuf}, sync::Arc, thread};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use edtui::{EditorEventHandler, EditorMode, EditorState, Index2, Lines};
 use ratatui::layout::{Constraint, Direction, Layout};
 use tokio::sync::mpsc;
 
-use crate::{core::{Input, InputMode, Node, Selection, Tree, Visual}, event::Event, fs::{Engine, LocalEngine}, scheduler::Scheduler, tui::{Raterm, widgets::{Prompt, StatusBar, TreeView}}, watcher::Watcher};
+use crate::{core::{Node, Selection, Tree, Visual}, event::Event, fs::{Engine, LocalEngine}, scheduler::Scheduler, tui::{Raterm, widgets::{Prompt, StatusBar, TreeView}}, watcher::Watcher};
 
 use super::{Dispatcher, Router};
+
+/// An open rename prompt: which path it targets, edtui's own buffer/cursor/
+/// mode state, and a per-session key handler (fresh each time, so a
+/// half-finished `d`-then-motion sequence from a previous rename can never
+/// bleed into the next one).
+struct Rename {
+	target:  PathBuf,
+	state:   EditorState,
+	handler: EditorEventHandler,
+}
 
 pub struct App {
 	pub tree:           Tree,
@@ -17,7 +29,7 @@ pub struct App {
 	pub visual:         Option<Visual>,
 	pub clipboard:      Vec<PathBuf>,
 	pub pending_delete: Option<Vec<PathBuf>>,
-	pub rename:         Option<(PathBuf, Input)>,
+	rename:             Option<Rename>,
 }
 
 impl App {
@@ -25,9 +37,9 @@ impl App {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 
 		// Raw terminal events are wrapped, not translated, here — the
-		// background thread doesn't know whether a prompt is open, so
-		// `Router::route` only actually runs once the event reaches the
-		// main loop, where `app.rename`'s mode is in scope.
+		// background thread doesn't know whether a rename prompt is open,
+		// so the split between tree keymap and raw-key-to-edtui only
+		// happens once the event reaches the main loop below.
 		let input_tx = tx.clone();
 		thread::spawn(move || {
 			while let Ok(term_event) = crossterm::event::read() {
@@ -64,7 +76,15 @@ impl App {
 		};
 		let mut term = Raterm::start()?;
 
-		let draw = |app: &App, term: &mut Raterm| -> io::Result<()> {
+		let draw = |app: &mut App, term: &mut Raterm| -> io::Result<()> {
+			// Taken out (and put back at the end) so that its `&mut` doesn't
+			// overlap, for the borrow checker's purposes, with the `&Node`s
+			// `app.visible()` lends out below — both ultimately borrow from
+			// `app` through `&self` methods, which erases field-level
+			// disjointness even though `rename` and `tree` never actually
+			// touch each other.
+			let mut rename = app.rename.take();
+
 			let rows = app.visible();
 			let (status, warn) = app.status_line();
 			let visual = app.visual_range();
@@ -74,8 +94,8 @@ impl App {
 				TreeView::render(frame, tree_area, &rows, app.cursor, &app.selection, visual);
 				StatusBar::render(frame, status_area, &status, warn);
 
-				if let Some((_, input)) = &app.rename {
-					let (x, y) = Prompt::render(frame, frame.area(), input);
+				if let Some(rename) = &mut rename {
+					let (x, y) = Prompt::render(frame, frame.area(), "Rename", &mut rename.state);
 					frame.set_cursor_position((x, y));
 				}
 			})?;
@@ -83,30 +103,32 @@ impl App {
 			// Cursor *shape* is a raw terminal escape, not something ratatui's
 			// buffer diffing covers — set it after the frame's own writes are
 			// flushed so it doesn't get interleaved with them. A bar in
-			// Insert/Replace mirrors vim's editing feel; a block in
-			// Normal/Visual makes clear you're issuing commands, not typing.
-			if let Some((_, input)) = &app.rename {
+			// Insert mirrors vim's editing feel; a block otherwise (Normal,
+			// Visual, edtui's Search) makes clear you're issuing commands.
+			if let Some(rename) = &rename {
 				use crossterm::cursor::SetCursorStyle;
-				let style = match input.mode {
-					InputMode::Insert => SetCursorStyle::SteadyBar,
-					InputMode::Replace => SetCursorStyle::SteadyUnderScore,
-					InputMode::Normal | InputMode::Visual => SetCursorStyle::SteadyBlock,
-				};
+				let style = if rename.state.mode == EditorMode::Insert { SetCursorStyle::SteadyBar } else { SetCursorStyle::SteadyBlock };
 				crossterm::execute!(io::stdout(), style)?;
 			}
+
+			app.rename = rename;
 			Ok(())
 		};
 
-		draw(&app, &mut term)?;
+		draw(&mut app, &mut term)?;
 		while let Some(event) = rx.recv().await {
 			let event = match event {
-				Event::Term(term_event) => {
-					let mode = app.rename.as_ref().map(|(_, input)| input.mode);
-					match Router::route(term_event, mode) {
-						Some(event) => event,
-						None => continue,
+				Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => {
+					if app.rename.is_some() {
+						Event::RenameKey(key)
+					} else {
+						match Router::route(key.code) {
+							Some(event) => event,
+							None => continue,
+						}
 					}
 				}
+				Event::Term(_) => continue,
 				event => event,
 			};
 
@@ -114,7 +136,7 @@ impl App {
 			if app.quit {
 				break;
 			}
-			draw(&app, &mut term)?;
+			draw(&mut app, &mut term)?;
 		}
 
 		Ok(())
@@ -231,103 +253,92 @@ impl App {
 	}
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
-	/// with its current name. Renaming the tree's own root is refused — it
-	/// would orphan every path already cached under it.
+	/// with its current name in Insert mode, cursor at the end — ready to
+	/// type over it. Renaming the tree's own root is refused — it would
+	/// orphan every path already cached under it.
 	pub fn start_rename(&mut self) {
 		let Some((_, node)) = self.visible().into_iter().nth(self.cursor) else { return };
 		if node.path == self.tree.root.path {
 			return;
 		}
 		let name = node.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-		self.rename = Some((node.path.clone(), Input::new("Rename", name)));
+
+		let mut state = EditorState::new(Lines::from(name.as_str()));
+		state.set_single_line(true);
+		state.mode = EditorMode::Insert;
+		state.cursor = Index2::new(0, name.chars().count());
+
+		self.rename = Some(Rename { target: node.path.clone(), state, handler: EditorEventHandler::vim_mode() });
 	}
 
-	pub fn input_insert(&mut self, c: char) { self.with_input(|i| i.insert(c)); }
-
-	pub fn input_backspace(&mut self) { self.with_input(|i| i.backspace()); }
-
-	pub fn input_delete_under(&mut self) { self.with_input(|i| i.delete_under()); }
-
-	pub fn input_delete_to_eol(&mut self) { self.with_input(|i| i.delete_to_eol()); }
-
-	pub fn input_delete_visual(&mut self) { self.with_input(|i| i.delete_visual()); }
-
-	pub fn input_op_delete(&mut self) { self.with_input(|i| i.op_delete()); }
-
-	pub fn input_replace_char(&mut self, c: char) { self.with_input(|i| i.replace_char(c)); }
-
-	pub fn input_enter_replace(&mut self) { self.with_input(|i| i.enter_replace()); }
-
-	pub fn input_toggle_visual(&mut self) { self.with_input(|i| i.toggle_visual()); }
-
-	pub fn input_move_left(&mut self) { self.with_input(|i| i.move_left()); }
-
-	pub fn input_move_right(&mut self) { self.with_input(|i| i.move_right()); }
-
-	pub fn input_move_bol(&mut self) { self.with_input(|i| i.move_bol()); }
-
-	pub fn input_move_eol(&mut self) { self.with_input(|i| i.move_eol()); }
-
-	pub fn input_move_word_forward(&mut self) { self.with_input(|i| i.move_word_forward()); }
-
-	pub fn input_move_word_back(&mut self) { self.with_input(|i| i.move_word_back()); }
-
-	pub fn input_move_word_end(&mut self) { self.with_input(|i| i.move_word_end()); }
-
-	pub fn input_enter_insert(&mut self) { self.with_input(|i| i.enter_insert()); }
-
-	pub fn input_enter_insert_bol(&mut self) {
-		self.with_input(|i| {
-			i.move_bol();
-			i.enter_insert();
-		});
-	}
-
-	pub fn input_enter_append(&mut self) { self.with_input(|i| i.enter_insert_after()); }
-
-	pub fn input_enter_append_eol(&mut self) {
-		self.with_input(|i| {
-			i.move_eol();
-			i.enter_insert_after();
-		});
-	}
-
-	/// Esc within the prompt: drop from Insert to Normal, or — already in
-	/// Normal — close the prompt without renaming anything.
-	pub fn input_escape(&mut self) {
-		let Some((_, input)) = &mut self.rename else { return };
-		if input.escape() {
-			self.rename = None;
+	/// Enter confirms; Esc from edtui's own Normal mode closes the prompt
+	/// (Esc from Insert/Visual is forwarded instead, so edtui can drop it
+	/// to Normal itself, vim-style); everything else is handed straight to
+	/// edtui's own vim-modal key handler.
+	pub fn handle_rename_key(&mut self, key: KeyEvent) {
+		match key.code {
+			KeyCode::Enter => self.confirm_rename(),
+			KeyCode::Esc => {
+				let Some(rename) = &mut self.rename else { return };
+				if rename.state.mode != EditorMode::Normal {
+					rename.handler.on_key_event(key, &mut rename.state);
+					return;
+				}
+				self.rename = None;
+			}
+			// edtui's vim_mode doesn't bind `C` (vim's "change to end of
+			// line") at all — synthesize it from what it does have: `D`
+			// (delete to eol) followed by dropping straight into Insert,
+			// appending right where the cut happened. Only in Normal mode;
+			// typing a literal capital C elsewhere goes through untouched.
+			KeyCode::Char('C') => {
+				let Some(rename) = &mut self.rename else { return };
+				if rename.state.mode != EditorMode::Normal {
+					rename.handler.on_key_event(key, &mut rename.state);
+					return;
+				}
+				// edtui's own uppercase-letter bindings (like this `D`) key
+				// off the modifier flag, not just the letter's case — and
+				// most terminals report Shift+<letter> as the already-
+				// capitalized char with the modifier bit left unset, so it
+				// has to be set explicitly here rather than forwarded from
+				// whatever `key.modifiers` the incoming `C` carried.
+				rename.handler.on_key_event(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), &mut rename.state);
+				// `D` leaves the Normal-mode cursor sitting *on* whatever's
+				// now the last character (or col 0, on an emptied line) —
+				// vim's `C` instead appends *after* it, so nudge to the
+				// line's current length rather than just flipping the mode.
+				rename.state.cursor.col = rename.state.lines.len_col(rename.state.cursor.row).unwrap_or(0);
+				rename.state.mode = EditorMode::Insert;
+			}
+			_ => {
+				let Some(rename) = &mut self.rename else { return };
+				rename.handler.on_key_event(key, &mut rename.state);
+			}
 		}
 	}
 
 	pub fn confirm_rename(&mut self) {
-		let Some((target, input)) = self.rename.take() else { return };
-		let name = input.value();
-		let Some(parent) = target.parent() else { return };
+		let Some(rename) = self.rename.take() else { return };
+		let name: String = rename.state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect();
+		let Some(parent) = rename.target.parent() else { return };
 		let dest = parent.join(&name);
-		if name.is_empty() || dest == target || std::fs::rename(&target, &dest).is_err() {
+		if name.is_empty() || dest == rename.target || std::fs::rename(&rename.target, &dest).is_err() {
 			return;
 		}
 
-		self.watcher.unwatch(&target);
-		self.scheduler.forget(&target);
-		self.selection.remove(&target);
+		self.watcher.unwatch(&rename.target);
+		self.scheduler.forget(&rename.target);
+		self.selection.remove(&rename.target);
 		if self.tree.is_loaded(parent) {
 			self.scheduler.refresh(parent.to_path_buf());
 		}
 	}
 
-	fn with_input(&mut self, f: impl FnOnce(&mut Input)) {
-		if let Some((_, input)) = &mut self.rename {
-			f(input);
-		}
-	}
-
-	/// Esc cancels whatever's most "in progress": an open rename prompt,
-	/// then an open visual selection (committing it), then an armed
-	/// delete, then the selection. Reaching here at all means no prompt was
-	/// open — while one is, Esc routes to `input_escape` instead.
+	/// Esc cancels whatever's most "in progress": an open visual selection
+	/// (committing it), then an armed delete, then the selection. Reaching
+	/// here at all means no rename prompt was open — while one is, Esc
+	/// routes to `handle_rename_key` instead.
 	pub fn escape(&mut self) {
 		if self.commit_visual() {
 			return;
@@ -479,6 +490,12 @@ mod tests {
 	async fn pump(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>) {
 		let event = rx.recv().await.unwrap();
 		Dispatcher::dispatch(app, event);
+	}
+
+	fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, crossterm::event::KeyModifiers::NONE) }
+
+	fn rename_value(app: &App) -> String {
+		app.rename.as_ref().unwrap().state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect()
 	}
 
 	#[tokio::test]
@@ -676,17 +693,20 @@ mod tests {
 		app.move_cursor(1); // onto "old.txt"
 
 		app.start_rename();
-		assert_eq!(app.rename.as_ref().unwrap().1.value(), "old.txt", "prefilled with the current name");
+		assert_eq!(rename_value(&app), "old.txt", "prefilled with the current name");
+		assert!(app.rename.as_ref().unwrap().state.mode == EditorMode::Insert);
 
-		// still in Insert mode: clear the prefill and type the new name
+		// still in Insert mode (cursor at the end): clear the prefill and
+		// type the new name, one raw key event at a time through edtui.
 		for _ in 0..7 {
-			app.input_backspace();
+			app.handle_rename_key(key(KeyCode::Backspace));
 		}
 		for c in "new.txt".chars() {
-			app.input_insert(c);
+			app.handle_rename_key(key(KeyCode::Char(c)));
 		}
+		assert_eq!(rename_value(&app), "new.txt");
 
-		app.confirm_rename();
+		app.handle_rename_key(key(KeyCode::Enter)); // confirm
 		assert!(app.rename.is_none());
 		pump(&mut app, &mut rx).await; // parent's listing refreshes
 
@@ -709,12 +729,45 @@ mod tests {
 		app.move_cursor(1); // onto "keep.txt"
 		app.start_rename();
 
-		app.input_escape(); // Insert -> Normal
+		app.handle_rename_key(key(KeyCode::Esc)); // Insert -> Normal, handled by edtui itself
 		assert!(app.rename.is_some(), "first escape only drops to normal mode");
+		assert!(app.rename.as_ref().unwrap().state.mode == EditorMode::Normal);
 
-		app.input_escape(); // Normal -> cancel
+		app.handle_rename_key(key(KeyCode::Esc)); // Normal -> we intercept and close
 		assert!(app.rename.is_none());
 		assert!(root.join("keep.txt").exists(), "nothing was renamed");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn capital_c_changes_from_the_cursor_to_the_end_of_line() {
+		let root = std::env::temp_dir().join("tuzi-app-test-rename-change");
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("keep.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		app.move_cursor(1); // onto "keep.txt"
+		app.start_rename();
+
+		app.handle_rename_key(key(KeyCode::Esc)); // Insert -> Normal, cursor lands on the last char ('t')
+		app.handle_rename_key(key(KeyCode::Char('0'))); // BOL
+		// edtui's `w` treats punctuation as its own word class, matching
+		// real vim: "keep" | "." | "txt" is three words, not one.
+		app.handle_rename_key(key(KeyCode::Char('w'))); // -> the '.'
+		app.handle_rename_key(key(KeyCode::Char('w'))); // -> start of "txt"
+
+		// edtui's vim_mode has no native `C` binding at all — this is our
+		// own synthesized delete-to-eol-then-insert.
+		app.handle_rename_key(key(KeyCode::Char('C')));
+		assert_eq!(rename_value(&app), "keep.");
+		assert!(app.rename.as_ref().unwrap().state.mode == EditorMode::Insert, "C drops straight into Insert");
+
+		for c in "md".chars() {
+			app.handle_rename_key(key(KeyCode::Char(c)));
+		}
+		assert_eq!(rename_value(&app), "keep.md");
 
 		fs::remove_dir_all(&root).unwrap();
 	}
