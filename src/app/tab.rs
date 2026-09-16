@@ -211,8 +211,11 @@ impl Tab {
 
 	/// The action targets to yank (the current selection, or the hovered
 	/// node), with the selection then cleared since it converts into
-	/// clipboard markers held by `App`.
+	/// clipboard markers held by `App`. Commits a pending visual range
+	/// first — mirrors yazi: yanking mid-visual-select acts on the
+	/// highlighted range and leaves visual mode, rather than ignoring it.
 	pub(super) fn take_yank_targets(&mut self) -> Vec<PathBuf> {
+		self.commit_visual();
 		let targets = self.action_targets();
 		if !targets.is_empty() {
 			self.selection.clear();
@@ -1120,6 +1123,28 @@ mod tests {
 		let targets = tab.take_yank_targets();
 		assert_eq!(targets, vec![root.join("src/leaf.txt")]);
 		assert!(tab.selection.is_empty(), "yanking converts selected markers into clipboard markers");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn take_yank_targets_commits_a_pending_visual_range_and_leaves_visual_mode() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-yank-visual");
+		fs::create_dir_all(root.join("a")).unwrap();
+		fs::create_dir_all(root.join("b")).unwrap();
+		fs::create_dir_all(root.join("c")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.move_cursor(1); // onto "a"
+		tab.enter_visual(false);
+		tab.move_cursor(1); // onto "b" — range is now a..=b, not yet committed
+
+		let mut targets = tab.take_yank_targets();
+		targets.sort();
+		assert_eq!(targets, [root.join("a"), root.join("b")], "yanks the highlighted range, not just the hovered node");
+		assert!(tab.visual.is_none(), "yanking mid-visual-select leaves visual mode");
+		assert!(tab.selection.is_empty(), "and the range converts straight into clipboard markers, same as a committed selection");
 
 		fs::remove_dir_all(&root).unwrap();
 	}
