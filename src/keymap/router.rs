@@ -115,6 +115,10 @@ mod tests {
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Actions(vec![Action::OpenInput(InputKind::Cd)]));
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Actions(vec![Action::CdParent]));
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Actions(vec![Action::CdSelected]));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('G')), Route::Actions(vec![Action::MoveTo(CursorTarget::Bottom)]));
 	}
 

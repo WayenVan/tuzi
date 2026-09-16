@@ -21,6 +21,8 @@ pub enum Action {
 	MoveCursor(isize),
 	MovePage(i8),
 	MoveTo(CursorTarget),
+	CdParent,
+	CdSelected,
 	Expand,
 	ToggleExpand,
 	Collapse,

@@ -19,6 +19,8 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::new(KeyCode::Char('b'), KeyModifiers::CONTROL)], A::MovePage(-100), "Move up one page"),
 		Binding::manager(vec![Key::new(KeyCode::Char('f'), KeyModifiers::CONTROL)], A::MovePage(100), "Move down one page"),
 		Binding::manager(vec![Key::char('g'), Key::char('g')], A::MoveTo(CursorTarget::Top), "Move to top"),
+		Binding::manager(vec![Key::char('g'), Key::char('h')], A::CdParent, "Go to parent directory"),
+		Binding::manager(vec![Key::char('g'), Key::char('l')], A::CdSelected, "Enter selected directory"),
 		Binding::manager(vec![Key::char('G')], A::MoveTo(CursorTarget::Bottom), "Move to bottom"),
 		Binding::manager(vec![Key::char('l')], A::Expand, "Expand"),
 		Binding::manager(vec![Key::plain(KeyCode::Right)], A::Expand, "Expand"),

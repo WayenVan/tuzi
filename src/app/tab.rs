@@ -454,6 +454,20 @@ impl Tab {
 		Ok(())
 	}
 
+	pub fn cd_parent(&mut self) {
+		let Some(parent) = self.tree.root.path.parent().map(Path::to_path_buf) else { return };
+		if let Err(error) = self.cd(parent) {
+			self.notice = Some(error.to_string());
+		}
+	}
+
+	pub fn cd_selected(&mut self) {
+		let Some(directory) = self.selected_dir() else { return };
+		if let Err(error) = self.cd(directory) {
+			self.notice = Some(error.to_string());
+		}
+	}
+
 	pub fn reveal(&mut self, target: PathBuf) -> io::Result<()> {
 		let target = target.canonicalize()?;
 		if !target.starts_with(&self.tree.root.path) {
@@ -794,6 +808,22 @@ mod tests {
 		let input = tab.input.as_mut().unwrap();
 		input.state.lines = edtui::Lines::from(value);
 		input.state.cursor = edtui::Index2::new(0, value.chars().count());
+	}
+
+	#[tokio::test]
+	async fn cd_selected_and_cd_parent_change_the_tab_root() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-cd-navigation");
+		fs::create_dir_all(root.join("child")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.move_cursor(1);
+		tab.cd_selected();
+		assert_eq!(tab.tree.root.path, root.join("child"));
+
+		tab.cd_parent();
+		assert_eq!(tab.tree.root.path, root);
+		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]

@@ -13,6 +13,8 @@ impl Dispatcher {
 			Action::MovePage(percent) => app.move_page(percent),
 			Action::MoveTo(CursorTarget::Top) => app.active_tab_mut().move_to_top(),
 			Action::MoveTo(CursorTarget::Bottom) => app.active_tab_mut().move_to_bottom(),
+			Action::CdParent => app.active_tab_mut().cd_parent(),
+			Action::CdSelected => app.active_tab_mut().cd_selected(),
 			Action::Expand => app.active_tab_mut().expand_selected(),
 			Action::ToggleExpand => app.active_tab_mut().toggle_expand_selected(),
 			Action::Collapse => app.active_tab_mut().collapse_selected(),
