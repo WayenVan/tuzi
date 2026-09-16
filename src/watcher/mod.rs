@@ -11,7 +11,7 @@ pub struct Watcher {
 }
 
 impl Watcher {
-	pub fn new(tx: UnboundedSender<Event>) -> io::Result<Self> {
+	pub fn new(tab: usize, tx: UnboundedSender<Event>) -> io::Result<Self> {
 		let watched = Arc::new(Mutex::new(HashSet::new()));
 		let matched = watched.clone();
 
@@ -27,7 +27,7 @@ impl Watcher {
 				for path in event.paths {
 					let path = path.canonicalize().unwrap_or(path);
 					if let Some(dir) = nearest_watched(&watched, &path) {
-						let _ = tx.send(Event::Changed(dir));
+						let _ = tx.send(Event::Changed { tab, path: dir });
 					}
 				}
 			},
@@ -80,7 +80,7 @@ mod tests {
 		let dir = dir.canonicalize().unwrap();
 
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let mut watcher = Watcher::new(tx).unwrap();
+		let mut watcher = Watcher::new(7, tx).unwrap();
 		watcher.watch(&dir);
 
 		// give the OS watch a moment to actually arm before writing
@@ -89,7 +89,10 @@ mod tests {
 
 		let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("channel closed");
 		match event {
-			Event::Changed(path) => assert_eq!(path, dir),
+			Event::Changed { tab, path } => {
+				assert_eq!(tab, 7);
+				assert_eq!(path, dir);
+			}
 			_ => panic!("unexpected event"),
 		}
 

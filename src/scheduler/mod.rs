@@ -11,6 +11,7 @@ struct Entry {
 }
 
 pub struct Scheduler {
+	tab:     usize,
 	tx:      UnboundedSender<Event>,
 	engine:  Arc<dyn Engine>,
 	entries: HashMap<PathBuf, Entry>,
@@ -18,8 +19,8 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-	pub fn new(tx: UnboundedSender<Event>, engine: Arc<dyn Engine>) -> Self {
-		Self { tx, engine, entries: HashMap::new(), next: 0 }
+	pub fn new(tab: usize, tx: UnboundedSender<Event>, engine: Arc<dyn Engine>) -> Self {
+		Self { tab, tx, engine, entries: HashMap::new(), next: 0 }
 	}
 
 	/// Requests a fresh listing for `path`. If one's already in flight, just
@@ -40,12 +41,13 @@ impl Scheduler {
 		self.next += 1;
 		self.entries.entry(path.clone()).or_default().busy = Some(ticket);
 
+		let tab = self.tab;
 		let engine = self.engine.clone();
 		let tx = self.tx.clone();
 		let target = path.clone();
 		tokio::spawn(async move {
 			let result = tokio::task::spawn_blocking(move || engine.read_dir(&target)).await.expect("read_dir task panicked");
-			let _ = tx.send(Event::Loaded { path, ticket, result });
+			let _ = tx.send(Event::Loaded { tab, path, ticket, result });
 		});
 	}
 
@@ -69,6 +71,7 @@ impl Scheduler {
 	pub fn forget(&mut self, path: &Path) { self.entries.remove(path); }
 
 	pub fn delete(&self, paths: Vec<PathBuf>) {
+		let tab = self.tab;
 		let tx = self.tx.clone();
 		let targets = paths.clone();
 		tokio::spawn(async move {
@@ -79,11 +82,12 @@ impl Scheduler {
 			})
 			.await
 			.ok();
-			let _ = tx.send(Event::Deleted(paths));
+			let _ = tx.send(Event::Deleted { tab, paths });
 		});
 	}
 
 	pub fn copy(&self, sources: Vec<PathBuf>, target_dir: PathBuf) {
+		let tab = self.tab;
 		let tx = self.tx.clone();
 		let dir = target_dir.clone();
 		tokio::spawn(async move {
@@ -96,7 +100,7 @@ impl Scheduler {
 			})
 			.await
 			.ok();
-			let _ = tx.send(Event::Pasted(target_dir));
+			let _ = tx.send(Event::Pasted { tab, target: target_dir });
 		});
 	}
 }
