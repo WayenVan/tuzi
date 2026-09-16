@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 
-use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TreeView, TreeViewState, WhichPopup, WinBar}}};
+use crate::{event::Event, preview::PreviewTarget, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, TreeView, TreeViewState, WhichPopup, WinBar}}};
 
 use super::App;
 
@@ -44,6 +44,9 @@ impl App {
 		let preview_visible = tab.preview.visible;
 		let pending_delete = tab.pending_delete.clone();
 		let preview_target = rows.get(tab.cursor).map(|(_, node)| PreviewTarget::from_node(node));
+		let task_visible = self.tasks.visible;
+		let task_cursor = self.tasks.cursor;
+		let tasks = &self.tasks.tasks;
 
 		term.terminal.draw(|frame| {
 			let [win_area, tab_area, body_area, status_area] = Layout::default()
@@ -85,6 +88,12 @@ impl App {
 				PreviewView::render(frame, area, rows.get(tab.cursor).map(|(_, node)| *node), &tab.preview.state, tab.preview.skip);
 			}
 			StatusBar::render(frame, status_area, &status);
+			if let Some((count, percent)) = self.tasks.summary() {
+				let text = format!(" {:3.0}% · {count} tasks ", percent);
+				let width = text.len().min(status_area.width as usize) as u16;
+				let area = ratatui::layout::Rect::new(status_area.right().saturating_sub(width), status_area.y, width, 1);
+				frame.render_widget(ratatui::widgets::Paragraph::new(text).style(ratatui::style::Style::new().fg(ratatui::style::Color::Black).bg(ratatui::style::Color::Blue)), area);
+			}
 			WhichPopup::render(frame, frame.area(), &which);
 			if let Some(picker) = &self.open_picker {
 				OpenPopup::render(frame, frame.area(), picker);
@@ -99,6 +108,7 @@ impl App {
 				}
 				frame.set_cursor_position((x, y));
 			}
+			if task_visible { TaskPopup::render(frame, frame.area(), tasks, task_cursor); }
 		})?;
 		tab.scroll = scroll;
 

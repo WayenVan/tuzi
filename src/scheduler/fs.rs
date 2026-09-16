@@ -77,44 +77,6 @@ impl FsScheduler {
 		});
 	}
 
-	pub fn copy(&self, sources: Vec<PathBuf>, target_dir: PathBuf) {
-		let tab = self.tab;
-		let tx = self.tx.clone();
-		let dir = target_dir.clone();
-		tokio::spawn(async move {
-			tokio::task::spawn_blocking(move || {
-				for src in &sources {
-					let Some(name) = src.file_name() else { continue };
-					let dest = fs::unique_dest(&dir, name);
-					let _ = fs::copy_recursive(src, &dest);
-				}
-			})
-			.await
-			.ok();
-			let _ = tx.send(Event::Pasted { tab, target: target_dir });
-		});
-	}
-
-	pub fn move_paths(&self, sources: Vec<PathBuf>, target_dir: PathBuf) {
-		let tab = self.tab;
-		let tx = self.tx.clone();
-		let dir = target_dir.clone();
-		tokio::spawn(async move {
-			tokio::task::spawn_blocking(move || {
-				for src in &sources {
-					let Some(name) = src.file_name() else { continue };
-					let dest = fs::unique_dest(&dir, name);
-					if std::fs::rename(src, &dest).is_err() && fs::copy_recursive(src, &dest).is_ok() {
-						let _ = fs::remove(src);
-					}
-				}
-			})
-			.await
-			.ok();
-			let _ = tx.send(Event::Pasted { tab, target: target_dir });
-		});
-	}
-
 	pub fn create(&self, base: PathBuf, value: String) {
 		let tab = self.tab;
 		let tx = self.tx.clone();

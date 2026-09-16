@@ -37,6 +37,7 @@ impl Dispatcher {
 			Action::RepeatFind { opposite } => app.active_tab_mut().repeat_find(opposite),
 			Action::Fzf => app.start_fzf(),
 			Action::Open { interactive } => app.open_selected(interactive),
+			Action::ToggleTasks => app.tasks.visible = !app.tasks.visible,
 		}
 	}
 
@@ -58,11 +59,6 @@ impl Dispatcher {
 					t.on_deleted(paths);
 				}
 			}
-			Event::Pasted { tab, target } => {
-				if let Some(t) = app.tab_mut(tab) {
-					t.on_pasted(target);
-				}
-			}
 			Event::Created { tab, base, value, target, result } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_created(base, value, target, result);
@@ -79,6 +75,7 @@ impl Dispatcher {
 				}
 			}
 			Event::OpenResolved { tab, cwd, interactive, result } => app.on_open_resolved(tab, cwd, interactive, result),
+			Event::Task(event) => app.on_task_event(event),
 			Event::Term(_) => {}
 		}
 	}

@@ -13,7 +13,7 @@ use super::input::{Completion, InputPurpose, InputSession};
 /// lives on `App` instead, shared by every tab (yank in one, paste in
 /// another). `id` is assigned once at creation and never reused or
 /// renumbered, so that background events tagged with it
-/// (`Loaded`/`Deleted`/`Pasted`/`Changed`) keep routing to the right tab
+/// (`Loaded`/`Deleted`/`Changed`) keep routing to the right tab
 /// even after some *other* tab closes and every tab after it would
 /// otherwise shift position in `App::tabs`.
 pub struct Tab {
@@ -221,18 +221,8 @@ impl Tab {
 	}
 
 	/// Copies or moves `paths` into the cursor's parent directory (see
-	/// `paste_target`) in the background; the target's listing refreshes
-	/// once `Pasted` comes back. Returns whether there was a parent to
-	/// paste into.
-	pub(super) fn paste_into(&mut self, paths: Vec<PathBuf>, cut: bool) -> bool {
-		let Some(target_dir) = self.paste_target() else { return false };
-		if cut {
-			self.fs_scheduler.move_paths(paths, target_dir);
-		} else {
-			self.fs_scheduler.copy(paths, target_dir);
-		}
-		true
-	}
+	/// `paste_target`). App hands this destination to its global task queue.
+	pub(super) fn paste_destination(&self) -> Option<PathBuf> { self.paste_target() }
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
 	/// with its current name in Insert mode, cursor at the end — ready to
@@ -820,7 +810,6 @@ mod tests {
 			Event::Changed { path, .. } => tab.on_changed(path),
 			Event::Loaded { path, ticket, result, .. } => tab.on_loaded(path, ticket, result),
 			Event::Deleted { paths, .. } => tab.on_deleted(paths),
-			Event::Pasted { target, .. } => tab.on_pasted(target),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			_ => panic!("unexpected event in a single-tab test"),
 		}
@@ -1136,7 +1125,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn paste_into_targets_the_cursors_parent_not_the_cursor_itself() {
+	async fn paste_destination_is_the_cursors_parent_not_the_cursor_itself() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into");
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
@@ -1150,26 +1139,21 @@ mod tests {
 
 		// Pasting while the cursor sits on "sub" lands in "sub"'s parent,
 		// "dst" — not inside "sub", even though "sub" is a directory.
-		assert!(tab.paste_into(vec![root.join("source.txt")], true));
-		pump(&mut tab, &mut rx).await;
-
-		assert!(!root.join("source.txt").exists());
-		assert!(root.join("dst/source.txt").exists());
-		assert!(!root.join("dst/sub/source.txt").exists());
+		assert_eq!(tab.paste_destination(), Some(root.join("dst")));
 		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
-	async fn paste_into_refuses_when_the_cursor_is_on_the_tree_root() {
+	async fn paste_destination_refuses_the_tree_root() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into-root");
 		fs::create_dir_all(&root).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
 		let root = root.canonicalize().unwrap();
 
-		let (mut tab, _rx) = tab(&root).await;
+		let (tab, _rx) = tab(&root).await;
 		assert_eq!(tab.cursor, 0, "starts on the tree's own root");
 
-		assert!(!tab.paste_into(vec![root.join("source.txt")], true), "the root has no parent to paste into");
+		assert!(tab.paste_destination().is_none(), "the root has no parent to paste into");
 		assert!(root.join("source.txt").exists(), "nothing was moved");
 
 		fs::remove_dir_all(root).unwrap();

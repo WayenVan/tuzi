@@ -15,6 +15,7 @@ mod preview;
 mod runner;
 mod scheduler;
 mod status;
+mod tasks;
 mod tui;
 mod watcher;
 

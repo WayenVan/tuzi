@@ -42,4 +42,5 @@ pub enum Action {
 	RepeatFind { opposite: bool },
 	Fzf,
 	Open { interactive: bool },
+	ToggleTasks,
 }

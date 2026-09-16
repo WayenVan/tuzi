@@ -3,7 +3,7 @@ use std::{collections::VecDeque, env, io, path::PathBuf};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tui::TerminalSession};
+use crate::{event::Event, icon::IconTheme, keymap::{Key, KeyContext, Route, Router, WhichCandidate}, opener::OpenPicker, process::ProcessRequest, scheduler::OpenScheduler, tasks::{TaskEvent, TaskManager}, tui::TerminalSession};
 
 use super::{Dispatcher, Tab};
 
@@ -22,6 +22,7 @@ pub struct App {
 	pub(super) open_picker: Option<OpenPicker>,
 	pub(super) processes:   VecDeque<ProcessRequest>,
 	pub(super) tx:         mpsc::UnboundedSender<Event>,
+	pub tasks:             TaskManager,
 }
 
 impl App {
@@ -33,7 +34,7 @@ impl App {
 			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), tx,
 		};
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::default();
@@ -41,6 +42,7 @@ impl App {
 		app.render(terminal.terminal())?;
 		loop {
 			let event = tokio::select! {
+				biased;
 				term_event = terminal.next_event() => match term_event? {
 					Some(event) => Event::Term(event),
 					None => break,
@@ -76,6 +78,15 @@ impl App {
 	}
 
 	fn handle_key(&mut self, key: crossterm::event::KeyEvent, router: &mut Router) -> bool {
+		if self.tasks.visible {
+			return match key.code {
+				KeyCode::Up | KeyCode::Char('k') => { self.tasks.move_cursor(-1); true }
+				KeyCode::Down | KeyCode::Char('j') => { self.tasks.move_cursor(1); true }
+				KeyCode::Char('x') => { self.tasks.cancel_selected(); true }
+				KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => { self.tasks.visible = false; true }
+				_ => false,
+			};
+		}
 		if self.open_picker.is_some() {
 			return match key.code {
 				KeyCode::Up | KeyCode::Char('k') => { self.move_open_picker(-1); true }
@@ -201,9 +212,19 @@ impl App {
 		}
 		let paths = self.clipboard.clone();
 		let cut = self.clipboard_cut;
-		if self.active_tab_mut().paste_into(paths, cut) && cut {
+		let tab = self.active;
+		let Some(target) = self.active_tab().paste_destination() else { return };
+		self.tasks.enqueue(paths, target, cut, tab);
+		if cut {
 			self.clipboard.clear();
 			self.clipboard_cut = false;
+		}
+	}
+
+	pub(super) fn on_task_event(&mut self, event: TaskEvent) {
+		if let Some((tab, target)) = self.tasks.accept(event)
+			&& let Some(tab) = self.tab_mut(tab) {
+			tab.on_pasted(target);
 		}
 	}
 }
@@ -223,7 +244,7 @@ mod tests {
 			tabs: vec![first], active: 0, quit: false, next_tab_id: 1,
 			clipboard: Vec::new(), clipboard_cut: false,
 			tree_rows: 0, which: Vec::new(), icon_theme: IconTheme,
-			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tx,
+			open: OpenScheduler::new(tx.clone()), open_picker: None, processes: VecDeque::new(), tasks: TaskManager::new(tx.clone()), tx,
 		};
 
 		// drain the root tab's initial listing so it's got visible rows
@@ -234,13 +255,21 @@ mod tests {
 	}
 
 	async fn pump(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>) {
-		let event = rx.recv().await.unwrap();
-		Dispatcher::dispatch_event(app, event);
+		loop {
+			let event = rx.recv().await.unwrap();
+			let task_finished = matches!(&event, Event::Task(TaskEvent::Finished { .. }));
+			let task_event = matches!(&event, Event::Task(_));
+			Dispatcher::dispatch_event(app, event);
+			if !task_event || task_finished {
+				break;
+			}
+		}
 	}
 
 	#[tokio::test]
 	async fn yank_then_paste_copies_into_the_cursors_parent_directory() {
 		let root = std::env::temp_dir().join("tuzi-app-test-paste");
+		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(root.join("src")).unwrap();
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("src/leaf.txt"), b"hi").unwrap();
@@ -280,6 +309,7 @@ mod tests {
 	#[tokio::test]
 	async fn cut_then_paste_moves_the_file_and_clears_the_marker_state() {
 		let root = std::env::temp_dir().join("tuzi-app-test-cut-paste");
+		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
 		let root = root.canonicalize().unwrap();
@@ -304,6 +334,7 @@ mod tests {
 	#[tokio::test]
 	async fn yanking_in_one_tab_pastes_in_another() {
 		let root = std::env::temp_dir().join("tuzi-app-test-cross-tab-paste");
+		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(root.join("src")).unwrap();
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("src/leaf.txt"), b"hi").unwrap();
