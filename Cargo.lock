@@ -1955,6 +1955,7 @@ dependencies = [
  "notify",
  "ratatui",
  "serde",
+ "serde_json",
  "syntect-no-panic",
  "tokio",
  "toml",

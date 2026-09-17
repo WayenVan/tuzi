@@ -8,7 +8,7 @@ pub struct WhichCandidate {
 	pub description: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Route {
 	Pending(Vec<WhichCandidate>),
 	Commands(Vec<Command>),

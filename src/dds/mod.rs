@@ -5,5 +5,5 @@
 mod body;
 mod registry;
 
-pub use body::Body;
+pub use body::{BUILTIN_KINDS, Body};
 pub use registry::Registry;

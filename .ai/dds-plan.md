@@ -72,18 +72,17 @@ dispatch）做了裁剪。
 ```text
 src/dds/
   mod.rs        // 对外入口：re-export Body/Registry                         [P1 已实现]
-  body.rs       // Body 枚举：Cd/Yank/Renamed/TaskDone                        [P1 已实现]
+  body.rs       // Body 枚举：Cd/Yank/Renamed/TaskDone/Custom               [P1+P2 已实现]
   registry.rs   // Registry：kind -> {subscriber -> handler}，App 的字段     [P1 已实现]
   payload.rs    // Payload{receiver,sender,body} envelope + 序列化           [P3 待实现]
   transport.rs  // Unix Socket client/server（首个实例自举为 server）        [P3 待实现]
   state.rs      // 可选：@ 前缀 static topic 的磁盘持久化                    [P4 待实现]
 ```
 
-P1 阶段 `Body` 还没有 `Custom(kind, data)` 兜底分支——外部/动态 kind 要等
-P2 的 `Command::Emit` 落地、真的有调用方产生任意 JSON 时再加，避免现在
-就引入未使用的 `serde_json` 依赖。`Registry` 也没有 yazi 那样的
-`LOCAL`/`REMOTE` 两张表：P1 是单实例场景，`REMOTE`（转发给其他实例的订阅）
-要等 P3 有了真正的跨实例概念才有意义。
+`Custom(kind, data)` 兜底分支和 `serde_json` 依赖已随 P2 落地（见下面
+「实施阶段」）。`Registry` 仍然没有 yazi 那样的 `LOCAL`/`REMOTE` 两张表：
+P1/P2 都是单实例场景，`REMOTE`（转发给其他实例的订阅）要等 P3 有了真正
+的跨实例概念才有意义。
 
 ### Body 内建 kind
 
@@ -91,13 +90,29 @@ P2 的 `Command::Emit` 落地、真的有调用方产生任意 JSON 时再加，
 `rename`/任务完成；`Loaded`/`PreviewLoaded`/`CompletionLoaded` 这类纯
 内部 IO 分片进度继续走现有 `Event` 通道，不进入 `Body`。
 
+P3 引入跨实例传输后的目标形态（`Hi`/`Hey`/`Bye`/`Hover` 是握手和跨实例
+才需要的 kind，现在还不存在）：
+
 ```rust
 pub enum Body {
-    Hi { abilities: Vec<String>, version: String },
-    Hey { peers: Vec<PeerInfo> },
-    Bye,
+    Hi { abilities: Vec<String>, version: String },   // [P3 待实现]
+    Hey { peers: Vec<PeerInfo> },                     // [P3 待实现]
+    Bye,                                               // [P3 待实现]
     Cd { path: PathBuf },
-    Hover { path: Option<PathBuf> },
+    Hover { path: Option<PathBuf> },                  // [P3 待实现]
+    Yank { paths: Vec<PathBuf>, cut: bool },
+    Renamed { from: PathBuf, to: PathBuf },
+    TaskDone { kind: TaskKind, ok: bool },
+    Custom { kind: String, data: serde_json::Value },
+}
+```
+
+P1+P2 目前实际实现的 `src/dds/body.rs`（没有 `Hi`/`Hey`/`Bye`/`Hover`，
+其余字段一致）：
+
+```rust
+pub enum Body {
+    Cd { path: PathBuf },
     Yank { paths: Vec<PathBuf>, cut: bool },
     Renamed { from: PathBuf, to: PathBuf },
     TaskDone { kind: TaskKind, ok: bool },
@@ -258,8 +273,25 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
      的 `Event::Pubsub` 会先于目标事件被消费掉，导致既有测试断言错位。
      两处 `pump` 都已改为「跳过 Pubsub 事件继续等待」，`tab.rs` 的
      `apply` 对 `Event::Pubsub(_)` 显式忽略（无订阅者时是合法的空操作）。
-2. **P2 CLI 可编程**：新增 `Command::Emit`，让 keymap/`:` 命令能发布任意
-   custom kind，不依赖 socket。
+2. **P2 CLI 可编程**（已完成）：新增 `Command::Emit { kind: String, data:
+   serde_json::Value }`，让 keymap/`:` 命令能发布任意 custom kind，不
+   依赖 socket。语法定为 `emit <kind> [json]`：
+   - `emit my-kind` — `data` 缺省为 `Value::Null`。
+   - `emit my-kind '{"a":1}'` — JSON 参数必须整体用单引号包住，直接
+     复用现有 tokenizer 的引号处理（双引号在 tokenizer 里会被当成
+     token 内的二次引号消耗掉，裸写 `{"a":1}` 不加外层单引号会被
+     tokenizer 吃掉内部的双引号，解析出 `{a:1}` 这种非法 JSON）。
+   - `kind` 为空或撞上内建 kind（`cd`/`yank`/`renamed`/`task-done`，见
+     `dds::BUILTIN_KINDS`）会被拒绝，防止 `emit` 冒充内建事件。
+   - `Body` 补上了 P1 特意留空的 `Custom { kind, data }` 兜底分支；
+     `App::execute` 里 `Command::Emit { kind, data } =>
+     self.publish(Body::Custom { kind, data })`。
+   - `Command` 的 derive 从 `Eq, PartialEq` 降成只有 `PartialEq`
+     （`serde_json::Value` 含 `f64`，不能 `Eq`），连带 `keymap::Route`
+     也去掉了 `Eq`。
+   - 端到端测试：`app::tests::the_emit_command_publishes_a_custom_kind_with_its_json_payload`
+     跑通 `":emit ..."` 解析 -> `execute` -> `Event::Pubsub` ->
+     `Dispatcher` -> 订阅者收到 `data` 且产生的 `Command` 被执行。
 3. **P3 跨实例 socket**：新增 `transport.rs`（client 自举为 server）+
    `tuzi emit`/`tuzi sub` 子命令，打通多实例/外部脚本集成。
 4. **P4（可选，按需）**：按上面「Event/State 双轨模型」给 `Registry` 加
@@ -281,8 +313,6 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
 - `Command::RestoreTab`（或等价变体）的具体字段和「哪些状态值得恢复」
   （path/selection 之外要不要包含 sort_policy、column_mode、展开的子树）
   待 P4 实现时按需扩展，不必一次性照搬全部 Tab 字段。
-- `Command::Emit` 的 JSON 参数解析方式（内联 JSON vs. 简化 key=value）
-  待 P2 阶段结合 `Command::from_str` 现有语法一起设计。
 
 ## 续接建议
 

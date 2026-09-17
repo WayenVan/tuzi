@@ -1298,4 +1298,35 @@ mod tests {
 
 		fs::remove_dir_all(&root).unwrap();
 	}
+
+	#[tokio::test]
+	async fn the_emit_command_publishes_a_custom_kind_with_its_json_payload() {
+		let root = std::env::temp_dir().join("tuzi-app-test-emit");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		let seen: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> = Default::default();
+		let recorded = seen.clone();
+		app.pubsub.sub(
+			"test",
+			"my-kind",
+			Box::new(move |body| {
+				if let crate::dds::Body::Custom { data, .. } = body {
+					*recorded.lock().unwrap() = Some(data.clone());
+				}
+				vec![Command::ToggleTasks]
+			}),
+		);
+
+		app.execute(r#"emit my-kind '{"a":1}'"#.parse().unwrap());
+		let event = rx.recv().await.unwrap();
+		Dispatcher::dispatch_event(&mut app, event);
+
+		assert_eq!(*seen.lock().unwrap(), Some(serde_json::json!({"a": 1})));
+		assert!(app.tasks.visible);
+
+		fs::remove_dir_all(&root).unwrap();
+	}
 }

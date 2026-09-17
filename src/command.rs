@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::{column_mode::ColumnMode, fs::{SortBy, SortPolicy}};
+use crate::{column_mode::ColumnMode, dds::BUILTIN_KINDS, fs::{SortBy, SortPolicy}};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CursorTarget {
@@ -36,7 +36,9 @@ pub enum CopyKind {
 	Stem,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// `serde_json::Value` can hold an `f64`, so `Command` can't derive `Eq`
+/// (only `PartialEq`) once `Emit` carries one.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
 	Quit,
 	Escape,
@@ -77,6 +79,10 @@ pub enum Command {
 	Zoxide,
 	Open { interactive: bool },
 	ToggleTasks,
+	/// Publishes a custom event on the internal DDS bus (`.ai/dds-plan.md`
+	/// P2). `data` defaults to `Value::Null` when the command carries no
+	/// JSON argument.
+	Emit { kind: String, data: serde_json::Value },
 }
 
 impl FromStr for Command {
@@ -149,9 +155,20 @@ impl FromStr for Command {
 			["open"] => Ok(Self::Open { interactive: false }),
 			["open", "--interactive"] => Ok(Self::Open { interactive: true }),
 			["tasks", "toggle"] => Ok(Self::ToggleTasks),
+			["emit", kind] => Ok(Self::Emit { kind: emit_kind(kind).map_err(|_| invalid())?, data: serde_json::Value::Null }),
+			["emit", kind, json] => Ok(Self::Emit {
+				kind: emit_kind(kind).map_err(|_| invalid())?,
+				data: serde_json::from_str(json).map_err(|_| format!("invalid json for emit: '{json}'"))?,
+			}),
 			_ => Err(invalid()),
 		}
 	}
+}
+
+/// Rejects kinds that would let `emit` spoof a built-in DDS event.
+fn emit_kind(kind: &str) -> Result<String, ()> {
+	if kind.is_empty() || BUILTIN_KINDS.contains(&kind) { return Err(()); }
+	Ok(kind.to_string())
 }
 
 fn parse_sort(value: &str) -> Option<SortBy> {
@@ -173,6 +190,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "command", description: "Open the command prompt", usages: &["command"] },
 	CommandSpec { name: "copy", description: "Copy path information", usages: &["copy path", "copy url", "copy dirpath", "copy dirurl", "copy filename", "copy stem"] },
 	CommandSpec { name: "create", description: "Create a file or directory", usages: &["create"] },
+	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#] },
 	CommandSpec { name: "escape", description: "Cancel the current mode", usages: &["escape"] },
 	CommandSpec { name: "expand", description: "Expand directories", usages: &["expand", "expand toggle"] },
 	CommandSpec { name: "filter", description: "Filter visible files", usages: &["filter"] },
@@ -255,6 +273,25 @@ mod tests {
 		assert!("unknown".parse::<Command>().is_err());
 		assert!("arrow -2".parse::<Command>().is_err());
 		assert!("input cd".parse::<Command>().is_err());
+	}
+
+	#[test]
+	fn emit_publishes_an_arbitrary_kind_with_optional_json() {
+		assert_eq!(
+			"emit my-kind".parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null })
+		);
+		assert_eq!(
+			r#"emit my-kind '{"a":1}'"#.parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}) })
+		);
+	}
+
+	#[test]
+	fn emit_rejects_reserved_kinds_and_malformed_json() {
+		assert!("emit cd".parse::<Command>().is_err(), "cd is a built-in DDS kind");
+		assert!("emit ''".parse::<Command>().is_err(), "empty kind");
+		assert!(r#"emit my-kind 'not json'"#.parse::<Command>().is_err());
 	}
 
 	#[test]

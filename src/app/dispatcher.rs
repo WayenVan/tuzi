@@ -1,5 +1,6 @@
 use crate::{
 	command::{CdTarget, Command, CursorTarget, DeleteMode},
+	dds::Body,
 	event::Event,
 	fs::FsChange,
 };
@@ -58,6 +59,7 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
+			Command::Emit { kind, data } => self.publish(Body::Custom { kind, data }),
 		}
 		self.drain_tab_notices();
 	}
