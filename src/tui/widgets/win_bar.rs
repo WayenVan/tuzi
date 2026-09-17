@@ -1,6 +1,8 @@
 use std::{env, path::{Path, PathBuf}};
 
-use ratatui::{Frame, layout::Rect, style::{Color, Style}, text::{Line, Span}, widgets::Paragraph};
+use ratatui::{Frame, layout::Rect, text::{Line, Span}, widgets::Paragraph};
+
+use crate::theme::Theme;
 
 pub struct WinBar;
 
@@ -20,16 +22,16 @@ pub struct WinBarState<'a> {
 impl WinBar {
 	/// Mirrors yazi's header cwd: the active tab's absolute root path sits
 	/// above the tab strip and is clipped by the terminal at the right edge.
-	pub fn render(frame: &mut Frame, area: Rect, state: WinBarState<'_>) {
+	pub fn render(frame: &mut Frame, area: Rect, state: WinBarState<'_>, theme: &Theme) {
 		let path = pretty_path(state.path, home_dir().as_deref());
 		let suffix = flags(state.finder, state.filter);
-		let badge = state.badge.map(badge_line);
+		let badge = state.badge.map(|badge| badge_line(badge, theme));
 		let badge_width = badge.as_ref().map_or(0, Line::width);
 		let left_width = (area.width as usize).saturating_sub(badge_width);
 		let (path, suffix) = fit(&path, &suffix, left_width);
 		frame.render_widget(Paragraph::new(Line::from(vec![
-			Span::styled(path, Style::new().fg(Color::Cyan)),
-			Span::styled(suffix, Style::new().fg(Color::Cyan)),
+			Span::styled(path, theme.style("win.cwd")),
+			Span::styled(suffix, theme.style("win.cwd")),
 		])), area);
 		if let Some(line) = badge {
 			frame.render_widget(Paragraph::new(line.right_aligned()), area);
@@ -37,12 +39,12 @@ impl WinBar {
 	}
 }
 
-fn badge_line(badge: ClipboardBadge) -> Line<'static> {
-	let (count, background) = match badge {
-		ClipboardBadge::Copy(count) => (count, Color::Green),
-		ClipboardBadge::Cut(count) => (count, Color::Red),
+fn badge_line(badge: ClipboardBadge, theme: &Theme) -> Line<'static> {
+	let (count, style) = match badge {
+		ClipboardBadge::Copy(count) => (count, theme.style("win.badge_copy")),
+		ClipboardBadge::Cut(count) => (count, theme.style("win.badge_cut")),
 	};
-	Line::from(vec![Span::styled(format!(" {count} "), Style::new().fg(Color::Black).bg(background)), Span::raw(" ")])
+	Line::from(vec![Span::styled(format!(" {count} "), style), Span::raw(" ")])
 }
 
 fn flags(finder: Option<&str>, filter: Option<&str>) -> String {
@@ -104,15 +106,18 @@ fn pretty_path(path: &Path, home: Option<&Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+	use ratatui::style::{Color, Style};
+
 	use super::*;
 
 	#[test]
 	fn clipboard_badges_match_yazi_copy_and_cut_colors() {
-		let copied = badge_line(ClipboardBadge::Copy(3));
+		let theme = Theme::default();
+		let copied = badge_line(ClipboardBadge::Copy(3), &theme);
 		assert_eq!(copied.to_string(), " 3  ");
 		assert_eq!(copied.spans[0].style, Style::new().fg(Color::Black).bg(Color::Green));
 
-		let cut = badge_line(ClipboardBadge::Cut(12));
+		let cut = badge_line(ClipboardBadge::Cut(12), &theme);
 		assert_eq!(cut.to_string(), " 12  ");
 		assert_eq!(cut.spans[0].style, Style::new().fg(Color::Black).bg(Color::Red));
 	}
@@ -141,7 +146,7 @@ mod tests {
 
 	#[test]
 	fn badge_width_is_reserved_before_the_path_is_fitted() {
-		let available = 20usize.saturating_sub(badge_line(ClipboardBadge::Copy(3)).width());
+		let available = 20usize.saturating_sub(badge_line(ClipboardBadge::Copy(3), &Theme::default()).width());
 		let (path, suffix) = fit("~/projects/tuzi", "", available);
 		assert!(display_width(&path) + display_width(&suffix) <= available);
 	}

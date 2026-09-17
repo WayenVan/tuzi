@@ -1,4 +1,4 @@
-use crate::action::Action;
+use crate::command::Command;
 
 use super::{Key, KeyContext, Keymap};
 
@@ -11,7 +11,7 @@ pub struct WhichCandidate {
 #[derive(Debug, Eq, PartialEq)]
 pub enum Route {
 	Pending(Vec<WhichCandidate>),
-	Actions(Vec<Action>),
+	Commands(Vec<Command>),
 	Unmatched,
 }
 
@@ -22,6 +22,8 @@ pub struct Router {
 }
 
 impl Router {
+	pub fn new(keymap: Keymap) -> Self { Self { keymap, pending: Vec::new() } }
+
 	pub fn route(&mut self, context: KeyContext, key: Key) -> Route {
 		self.pending.push(key);
 		let matched: Vec<_> = self
@@ -36,9 +38,9 @@ impl Router {
 		}
 
 		if let Some(binding) = matched.iter().find(|binding| binding.keys.len() == self.pending.len()) {
-			let actions = binding.actions.clone();
+			let commands = binding.commands.clone();
 			self.pending.clear();
-			Route::Actions(actions)
+			Route::Commands(commands)
 		} else {
 			let typed = self.pending.len();
 			Route::Pending(
@@ -59,7 +61,7 @@ mod tests {
 	use crossterm::event::{KeyCode, KeyModifiers};
 
 	use crate::{
-		action::{Action, CopyKind, CursorTarget, InputKind},
+		command::{CdTarget, Command, CopyKind, CursorTarget},
 		column_mode::ColumnMode,
 		fs::{SortBy, SortPolicy},
 	};
@@ -69,12 +71,18 @@ mod tests {
 	#[test]
 	fn matches_single_keys_and_arbitrary_chords() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char('j')), Route::Actions(vec![Action::MoveCursor(1)]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('j')), Route::Commands(vec![Command::Cursor(CursorTarget::Relative(1))]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char(' ')),
-			Route::Actions(vec![Action::OpenInput(InputKind::Cd)])
+			Route::Commands(vec![Command::Cd(CdTarget::Interactive)])
 		);
+	}
+
+	#[test]
+	fn colon_opens_the_command_input() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char(':')), Route::Commands(vec![Command::CommandPrompt]));
 	}
 
 	#[test]
@@ -82,7 +90,7 @@ mod tests {
 		let mut router = Router::default();
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('t')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('x')), Route::Unmatched);
-		assert_eq!(router.route(KeyContext::Manager, Key::char('q')), Route::Actions(vec![Action::Quit]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('q')), Route::Commands(vec![Command::Quit]));
 	}
 
 	#[test]
@@ -96,44 +104,44 @@ mod tests {
 		let mut router = Router::default();
 		let control = |c| Key::new(KeyCode::Char(c), KeyModifiers::CONTROL);
 
-		assert_eq!(router.route(KeyContext::Manager, control('u')), Route::Actions(vec![Action::MovePage(-50)]));
-		assert_eq!(router.route(KeyContext::Manager, control('d')), Route::Actions(vec![Action::MovePage(50)]));
-		assert_eq!(router.route(KeyContext::Manager, control('b')), Route::Actions(vec![Action::MovePage(-100)]));
-		assert_eq!(router.route(KeyContext::Manager, control('f')), Route::Actions(vec![Action::MovePage(100)]));
+		assert_eq!(router.route(KeyContext::Manager, control('u')), Route::Commands(vec![Command::MovePage(-50)]));
+		assert_eq!(router.route(KeyContext::Manager, control('d')), Route::Commands(vec![Command::MovePage(50)]));
+		assert_eq!(router.route(KeyContext::Manager, control('b')), Route::Commands(vec![Command::MovePage(-100)]));
+		assert_eq!(router.route(KeyContext::Manager, control('f')), Route::Commands(vec![Command::MovePage(100)]));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('u')), Route::Unmatched);
-		assert_eq!(router.route(KeyContext::Manager, Key::char('d')), Route::Actions(vec![Action::Delete]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('d')), Route::Commands(vec![Command::Delete]));
 	}
 
 	#[test]
 	fn control_o_and_control_i_navigate_directory_history() {
 		let mut router = Router::default();
 		let control = |c| Key::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-		assert_eq!(router.route(KeyContext::Manager, control('o')), Route::Actions(vec![Action::HistoryBack]));
-		assert_eq!(router.route(KeyContext::Manager, control('i')), Route::Actions(vec![Action::HistoryForward]));
-		assert_eq!(router.route(KeyContext::Manager, Key::plain(KeyCode::Tab)), Route::Actions(vec![Action::HistoryForward]));
+		assert_eq!(router.route(KeyContext::Manager, control('o')), Route::Commands(vec![Command::HistoryBack]));
+		assert_eq!(router.route(KeyContext::Manager, control('i')), Route::Commands(vec![Command::HistoryForward]));
+		assert_eq!(router.route(KeyContext::Manager, Key::plain(KeyCode::Tab)), Route::Commands(vec![Command::HistoryForward]));
 	}
 
 	#[test]
 	fn space_prefix_exposes_fzf_and_symlink_paste() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char(';')), Route::Actions(vec![Action::ToggleSelect]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char(';')), Route::Commands(vec![Command::ToggleSelect]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Actions(vec![Action::Fzf]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Commands(vec![Command::Fzf]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('-')), Route::Actions(vec![Action::PasteLink { absolute: false }]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('-')), Route::Commands(vec![Command::PasteLink { absolute: false }]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('_')), Route::Actions(vec![Action::PasteLink { absolute: true }]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('_')), Route::Commands(vec![Command::PasteLink { absolute: true }]));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('P')), Route::Unmatched);
 	}
 
 	#[test]
 	fn z_prefix_controls_tree_folding_and_cursor_centering() {
 		let mut router = Router::default();
-		for (key, action) in [('c', Action::CollapseSubtree), ('m', Action::CollapseAll), ('z', Action::CenterCursor)] {
+		for (key, command) in [('c', Command::CollapseSubtree), ('m', Command::CollapseAll), ('z', Command::CenterCursor)] {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char('z')), Route::Pending(_)));
-			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![action]));
+			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Commands(vec![command]));
 		}
 	}
 
@@ -143,21 +151,21 @@ mod tests {
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('g')),
-			Route::Actions(vec![Action::MoveTo(CursorTarget::Top)])
+			Route::Commands(vec![Command::Cursor(CursorTarget::Top)])
 		);
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char(' ')),
-			Route::Actions(vec![Action::OpenInput(InputKind::Cd)])
+			Route::Commands(vec![Command::Cd(CdTarget::Interactive)])
 		);
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Actions(vec![Action::CdParent]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Commands(vec![Command::Cd(CdTarget::Path("..".into()))]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Actions(vec![Action::CdSelected]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Commands(vec![Command::Cd(CdTarget::Selected)]));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('G')),
-			Route::Actions(vec![Action::MoveTo(CursorTarget::Bottom)])
+			Route::Commands(vec![Command::Cursor(CursorTarget::Bottom)])
 		);
 	}
 
@@ -173,7 +181,7 @@ mod tests {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char('m')), Route::Pending(_)));
 			assert_eq!(
 				router.route(KeyContext::Manager, Key::char(key)),
-				Route::Actions(vec![Action::SetColumnMode(mode)])
+				Route::Commands(vec![Command::SetColumnMode(mode)])
 			);
 		}
 	}
@@ -181,19 +189,19 @@ mod tests {
 	#[test]
 	fn hidden_and_directory_shortcuts_match_yazi() {
 		let mut router = Router::default();
-		assert_eq!(router.route(KeyContext::Manager, Key::char('.')), Route::Actions(vec![Action::ToggleHidden]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('.')), Route::Commands(vec![Command::ToggleHidden]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('~')), Route::Actions(vec![Action::CdHome]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('~')), Route::Commands(vec![Command::Cd(CdTarget::Path("~".into()))]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('c')), Route::Actions(vec![Action::CdConfig]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('c')), Route::Commands(vec![Command::Cd(CdTarget::Config)]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('d')), Route::Actions(vec![Action::CdDownloads]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('d')), Route::Commands(vec![Command::Cd(CdTarget::Path("~/Downloads".into()))]));
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('D')), Route::Actions(vec![Action::CdDesktop]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('D')), Route::Commands(vec![Command::Cd(CdTarget::Path("~/Desktop".into()))]));
 	}
 
 	#[test]
@@ -212,7 +220,7 @@ mod tests {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char(',')), Route::Pending(_)));
 			assert_eq!(
 				router.route(KeyContext::Manager, Key::char(key)),
-				Route::Actions(vec![Action::SetSort(SortPolicy::new(by, reverse))])
+				Route::Commands(vec![Command::SetSort(SortPolicy::new(by, reverse))])
 			);
 		}
 	}
@@ -229,7 +237,7 @@ mod tests {
 			('n', CopyKind::Stem),
 		] {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char('c')), Route::Pending(_)));
-			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![Action::Copy(kind)]));
+			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Commands(vec![Command::Copy(kind)]));
 		}
 	}
 
@@ -257,15 +265,15 @@ mod tests {
 	fn control_p_toggles_the_preview() {
 		let mut router = Router::default();
 		let key = Key::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
-		assert_eq!(router.route(KeyContext::Manager, key), Route::Actions(vec![Action::TogglePreview]));
+		assert_eq!(router.route(KeyContext::Manager, key), Route::Commands(vec![Command::TogglePreview]));
 	}
 
 	#[test]
 	fn alt_j_and_k_scroll_the_preview() {
 		let mut router = Router::default();
 		let alt = |c| Key::new(KeyCode::Char(c), KeyModifiers::ALT);
-		assert_eq!(router.route(KeyContext::Manager, alt('j')), Route::Actions(vec![Action::SeekPreview(1)]));
-		assert_eq!(router.route(KeyContext::Manager, alt('k')), Route::Actions(vec![Action::SeekPreview(-1)]));
+		assert_eq!(router.route(KeyContext::Manager, alt('j')), Route::Commands(vec![Command::SeekPreview(1)]));
+		assert_eq!(router.route(KeyContext::Manager, alt('k')), Route::Commands(vec![Command::SeekPreview(-1)]));
 	}
 
 	#[test]
@@ -273,19 +281,19 @@ mod tests {
 		let mut router = Router::default();
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('/')),
-			Route::Actions(vec![Action::OpenInput(InputKind::Find { previous: false })])
+			Route::Commands(vec![Command::Find { previous: false }])
 		);
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('?')),
-			Route::Actions(vec![Action::OpenInput(InputKind::Find { previous: true })])
+			Route::Commands(vec![Command::Find { previous: true }])
 		);
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('n')),
-			Route::Actions(vec![Action::RepeatFind { opposite: false }])
+			Route::Commands(vec![Command::RepeatFind { opposite: false }])
 		);
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('N')),
-			Route::Actions(vec![Action::RepeatFind { opposite: true }])
+			Route::Commands(vec![Command::RepeatFind { opposite: true }])
 		);
 	}
 
@@ -294,11 +302,11 @@ mod tests {
 		let mut router = Router::default();
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('o')),
-			Route::Actions(vec![Action::Open { interactive: false }])
+			Route::Commands(vec![Command::Open { interactive: false }])
 		);
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('O')),
-			Route::Actions(vec![Action::Open { interactive: true }])
+			Route::Commands(vec![Command::Open { interactive: true }])
 		);
 	}
 }

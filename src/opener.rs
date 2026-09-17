@@ -1,6 +1,7 @@
 use std::{collections::HashMap, fs::File, io::{self, Read}, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::SystemTime};
 
 use tokio::sync::mpsc::UnboundedSender;
+use serde::Deserialize;
 
 use crate::event::Event;
 
@@ -10,59 +11,109 @@ pub struct OpenTarget {
 	pub mime: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenMode {
-	Open,
-	Reveal,
-}
-
-impl OpenMode {
-	pub const ALL: [Self; 2] = [Self::Open, Self::Reveal];
-
-	pub const fn label(self) -> &'static str {
-		match self {
-			Self::Open => "Open with the default application",
-			Self::Reveal => "Reveal in the file manager",
-		}
-	}
-}
-
 #[derive(Clone)]
 pub struct OpenPicker {
 	pub cwd:      PathBuf,
 	pub targets:  Vec<OpenTarget>,
+	pub choices:  Vec<OpenChoice>,
 	pub selected: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenKind {
-	Folder,
-	Text,
-	Image,
-	Audio,
-	Video,
-	Archive,
-	Other,
+#[derive(Clone, Debug)]
+pub struct OpenChoice { pub name: String, pub description: String }
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Opener {
+	pub run: String,
+	#[serde(default)] pub args: Vec<String>,
+	pub desc: String,
+	#[serde(rename = "for")] pub platform: Option<String>,
+	#[serde(default)] pub block: bool,
+	#[serde(default)] pub orphan: bool,
+	#[serde(default)] pub per_file: bool,
 }
 
-impl OpenTarget {
-	pub fn kind(&self) -> OpenKind {
-		if self.mime == "inode/directory" {
-			OpenKind::Folder
-		} else if is_text(&self.mime) || self.mime == "inode/empty" {
-			OpenKind::Text
-		} else if self.mime.starts_with("image/") {
-			OpenKind::Image
-		} else if self.mime.starts_with("audio/") {
-			OpenKind::Audio
-		} else if self.mime.starts_with("video/") {
-			OpenKind::Video
-		} else if is_archive(&self.mime) {
-			OpenKind::Archive
-		} else {
-			OpenKind::Other
-		}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRule {
+	pub mime: Option<String>,
+	pub name: Option<String>,
+	pub ext: Option<String>,
+	pub glob: Option<String>,
+	#[serde(rename = "use")] pub openers: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenConfig {
+	pub openers: HashMap<String, Vec<Opener>>,
+	pub rules:   Vec<OpenRule>,
+}
+
+impl OpenConfig {
+	pub fn names_for(&self, target: &OpenTarget) -> Vec<&str> {
+		self.rules.iter().find(|rule| rule.matches(target)).map_or_else(Vec::new, |rule| rule.openers.iter().map(String::as_str).collect())
 	}
+
+	pub fn choices(&self, targets: &[OpenTarget]) -> Vec<OpenChoice> {
+		let Some(first) = targets.first() else { return Vec::new() };
+		self.names_for(first).into_iter().filter(|name| targets.iter().all(|target| self.names_for(target).contains(name))).filter_map(|name| {
+			let opener = self.variant(name)?;
+			Some(OpenChoice { name: name.into(), description: opener.desc.clone() })
+		}).collect()
+	}
+
+	pub fn variant(&self, name: &str) -> Option<&Opener> {
+		self.openers.get(name)?.iter().find(|opener| platform_matches(opener.platform.as_deref()))
+	}
+
+	pub fn validate(&self) -> Result<(), String> {
+		for (name, variants) in &self.openers {
+			if variants.is_empty() { return Err(format!("opener '{name}' has no variants")); }
+			for opener in variants {
+				if opener.run.is_empty() || opener.desc.is_empty() { return Err(format!("opener '{name}' requires run and desc")); }
+				if opener.block && opener.orphan { return Err(format!("opener '{name}' cannot be both block and orphan")); }
+				if opener.args.iter().any(|arg| matches!(arg.as_str(), "{file}" | "{dir}")) && !opener.per_file { return Err(format!("opener '{name}' uses {{file}} or {{dir}} without per_file = true")); }
+				if let Some(platform) = opener.platform.as_deref() && !matches!(platform, "unix" | "macos" | "linux" | "windows") { return Err(format!("opener '{name}' has unknown platform '{platform}'")); }
+			}
+		}
+		for rule in &self.rules {
+			if [rule.mime.is_some(), rule.name.is_some(), rule.ext.is_some(), rule.glob.is_some()].into_iter().filter(|set| *set).count() != 1 { return Err("each open rule must set exactly one of mime, name, ext, or glob".into()); }
+			if rule.openers.is_empty() { return Err("open rule has no opener names".into()); }
+			for name in &rule.openers { if !self.openers.contains_key(name) { return Err(format!("open rule references unknown opener '{name}'")); } }
+		}
+		Ok(())
+	}
+}
+
+impl OpenRule {
+	fn matches(&self, target: &OpenTarget) -> bool {
+		self.mime.as_deref().is_some_and(|pattern| wildcard(pattern, &target.mime))
+			|| self.name.as_deref().is_some_and(|name| target.path.file_name().is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(name)))
+			|| self.ext.as_deref().is_some_and(|ext| target.path.extension().is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(ext)))
+			|| self.glob.as_deref().is_some_and(|pattern| wildcard(pattern, &target.path.to_string_lossy()))
+	}
+}
+
+fn platform_matches(platform: Option<&str>) -> bool {
+	match platform {
+		None => true,
+		Some("unix") => cfg!(unix),
+		Some("macos") => cfg!(target_os = "macos"),
+		Some("linux") => cfg!(target_os = "linux"),
+		Some("windows") => cfg!(target_os = "windows"),
+		_ => false,
+	}
+}
+
+fn wildcard(pattern: &str, value: &str) -> bool {
+	let (pattern, value): (Vec<_>, Vec<_>) = (pattern.chars().collect(), value.chars().collect());
+	let mut reachable = vec![false; value.len() + 1]; reachable[0] = true;
+	for token in pattern {
+		if token == '*' { for index in 1..=value.len() { reachable[index] |= reachable[index - 1]; } }
+		else { for index in (1..=value.len()).rev() { reachable[index] = reachable[index - 1] && (token == '?' || token == value[index - 1]); } reachable[0] = false; }
+	}
+	reachable[value.len()]
 }
 
 #[derive(Clone)]
@@ -140,49 +191,11 @@ fn detect(path: &Path, metadata: &std::fs::Metadata) -> io::Result<String> {
 
 fn looks_like_text(bytes: &[u8]) -> bool { !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok() }
 
-fn is_text(mime: &str) -> bool {
-	mime.starts_with("text/")
-		|| matches!(
-			mime,
-			"application/json"
-				| "application/ld+json"
-				| "application/javascript"
-				| "application/xml"
-				| "application/toml"
-				| "application/yaml"
-				| "application/x-sh"
-		)
-}
-
-fn is_archive(mime: &str) -> bool {
-	matches!(
-		mime,
-		"application/zip"
-			| "application/gzip"
-			| "application/x-7z-compressed"
-			| "application/x-rar-compressed"
-			| "application/x-tar"
-			| "application/x-bzip2"
-			| "application/x-xz"
-			| "application/zstd"
-	)
-}
-
 #[cfg(test)]
 mod tests {
 	use std::fs;
 
 	use super::*;
-
-	#[test]
-	fn classifies_mime_groups() {
-		let target = |mime: &str| OpenTarget { path: PathBuf::new(), mime: mime.into() };
-		assert_eq!(target("inode/directory").kind(), OpenKind::Folder);
-		assert_eq!(target("text/plain").kind(), OpenKind::Text);
-		assert_eq!(target("image/png").kind(), OpenKind::Image);
-		assert_eq!(target("application/zip").kind(), OpenKind::Archive);
-		assert_eq!(target("application/octet-stream").kind(), OpenKind::Other);
-	}
 
 	#[test]
 	fn detects_content_then_extension_and_empty_files() {

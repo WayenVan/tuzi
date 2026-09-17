@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use ratatui::{Frame, layout::{Alignment, Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap}};
+use ratatui::{Frame, layout::{Alignment, Constraint, Direction, Layout, Rect}, text::{Line, Span}, widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap}};
 
-use crate::action::DeleteMode;
+use crate::{command::DeleteMode, theme::Theme};
 
 pub struct ConfirmPopup;
 
@@ -10,11 +10,11 @@ impl ConfirmPopup {
 	/// Warns instead of quitting outright when a task is still running —
 	/// exiting mid-copy abandons whatever `.tuzi-part-*` temp file it was
 	/// using, so this is the last chance to notice and wait instead.
-	pub fn render_quit(frame: &mut Frame, area: Rect, running: usize) {
+	pub fn render_quit(frame: &mut Frame, area: Rect, running: usize, theme: &Theme, popup_width: u16) {
 		if running == 0 || area.width < 4 || area.height < 4 {
 			return;
 		}
-		let width = area.width.clamp(4, 50);
+		let width = area.width.clamp(4, popup_width);
 		let height = 5u16.min(area.height).max(4);
 		let popup = Rect::new(
 			area.x + area.width.saturating_sub(width) / 2,
@@ -27,7 +27,7 @@ impl ConfirmPopup {
 		let block = Block::new()
 			.borders(Borders::ALL)
 			.border_type(BorderType::Rounded)
-			.border_style(Style::new().fg(Color::Yellow))
+			.border_style(theme.style("popup.warning"))
 			.title(" Quit? ")
 			.title_alignment(Alignment::Center);
 		let inner = block.inner(popup);
@@ -42,14 +42,14 @@ impl ConfirmPopup {
 			Paragraph::new(format!("{running} {noun} still running. Quit anyway?")).alignment(Alignment::Center).wrap(Wrap { trim: true }),
 			body,
 		);
-		Self::render_yes_no(frame, buttons);
+		Self::render_yes_no(frame, buttons, theme);
 	}
 
-	pub fn render_delete(frame: &mut Frame, area: Rect, targets: &[PathBuf], mode: DeleteMode) {
+	pub fn render_delete(frame: &mut Frame, area: Rect, targets: &[PathBuf], mode: DeleteMode, theme: &Theme, popup_width: u16) {
 		if targets.is_empty() || area.width < 4 || area.height < 4 {
 			return;
 		}
-		let width = area.width.clamp(4, 60);
+		let width = area.width.clamp(4, popup_width);
 		let list_rows = targets.len().min(6) as u16;
 		let height = (list_rows + 6).min(area.height).max(4);
 		let popup = Rect::new(
@@ -64,7 +64,7 @@ impl ConfirmPopup {
 		let block = Block::new()
 			.borders(Borders::ALL)
 			.border_type(BorderType::Rounded)
-			.border_style(Style::new().fg(Color::Red))
+			.border_style(theme.style("popup.danger"))
 			.title(title)
 			.title_alignment(Alignment::Center);
 		let inner = block.inner(popup);
@@ -85,21 +85,21 @@ impl ConfirmPopup {
 			ListItem::new(Line::from(format!("  {name}")))
 		});
 		frame.render_widget(List::new(items), list);
-		Self::render_yes_no(frame, buttons);
+		Self::render_yes_no(frame, buttons, theme);
 	}
 
-	fn render_yes_no(frame: &mut Frame, area: Rect) {
+	fn render_yes_no(frame: &mut Frame, area: Rect, theme: &Theme) {
 		let [yes, no] = Layout::default()
 			.direction(Direction::Horizontal)
 			.constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
 			.areas(area);
 		frame.render_widget(
-			Paragraph::new(Line::from(vec![Span::styled("Yes (y)", Style::new().fg(Color::Red))]))
+			Paragraph::new(Line::from(vec![Span::styled("Yes (y)", theme.style("popup.danger"))]))
 				.alignment(Alignment::Center),
 			yes,
 		);
 		frame.render_widget(
-			Paragraph::new(Span::styled("No (n) [Enter]", Style::new().fg(Color::Black).bg(Color::LightCyan).add_modifier(Modifier::BOLD)))
+			Paragraph::new(Span::styled("No (n) [Enter]", theme.style("popup.cancel")))
 				.alignment(Alignment::Center),
 			no,
 		);

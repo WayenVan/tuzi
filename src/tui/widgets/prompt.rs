@@ -2,9 +2,11 @@ use edtui::{EditorMode, EditorState, EditorTheme, EditorView};
 use ratatui::{
 	Frame,
 	layout::{Constraint, Direction, Layout, Rect},
-	style::{Color, Style},
+	style::Style,
 	widgets::{Block, Clear},
 };
+
+use crate::theme::Theme;
 
 pub struct Prompt;
 
@@ -13,20 +15,20 @@ impl Prompt {
 	/// a popup dialog rather than a line squeezed into the status bar.
 	/// Border color and title both name edtui's own current vim mode.
 	/// Returns the screen column/row to park the terminal cursor at.
-	pub fn render(frame: &mut Frame, area: Rect, title: &str, state: &mut EditorState) -> (u16, u16, Rect) {
-		let width = area.width.saturating_sub(4).min(50);
+	pub fn render(frame: &mut Frame, area: Rect, title: &str, state: &mut EditorState, theme: &Theme, popup_width: u16) -> (u16, u16, Rect) {
+		let width = area.width.saturating_sub(4).min(popup_width);
 		let rect = Self::centered(width + 2, 3, area);
 
 		frame.render_widget(Clear, rect);
 
-		let (label, color) = match state.mode {
-			EditorMode::Insert => ("INSERT", Color::Green),
-			EditorMode::Normal => ("NORMAL", Color::Blue),
-			EditorMode::Visual => ("VISUAL", Color::Magenta),
-			EditorMode::Search => ("SEARCH", Color::Yellow),
+		let (label, style) = match state.mode {
+			EditorMode::Insert => ("INSERT", theme.style("prompt.insert")),
+			EditorMode::Normal => ("NORMAL", theme.style("prompt.normal")),
+			EditorMode::Visual => ("VISUAL", theme.style("prompt.visual")),
+			EditorMode::Search => ("SEARCH", theme.style("prompt.search")),
 		};
 
-		let block = Block::bordered().title(format!(" {title} [{label}] ")).border_style(Style::new().fg(color));
+		let block = Block::bordered().title(format!(" {title} [{label}] ")).border_style(style);
 		let inner = block.inner(rect);
 		frame.render_widget(block, rect);
 
@@ -92,7 +94,7 @@ mod tests {
 		let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
 		let mut before = (0, 0);
 		terminal.draw(|frame| {
-			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state);
+			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state, &Theme::default(), 50);
 			before = (x, y);
 		}).unwrap();
 
@@ -106,7 +108,7 @@ mod tests {
 
 		let mut after = (0, 0);
 		terminal.draw(|frame| {
-			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state);
+			let (x, y, _) = Prompt::render(frame, frame.area(), "Rename", &mut state, &Theme::default(), 50);
 			after = (x, y);
 		}).unwrap();
 

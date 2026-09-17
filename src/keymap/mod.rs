@@ -1,5 +1,5 @@
 mod binding;
-mod defaults;
+mod config;
 mod key;
 mod router;
 
@@ -12,17 +12,19 @@ pub struct Keymap {
 }
 
 impl Default for Keymap {
-	fn default() -> Self { Self::new(defaults::bindings()).expect("built-in keymap must be valid") }
+	fn default() -> Self { Self::load(&crate::config::LoadOptions { config_dir: None, no_config: true }).expect("built-in keymap must be valid") }
 }
 
 impl Keymap {
+	pub fn load(options: &crate::config::LoadOptions) -> Result<Self, String> { config::load(options) }
+
 	pub fn new(bindings: Vec<Binding>) -> Result<Self, String> {
 		for (i, binding) in bindings.iter().enumerate() {
 			if binding.keys.is_empty() {
 				return Err(format!("binding {i} has no keys"));
 			}
-			if binding.actions.is_empty() {
-				return Err(format!("binding {i} has no actions"));
+			if binding.commands.is_empty() {
+				return Err(format!("binding {i} has no commands"));
 			}
 			if binding.description.is_empty() {
 				return Err(format!("binding {i} has no description"));
@@ -45,15 +47,15 @@ impl Keymap {
 
 #[cfg(test)]
 mod tests {
-	use crate::action::Action;
+	use crate::command::Command;
 
 	use super::*;
 
 	#[test]
 	fn rejects_ambiguous_prefixes() {
 		let bindings = vec![
-			Binding::new(KeyContext::Manager, vec![Key::char('g')], Action::Quit, "short"),
-			Binding::new(KeyContext::Manager, vec![Key::char('g'), Key::char('g')], Action::Quit, "long"),
+			Binding::new(KeyContext::Manager, vec![Key::char('g')], Command::Quit, "short"),
+			Binding::new(KeyContext::Manager, vec![Key::char('g'), Key::char('g')], Command::Quit, "long"),
 		];
 		assert!(Keymap::new(bindings).is_err());
 	}

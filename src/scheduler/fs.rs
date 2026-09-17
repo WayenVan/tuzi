@@ -7,6 +7,7 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
+	config::ConflictPolicy,
 	event::Event,
 	fs::{Engine, create_symlink, symlink_target, unique_dest_avoiding},
 };
@@ -101,11 +102,15 @@ impl FsScheduler {
 		self.entries.remove(path);
 	}
 
-	pub fn create(&self, base: PathBuf, value: String) {
+	pub fn create_with_policy(&self, base: PathBuf, value: String, policy: ConflictPolicy) {
 		let tab = self.tab;
 		let tx = self.tx.clone();
 		let directory = value.ends_with('/') || value.ends_with('\\');
-		let target = base.join(&value);
+		let requested = base.join(&value);
+		let target = match (policy, requested.parent(), requested.file_name()) {
+			(ConflictPolicy::Rename, Some(parent), Some(name)) => unique_dest_avoiding(parent, name, |_| false),
+			_ => requested,
+		};
 		let task_target = target.clone();
 		let task_value = value.clone();
 		let task_base = base.clone();
@@ -113,6 +118,9 @@ impl FsScheduler {
 			let result = tokio::task::spawn_blocking(move || {
 				if task_value.is_empty() {
 					return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "name cannot be empty"));
+				}
+				if policy == ConflictPolicy::Error && task_target.exists() {
+					return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "target already exists"));
 				}
 				if directory {
 					std::fs::create_dir_all(&task_target)

@@ -6,6 +6,7 @@ use tokio::{io::AsyncWriteExt, process::Command};
 pub enum ProcessMode {
 	Block,
 	BlockCapture,
+	Wait,
 	Orphan,
 }
 
@@ -63,6 +64,11 @@ impl ProcessRequest {
 		Self { command, mode: ProcessMode::Orphan, purpose, label: label.into(), input: None }
 	}
 
+	pub fn wait(mut command: Command, purpose: ProcessPurpose, label: impl Into<String>) -> Self {
+		command.kill_on_drop(true).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+		Self { command, mode: ProcessMode::Wait, purpose, label: label.into(), input: None }
+	}
+
 	pub const fn mode(&self) -> ProcessMode { self.mode }
 
 	pub async fn execute(mut self) -> ProcessCompletion {
@@ -92,6 +98,7 @@ impl ProcessRequest {
 				}
 				Err(error) => Err(error),
 			},
+			ProcessMode::Wait => self.command.status().await.map(|status| ProcessOutput::Completed { status, stdout: Vec::new() }),
 			ProcessMode::Orphan => self.command.spawn().map(drop).map(|()| ProcessOutput::Detached),
 		};
 		ProcessCompletion { purpose: self.purpose, label: self.label, result }

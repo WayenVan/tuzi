@@ -2,7 +2,7 @@ use std::{io, path::{Path, PathBuf}};
 
 use tokio::process::Command;
 
-use crate::{notice::NoticeLevel, opener::{OpenMode, OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
+use crate::{notice::NoticeLevel, opener::{OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
 
 use super::App;
 
@@ -21,25 +21,26 @@ impl App {
 				return;
 			}
 			match result {
-				Ok(targets) => self.open_picker = Some(OpenPicker { cwd, targets, selected: 0 }),
+				Ok(targets) => {
+					let choices = self.config.opener.choices(&targets);
+					if choices.is_empty() { self.raise_tab_notice(tab, NoticeLevel::Warn, "no common opener matches the selected files".into()); }
+					else { self.open_picker = Some(OpenPicker { cwd, targets, choices, selected: 0 }); }
+				},
 				Err(error) => self.raise_tab_notice(tab, NoticeLevel::Error, error.to_string()),
 			}
 			return;
 		}
-		self.enqueue_open(tab, result.and_then(|targets| OpenPlanner::plan_editor(&cwd, &targets)));
+		self.enqueue_open(tab, result.and_then(|targets| OpenPlanner::plan_default(&self.config.opener, &cwd, &targets)));
 	}
 
 	pub(super) fn move_open_picker(&mut self, delta: isize) {
 		let Some(picker) = &mut self.open_picker else { return };
-		picker.selected = (picker.selected as isize + delta).rem_euclid(OpenMode::ALL.len() as isize) as usize;
+		picker.selected = (picker.selected as isize + delta).rem_euclid(picker.choices.len() as isize) as usize;
 	}
 
 	pub(super) fn submit_open_picker(&mut self) {
 		let Some(picker) = self.open_picker.take() else { return };
-		let result = match OpenMode::ALL[picker.selected] {
-			OpenMode::Open => OpenPlanner::plan_system(&picker.cwd, &picker.targets),
-			OpenMode::Reveal => OpenPlanner::plan_reveal(&picker.cwd, &picker.targets),
-		};
+		let result = OpenPlanner::plan_named(&self.config.opener, &picker.choices[picker.selected].name, &picker.cwd, &picker.targets);
 		self.enqueue_open(self.active, result);
 	}
 

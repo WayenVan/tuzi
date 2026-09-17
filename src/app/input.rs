@@ -8,11 +8,13 @@ pub(super) enum InputPurpose {
 	Create { base: PathBuf },
 	Find { previous: bool },
 	Filter,
+	Command,
 }
 
 pub(super) struct Completion {
 	pub(super) candidates: Vec<String>,
 	pub(super) selected:   usize,
+	pub(super) command:    bool,
 }
 
 pub(super) struct InputSession {
@@ -43,6 +45,7 @@ impl InputSession {
 			InputPurpose::Find { previous: false } => "Find next",
 			InputPurpose::Find { previous: true } => "Find previous",
 			InputPurpose::Filter => "Filter",
+			InputPurpose::Command => "Command",
 		}
 	}
 
@@ -60,6 +63,7 @@ impl InputSession {
 	}
 
 	pub(super) fn is_filter(&self) -> bool { matches!(self.purpose, InputPurpose::Filter) }
+	pub(super) fn is_command(&self) -> bool { matches!(self.purpose, InputPurpose::Command) }
 
 	pub(super) fn move_completion(&mut self, delta: isize) {
 		let Some(cmp) = &mut self.completion else { return };
@@ -71,6 +75,13 @@ impl InputSession {
 
 	pub(super) fn complete_selected(&mut self) -> bool {
 		let Some(name) = self.completion.as_ref().and_then(|c| c.candidates.get(c.selected)).cloned() else { return false };
+		if self.completion.as_ref().is_some_and(|completion| completion.command) {
+			self.state.lines = Lines::from(name.as_str());
+			self.state.cursor = Index2::new(0, name.chars().count());
+			self.completion = None;
+			self.error = None;
+			return true;
+		}
 		let value = self.value();
 		let cursor = self.state.cursor.col.min(value.chars().count());
 		let Range { start, end } = completion_fragment(&value, cursor);

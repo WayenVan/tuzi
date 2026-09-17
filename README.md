@@ -48,6 +48,220 @@ tuzi --help
 tuzi --version
 ```
 
+## Configuration
+
+Tuzi starts from the complete configuration embedded from
+`preset/tuzi-default.toml`, then overlays `~/.config/tuzi/tuzi.toml` on it.
+On systems using
+`XDG_CONFIG_HOME`, it reads `$XDG_CONFIG_HOME/tuzi/tuzi.toml` instead.
+Only values you want to change need to be specified:
+
+```toml
+[mgr]
+sort_by = "name"          # name, modified, size, extension
+sort_reverse = false
+show_hidden = false
+column_mode = "none"      # none, size, permissions, modified
+history_size = 60
+
+[preview]
+show = false
+ratio = 40                # 10–90
+max_scan_bytes = 5242880  # 64 KiB–1 GiB per viewport scan
+max_line_bytes = 16384    # 256 B–1 MiB; longer lines disable highlighting
+cache_bytes = 16777216    # 0 disables cache; maximum 1 GiB
+overscan_lines = 20       # 0–1000 lines beyond the visible viewport
+syntax_highlight = true
+
+[tasks]
+workers = 2               # 1–64
+copy_buffer_size = 524288 # 4 KiB–16 MiB per running copy task
+progress_interval_ms = 75 # 10–1000 ms between UI progress updates
+
+[confirm]
+trash = true              # Confirm before moving to trash
+delete = true             # Confirm before permanent deletion
+
+[fs]
+paste_conflict = "rename" # rename or error
+create_conflict = "error" # rename or error
+rename_conflict = "error" # rename or error
+
+[ui]
+mouse = true
+popup_width = 50           # 20–200 columns
+completion_max_items = 8   # 1–50 rows
+which_key = true
+
+[notify]
+info_timeout = 3           # seconds, 1–3600
+warn_timeout = 5
+error_timeout = 8
+
+[watcher]
+debounce_ms = 80           # 10–5000
+max_wait_ms = 500          # 10–10000; must be >= debounce_ms
+poll_interval_ms = 1000    # 50–60000
+```
+
+Use `tuzi --config-dir DIR` to select another configuration directory, or
+`tuzi --no-config` to run with the built-in defaults. `TUZI_CONFIG_HOME` can
+also set the configuration directory globally.
+
+The embedded TOML files are the single source of truth for defaults. An
+invalid embedded preset is treated as a Tuzi bug; Rust does not maintain a
+second copy of the behavior defaults.
+
+Disabling a confirmation never changes the operation itself: `remove` still
+uses the system trash, while permanent deletion still requires the explicit
+`remove --permanently` command. Conflict policy `rename` chooses a free
+`(copy)` name; `error` refuses an existing target without overwriting it.
+`popup_width` applies consistently to prompts, opener dialogs, and
+confirmation dialogs. Disabling `which_key` only hides chord hints; the
+keymap sequences themselves continue to work.
+Watcher changes are grouped for `debounce_ms`; `max_wait_ms` forces a refresh
+during nonstop filesystem churn. `poll_interval_ms` configures notify's
+polling backend/fallback and does not replace native watching where available.
+
+### Keymap
+
+`keymap.toml` uses Yazi-style key descriptions. `prepend_keymap` overrides a
+default binding with the same key, while `append_keymap` adds bindings that do
+not already exist:
+
+```toml
+[mgr]
+prepend_keymap = [
+  { on = "<C-p>", run = "preview toggle", desc = "Toggle preview" },
+  { on = ["g", "g"], run = ["cursor top", "preview toggle"], desc = "Top and preview" },
+]
+
+append_keymap = [
+  { on = "<F2>", run = "hidden toggle", desc = "Toggle hidden files" },
+]
+```
+
+Printable keys are written directly. Special keys and modifiers use forms
+such as `<Esc>`, `<Enter>`, `<Space>`, `<C-p>`, `<A-j>`, `<S-Down>`, and
+`<F2>`. Setting `keymap = [...]` replaces the complete manager keymap. The
+full command vocabulary and default bindings are available in
+[`preset/keymap-default.toml`](preset/keymap-default.toml).
+
+### Command line
+
+Press `:` to open the command prompt. It reuses the same edtui Vim editor as
+the other input dialogs: `Esc` leaves Insert mode, Normal-mode Vim motions
+edit the line, and `Enter` submits it. Command candidates update as you type;
+use Up/Down or `Ctrl-p`/`Ctrl-n` to select one and Tab to complete it, matching
+the interactive directory prompt. Commands use exactly the same language
+as keymap `run` entries, for example:
+
+```text
+:open --interactive
+:sort modified --reverse
+:preview toggle
+:tab create
+:cd ~/workspace
+:cd "/path with spaces"
+:rename "new name.txt"
+:create "notes/draft one.md"
+:cd @trash
+:cd @config
+:cd @selected
+:cursor top
+```
+
+Invalid commands stay in the prompt and report an error. Keymaps and the
+command prompt both parse into `Command` and execute through the same
+`App::execute()` entry point. Single quotes, double quotes, and backslash
+escapes are supported. Arguments are parsed by Tuzi and are not evaluated by
+a shell.
+
+Command syntax follows `command [target] [--behavior]`. A `cd` argument is
+always a real path unless it uses the explicit built-in target namespace:
+`@trash`, `@config`, or `@selected`. Thus `cd trash` enters a directory named
+`trash`, while `cd @trash` opens the system trash; use `cd ./@trash` for a
+literal directory named `@trash`. Running `cd`, `rename`, or `create` without
+an argument opens its interactive input dialog. Empty targets and unknown
+`@targets` are rejected.
+
+### Openers
+
+Openers and matching rules live in `tuzi.toml`. Plain `o` runs the first
+opener in the first matching rule; `O` lists every matching opener:
+
+```toml
+[opener]
+edit = [
+  { run = "$EDITOR", args = ["{files}"], desc = "$EDITOR", for = "unix", block = true },
+]
+browser = [
+  { run = "firefox", args = ["{file}"], desc = "Firefox", for = "unix", orphan = true, per_file = true },
+]
+
+[open]
+rules = [
+  { ext = "md", use = ["edit", "browser"] },
+  { mime = "text/*", use = ["edit", "browser"] },
+  { mime = "*", use = ["browser"] },
+]
+```
+
+Rules are checked from top to bottom and may match `mime`, `name`, `ext`, or
+`glob`. Arguments are passed directly to the executable without a shell:
+`{files}` expands to separate arguments, while `{file}` and `{dir}` require
+`per_file = true`. `$EDITOR` resolves `VISUAL`, then `EDITOR`, then the
+platform fallback. `block = true` suspends Tuzi and gives the child the TTY;
+`orphan = true` detaches it. With neither flag, Tuzi waits without surrendering
+the TTY. Complete defaults are in
+[`preset/tuzi-default.toml`](preset/tuzi-default.toml).
+
+### Icons
+
+Icons are configured in `theme.toml`. User rules are checked before the
+built-in `devicons` fallback:
+
+```toml
+[icon]
+directory      = { text = "", fg = "#03a9f4" }
+directory_open = { text = "", fg = "#03a9f4" }
+
+prepend_dirs = [
+  { name = ".git", text = "", fg = "#f54d27" },
+]
+prepend_files = [
+  { name = "Dockerfile", text = "󰡨", fg = "#458ee6" },
+]
+prepend_exts = [
+  { name = "rs", text = "", fg = "#f74c00" },
+]
+prepend_globs = [
+  { url = "*/tests/*.rs", text = "󰙨", fg = "light-green" },
+]
+```
+
+The matching order is glob, exact directory/file name, extension, special
+file state, `devicons`, then `fallback`. Set `enabled = false` under `[icon]`
+to remove icons and their spacing. Colors accept names or `#RRGGBB` values.
+
+All interface styles use semantic keys from the embedded
+[`preset/theme-default.toml`](preset/theme-default.toml). A user theme only
+needs to patch the properties it wants to change:
+
+```toml
+[style]
+"mgr.cursor_unfocused" = { bg = "#24273a" }
+"mgr.find_match"       = { fg = "#eed49f", bold = true, underline = true }
+"tabs.active"          = { fg = "black", bg = "#8aadf4", bold = true }
+"status.normal"        = { fg = "black", bg = "#8aadf4" }
+"popup.border"         = { fg = "magenta" }
+"notify.error"         = { fg = "#ed8796", bold = true }
+```
+
+Style properties are `fg`, `bg`, `bold`, `italic`, `underline`, and
+`reverse`. Unknown style names and properties are rejected instead of being
+silently ignored.
+
 ## Keybindings
 
 | Key | Action |
@@ -83,8 +297,8 @@ Prefix keys such as `Space`, `g`, `c`, `m`, and `,` show their available command
 
 ## Roadmap
 
-1. **User configuration** — configurable keybindings, themes, and behavior without rebuilding Tuzi.
-2. **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
+- [x] **User configuration** — configurable keybindings, themes, and behavior without rebuilding Tuzi.
+- [ ] **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
 
 ## Acknowledgements
 

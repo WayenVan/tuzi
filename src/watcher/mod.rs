@@ -42,13 +42,11 @@ struct WatchIndex {
 	by_original: HashMap<PathBuf, PathBuf>,
 }
 
-const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_CHANGE_BATCH: usize = 1000;
 /// Caps how long a directory under nonstop churn (e.g. a log file being
-/// appended to faster than `CHANGE_DEBOUNCE` apart) can be starved of an
+/// appended to faster than the configured debounce apart) can be starved of an
 /// update — the sliding debounce below would otherwise keep resetting
 /// forever.
-const MAX_CHANGE_WAIT: Duration = Duration::from_secs(1);
 
 type PendingChanges = Arc<Mutex<HashMap<PathBuf, PendingChange>>>;
 
@@ -67,11 +65,12 @@ struct ChangeSet {
 }
 
 impl Watcher {
-	pub fn new(tab: usize, tx: UnboundedSender<Event>) -> io::Result<Self> {
+	pub fn new(tab: usize, tx: UnboundedSender<Event>, debounce: Duration, max_wait: Duration, poll_interval: Duration) -> io::Result<Self> {
 		let watched = Arc::new(Mutex::new(WatchIndex::default()));
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
-		let inner = RecommendedWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime), Config::default()).map_err(io::Error::other)?;
+		let notify_config = Config::default().with_poll_interval(poll_interval).with_compare_contents(true);
+		let inner = RecommendedWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime, debounce, max_wait), notify_config).map_err(io::Error::other)?;
 		Ok(Self::with_inner(Box::new(inner), watched, pending))
 	}
 
@@ -81,7 +80,7 @@ impl Watcher {
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
 		let config = Config::default().with_poll_interval(interval).with_compare_contents(true);
-		let inner = notify::PollWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime), config).map_err(io::Error::other)?;
+		let inner = notify::PollWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime, Duration::from_millis(250), Duration::from_secs(1)), config).map_err(io::Error::other)?;
 		Ok(Self::with_inner(Box::new(inner), watched, pending))
 	}
 
@@ -177,7 +176,7 @@ fn unregister_watch(inner: &mut dyn NotifyWatcher, watched: &Mutex<WatchIndex>, 
 // downstream of that match (the `changed` map, debounce bookkeeping, the
 // event finally sent out) is then translated back to the tree's own path,
 // which is what `Tab` actually indexes its nodes by.
-fn event_handler(tab: usize, tx: UnboundedSender<Event>, matched: Arc<Mutex<WatchIndex>>, pending: PendingChanges, runtime: Handle) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+fn event_handler(tab: usize, tx: UnboundedSender<Event>, matched: Arc<Mutex<WatchIndex>>, pending: PendingChanges, runtime: Handle, debounce: Duration, max_wait: Duration) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
 	move |res| {
 		let Ok(event) = res else { return };
 		if event.kind.is_access() {
@@ -202,7 +201,7 @@ fn event_handler(tab: usize, tx: UnboundedSender<Event>, matched: Arc<Mutex<Watc
 		}
 		drop(watched);
 		for (parent, (paths, refresh)) in changed {
-			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, CHANGE_DEBOUNCE, MAX_CHANGE_WAIT);
+			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, debounce, max_wait);
 		}
 	}
 }

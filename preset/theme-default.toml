@@ -1,0 +1,66 @@
+# Tuzi's built-in theme. More UI styles will join this file as widgets are
+# migrated; icons already use it as their complete source of truth.
+
+[icon]
+enabled = true
+directory      = { text = "", fg = "#03a9f4" }
+directory_open = { text = "", fg = "#03a9f4" }
+symlink        = { text = "", fg = "#9e9e9e" }
+broken_symlink = { text = "", fg = "#f44336" }
+fallback       = { text = "", fg = "white" }
+globs = []
+dirs = []
+files = []
+exts = []
+
+[style]
+"mgr.cursor_unfocused" = { bg = "#313244" }
+"mgr.error"            = { fg = "red" }
+"mgr.loading"          = { fg = "gray" }
+"mgr.symlink"          = { fg = "gray" }
+"mgr.find_match"       = { fg = "yellow", bold = true, italic = true, underline = true }
+"mgr.marker_visual"    = { fg = "cyan", bg = "cyan" }
+"mgr.marker_selected"  = { fg = "light-yellow", bg = "light-yellow" }
+"mgr.marker_cut"       = { fg = "light-red", bg = "light-red" }
+"mgr.marker_copy"      = { fg = "light-green", bg = "light-green" }
+"win.cwd"              = { fg = "cyan" }
+"win.badge_copy"       = { fg = "black", bg = "green" }
+"win.badge_cut"        = { fg = "black", bg = "red" }
+"tabs.active"          = { fg = "#1e1e2e", bg = "#89b4fa", bold = true }
+"tabs.inactive"        = { fg = "#89b4fa", bg = "#313244" }
+"tabs.separator"       = { fg = "#89b4fa", bg = "#313244" }
+"tabs.outer"           = { fg = "#313244" }
+"status.normal"        = { fg = "#1e1e2e", bg = "#89b4fa" }
+"status.select"        = { fg = "#1e1e2e", bg = "#94e2d5" }
+"status.unset"         = { fg = "#1e1e2e", bg = "#f2cdcd" }
+"status.normal_alt"    = { fg = "#89b4fa", bg = "#313244" }
+"status.select_alt"    = { fg = "#94e2d5", bg = "#313244" }
+"status.unset_alt"     = { fg = "#f2cdcd", bg = "#313244" }
+"status.perm_none"     = { fg = "#7f849c" }
+"status.perm_read"     = { fg = "#f9e2af" }
+"status.perm_write"    = { fg = "#f38ba8" }
+"status.perm_exec"     = { fg = "#a6e3a1" }
+"status.perm_type"     = { fg = "#89b4fa" }
+"status.task"          = { fg = "#a6e3a1", bg = "#45475a" }
+"popup.border"         = { fg = "blue" }
+"popup.selected"       = { fg = "light-cyan", bold = true }
+"popup.muted"          = { fg = "dark-gray" }
+"popup.warning"        = { fg = "yellow" }
+"popup.danger"         = { fg = "red" }
+"popup.cancel"         = { fg = "black", bg = "light-cyan", bold = true }
+"which.key"            = { fg = "light-cyan", bold = true }
+"which.separator"      = { fg = "dark-gray" }
+"which.description"    = { fg = "light-magenta" }
+"preview.border"       = { fg = "cyan" }
+"preview.error"        = { fg = "red" }
+"prompt.insert"        = { fg = "green" }
+"prompt.normal"        = { fg = "blue" }
+"prompt.visual"        = { fg = "magenta" }
+"prompt.search"        = { fg = "yellow" }
+"tasks.normal"         = { fg = "gray" }
+"tasks.selected"       = { fg = "light-cyan", bold = true }
+"tasks.failed"         = { fg = "red" }
+"tasks.progress"       = { fg = "blue" }
+"notify.info"          = { fg = "cyan" }
+"notify.warn"          = { fg = "yellow" }
+"notify.error"         = { fg = "red" }

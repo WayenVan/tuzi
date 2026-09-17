@@ -1,0 +1,76 @@
+# Tuzi's complete built-in behavior configuration.
+# User configuration is overlaid on top of this preset.
+
+[mgr]
+sort_by = "name"
+sort_reverse = false
+show_hidden = false
+column_mode = "none"
+history_size = 60
+
+[preview]
+show = false
+ratio = 40
+max_scan_bytes = 5242880
+max_line_bytes = 16384
+cache_bytes = 16777216
+overscan_lines = 20
+syntax_highlight = true
+
+[tasks]
+workers = 2
+copy_buffer_size = 524288
+progress_interval_ms = 75
+
+[confirm]
+trash = true
+delete = true
+
+[fs]
+paste_conflict = "rename"
+create_conflict = "error"
+rename_conflict = "error"
+
+[ui]
+mouse = true
+popup_width = 50
+completion_max_items = 8
+which_key = true
+
+[notify]
+info_timeout = 3
+warn_timeout = 5
+error_timeout = 8
+
+[watcher]
+debounce_ms = 80
+max_wait_ms = 500
+poll_interval_ms = 1000
+
+[opener]
+edit = [
+	{ run = "$EDITOR", args = ["{files}"], desc = "$EDITOR", for = "unix", block = true },
+	{ run = "$EDITOR", args = ["{files}"], desc = "$EDITOR", for = "windows", block = true },
+]
+open = [
+	{ run = "open", args = ["{files}"], desc = "Open", for = "macos", orphan = true },
+	{ run = "xdg-open", args = ["{file}"], desc = "Open", for = "linux", orphan = true, per_file = true },
+	{ run = "cmd", args = ["/C", "start", "", "{file}"], desc = "Open", for = "windows", orphan = true, per_file = true },
+]
+reveal = [
+	{ run = "open", args = ["-R", "{file}"], desc = "Reveal", for = "macos", orphan = true, per_file = true },
+	{ run = "xdg-open", args = ["{dir}"], desc = "Reveal", for = "linux", orphan = true, per_file = true },
+	{ run = "explorer", args = ["/select,", "{file}"], desc = "Reveal", for = "windows", orphan = true, per_file = true },
+]
+
+[open]
+rules = [
+	{ mime = "inode/directory", use = ["open", "reveal"] },
+	{ mime = "text/*", use = ["edit", "open", "reveal"] },
+	{ mime = "inode/empty", use = ["edit", "open", "reveal"] },
+	{ mime = "application/json", use = ["edit", "open", "reveal"] },
+	{ mime = "application/javascript", use = ["edit", "open", "reveal"] },
+	{ mime = "application/toml", use = ["edit", "open", "reveal"] },
+	{ mime = "application/yaml", use = ["edit", "open", "reveal"] },
+	{ mime = "*", use = ["open", "reveal"] },
+]

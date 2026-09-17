@@ -1,4 +1,6 @@
-use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::Paragraph};
+use ratatui::{Frame, layout::Rect, text::{Line, Span}, widgets::Paragraph};
+
+use crate::theme::Theme;
 
 pub struct TabBar;
 
@@ -22,20 +24,17 @@ impl TabBar {
 
 	/// Takes owned labels so the caller can release its shared borrow of all
 	/// tabs before borrowing the active tab mutably for the rest of a frame.
-	pub fn render(frame: &mut Frame, area: Rect, tabs: &[(bool, String)]) {
+	pub fn render(frame: &mut Frame, area: Rect, tabs: &[(bool, String)], theme: &Theme) {
 		if tabs.is_empty() || area.width == 0 {
 			return;
 		}
 
 		const OPEN: &str = "";
 		const CLOSE: &str = "";
-		let blue = Color::Rgb(0x89, 0xb4, 0xfa);
-		let base = Color::Rgb(0x1e, 0x1e, 0x2e);
-		let surface = Color::Rgb(0x31, 0x32, 0x44);
-		let active = Style::new().fg(base).bg(blue).add_modifier(Modifier::BOLD);
-		let inactive = Style::new().fg(blue).bg(surface);
-		let separator = Style::new().fg(blue).bg(surface);
-		let outer = Style::new().fg(surface);
+		let active = theme.style("tabs.active");
+		let inactive = theme.style("tabs.inactive");
+		let separator = theme.style("tabs.separator");
+		let outer = theme.style("tabs.outer");
 		let max = area.width.saturating_sub(4) as usize / tabs.len();
 
 		let mut spans = Vec::with_capacity(tabs.len() * 3 + 2);

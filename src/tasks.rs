@@ -2,7 +2,7 @@ use std::{collections::HashSet, fs, io::{self, Read, Write}, path::{Path, PathBu
 
 use tokio::{sync::{Semaphore, mpsc::UnboundedSender, watch}, task::JoinHandle};
 
-use crate::{event::Event, fs::{format_size, remove, unique_dest_avoiding}};
+use crate::{config::{ConflictPolicy, Tasks as TaskConfig}, event::Event, fs::{format_size, remove, unique_dest_avoiding}};
 
 #[path = "tasks/trash.rs"]
 mod trash_backend;
@@ -88,23 +88,47 @@ pub struct TaskManager {
 	permits: Arc<Semaphore>,
 	reserved_targets: HashSet<PathBuf>,
 	trash: Arc<dyn TrashBackend>,
+	config: TaskConfig,
 }
 
 
 impl TaskManager {
+	#[cfg(test)]
 	pub fn new(tx: UnboundedSender<Event>) -> Self {
-		Self::with_trash(tx, Arc::new(SystemTrash))
+		Self::configured(tx, crate::config::Config::default().tasks)
 	}
 
+	pub fn configured(tx: UnboundedSender<Event>, config: TaskConfig) -> Self {
+		Self::with_trash_and_config(tx, Arc::new(SystemTrash), config)
+	}
+
+	#[cfg(test)]
 	fn with_trash(tx: UnboundedSender<Event>, trash: Arc<dyn TrashBackend>) -> Self {
-		Self { visible: false, cursor: 0, tasks: Vec::new(), next_id: 0, tx, permits: Arc::new(Semaphore::new(2)), reserved_targets: HashSet::new(), trash }
+		Self::with_trash_and_config(tx, trash, crate::config::Config::default().tasks)
 	}
 
+	fn with_trash_and_config(tx: UnboundedSender<Event>, trash: Arc<dyn TrashBackend>, config: TaskConfig) -> Self {
+		Self { visible: false, cursor: 0, tasks: Vec::new(), next_id: 0, tx, permits: Arc::new(Semaphore::new(config.workers)), reserved_targets: HashSet::new(), trash, config }
+	}
+
+	#[cfg(test)]
 	pub fn enqueue(&mut self, sources: Vec<PathBuf>, target_dir: PathBuf, cut: bool, tab: usize) {
+		self.enqueue_with_policy(sources, target_dir, cut, tab, ConflictPolicy::Rename);
+	}
+
+	pub fn enqueue_with_policy(&mut self, sources: Vec<PathBuf>, target_dir: PathBuf, cut: bool, tab: usize, policy: ConflictPolicy) -> usize {
+		if policy == ConflictPolicy::Error {
+			let conflicts = sources.iter().filter_map(|source| source.file_name()).map(|name| target_dir.join(name)).filter(|target| target.exists() || self.reserved_targets.contains(target)).count();
+			if conflicts > 0 { return conflicts; }
+		}
 		let dependencies = dependency_channels(&sources, cut);
 		for (source, (dependency, waits)) in sources.into_iter().zip(dependencies) {
 			let Some(name) = source.file_name() else { continue };
-			let target = unique_dest_avoiding(&target_dir, name, |path| self.reserved_targets.contains(path));
+			let direct = target_dir.join(name);
+			let target = match policy {
+				ConflictPolicy::Rename => unique_dest_avoiding(&target_dir, name, |path| self.reserved_targets.contains(path)),
+				ConflictPolicy::Error => direct,
+			};
 			self.reserved_targets.insert(target.clone());
 			let id = self.next_id;
 			self.next_id += 1;
@@ -118,12 +142,14 @@ impl TaskManager {
 				bytes_total: 0, bytes_done: 0, error: None, cancel, handle: Some(handle), reserved_target: Some(target), dependency,
 			});
 		}
+		0
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	fn spawn(&self, id: TaskId, tab: usize, source: PathBuf, target: PathBuf, refresh_dir: PathBuf, cut: bool, cancel: Arc<AtomicBool>, waits: Vec<watch::Receiver<DependencyState>>) -> JoinHandle<()> {
 		let tx = self.tx.clone();
 		let permits = self.permits.clone();
+		let config = self.config.clone();
 		tokio::spawn(async move {
 			if !wait_dependencies(id, waits, &tx).await { return }
 			let Ok(_permit) = permits.acquire_owned().await else { return };
@@ -134,7 +160,7 @@ impl TaskManager {
 			let _ = tx.send(Event::Task(TaskEvent::Scanning(id)));
 			let worker_tx = tx.clone();
 			let finish_target = refresh_dir;
-			let outcome = outcome(tokio::task::spawn_blocking(move || run_task(id, &source, &target, cut, &cancel, &worker_tx)).await, true);
+			let outcome = outcome(tokio::task::spawn_blocking(move || run_task(id, &source, &target, cut, &cancel, &worker_tx, &config)).await, true);
 			let _ = tx.send(Event::Task(TaskEvent::Finished { id, tab, subject: finish_target, outcome }));
 		})
 	}
@@ -200,6 +226,7 @@ impl TaskManager {
 	fn spawn_delete(&self, id: TaskId, tab: usize, source: PathBuf, cancel: Arc<AtomicBool>, waits: Vec<watch::Receiver<DependencyState>>) -> JoinHandle<()> {
 		let tx = self.tx.clone();
 		let permits = self.permits.clone();
+		let progress_interval = Duration::from_millis(self.config.progress_interval_ms);
 		tokio::spawn(async move {
 			if !wait_dependencies(id, waits, &tx).await { return }
 			let Ok(_permit) = permits.acquire_owned().await else { return };
@@ -210,7 +237,7 @@ impl TaskManager {
 			let _ = tx.send(Event::Task(TaskEvent::Scanning(id)));
 			let worker_tx = tx.clone();
 			let finish_subject = source.clone();
-			let outcome = outcome(tokio::task::spawn_blocking(move || run_delete(id, &source, &cancel, &worker_tx)).await, true);
+			let outcome = outcome(tokio::task::spawn_blocking(move || run_delete(id, &source, &cancel, &worker_tx, progress_interval)).await, true);
 			let _ = tx.send(Event::Task(TaskEvent::Finished { id, tab, subject: finish_subject, outcome }));
 		})
 	}
@@ -332,15 +359,15 @@ async fn wait_dependencies(id: TaskId, waits: Vec<watch::Receiver<DependencyStat
 	true
 }
 
-fn run_task(id: TaskId, source: &Path, target: &Path, cut: bool, cancel: &AtomicBool, tx: &UnboundedSender<Event>) -> io::Result<()> {
+fn run_task(id: TaskId, source: &Path, target: &Path, cut: bool, cancel: &AtomicBool, tx: &UnboundedSender<Event>, config: &TaskConfig) -> io::Result<()> {
 	let (files, bytes) = scan(source, cancel)?;
 	let _ = tx.send(Event::Task(TaskEvent::Started { id, files, bytes }));
-	let mut progress = Counters::default();
+	let mut progress = Counters::new(Duration::from_millis(config.progress_interval_ms));
 	if cut && fs::rename(source, target).is_ok() {
 		let _ = tx.send(Event::Task(TaskEvent::Progress { id, files, bytes }));
 		return Ok(())
 	}
-	copy_entry(id, source, target, cancel, tx, &mut progress)?;
+	copy_entry(id, source, target, cancel, tx, &mut progress, config.copy_buffer_size)?;
 	if cut {
 		if canceled(cancel) { return Err(io::Error::new(io::ErrorKind::Interrupted, "Canceled")) }
 		remove(source)?;
@@ -372,15 +399,17 @@ fn scan(path: &Path, cancel: &AtomicBool) -> io::Result<(u64, u64)> {
 	} else { Ok((1, meta.len())) }
 }
 
-#[derive(Default)]
 struct Counters {
 	files:     u64,
 	bytes:     u64,
 	last_emit: Option<Instant>,
+	emit_interval: Duration,
 }
 
 impl Counters {
-	/// Throttled to at most once per 75ms — including per-file completions,
+	fn new(emit_interval: Duration) -> Self { Self { files: 0, bytes: 0, last_emit: None, emit_interval } }
+
+	/// Throttled to the configured interval — including per-file completions,
 	/// not just the byte-level updates within one file. Without that, a
 	/// task over many small files would emit (and force a full redraw)
 	/// once per file, scaling UI cost with file *count* for no benefit:
@@ -388,7 +417,7 @@ impl Counters {
 	/// single file or just sampled a few times a second.
 	fn emit(&mut self, id: TaskId, tx: &UnboundedSender<Event>) {
 		let now = Instant::now();
-		if self.last_emit.is_some_and(|last| now.duration_since(last) < Duration::from_millis(75)) {
+		if self.last_emit.is_some_and(|last| now.duration_since(last) < self.emit_interval) {
 			return;
 		}
 		self.last_emit = Some(now);
@@ -396,7 +425,7 @@ impl Counters {
 	}
 }
 
-fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx: &UnboundedSender<Event>, progress: &mut Counters) -> io::Result<()> {
+fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx: &UnboundedSender<Event>, progress: &mut Counters, copy_buffer_size: usize) -> io::Result<()> {
 	check(cancel)?;
 	let meta = fs::symlink_metadata(source)?;
 	if meta.file_type().is_symlink() {
@@ -409,7 +438,7 @@ fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx:
 		fs::create_dir_all(target)?;
 		for entry in fs::read_dir(source)? {
 			let entry = entry?;
-			copy_entry(id, &entry.path(), &target.join(entry.file_name()), cancel, tx, progress)?;
+			copy_entry(id, &entry.path(), &target.join(entry.file_name()), cancel, tx, progress, copy_buffer_size)?;
 		}
 		return Ok(())
 	}
@@ -422,7 +451,7 @@ fn copy_entry(id: TaskId, source: &Path, target: &Path, cancel: &AtomicBool, tx:
 	let result = (|| {
 		let mut input = fs::File::open(source)?;
 		let mut output = fs::File::create(&temporary)?;
-		let mut buffer = vec![0; 512 * 1024];
+		let mut buffer = vec![0; copy_buffer_size];
 		loop {
 			check(cancel)?;
 			let read = input.read(&mut buffer)?;
@@ -454,10 +483,10 @@ fn copy_symlink(source: &Path, target: &Path) -> io::Result<()> {
 	else { std::os::windows::fs::symlink_file(link, target) }
 }
 
-fn run_delete(id: TaskId, path: &Path, cancel: &AtomicBool, tx: &UnboundedSender<Event>) -> io::Result<()> {
+fn run_delete(id: TaskId, path: &Path, cancel: &AtomicBool, tx: &UnboundedSender<Event>, progress_interval: Duration) -> io::Result<()> {
 	let (files, _) = scan(path, cancel)?;
 	let _ = tx.send(Event::Task(TaskEvent::Started { id, files, bytes: 0 }));
-	let mut progress = Counters::default();
+	let mut progress = Counters::new(progress_interval);
 	delete_entry(id, path, cancel, tx, &mut progress)
 }
 
@@ -596,6 +625,23 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn error_conflict_policy_rejects_the_paste_as_one_batch() {
+		let root = std::env::temp_dir().join(format!("tuzi-task-conflict-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::create_dir_all(root.join("dst")).unwrap();
+		fs::write(root.join("src/a"), b"new").unwrap();
+		fs::write(root.join("dst/a"), b"old").unwrap();
+		let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+		let mut manager = TaskManager::new(tx);
+		let conflicts = manager.enqueue_with_policy(vec![root.join("src/a")], root.join("dst"), false, 0, ConflictPolicy::Error);
+		assert_eq!(conflicts, 1);
+		assert!(manager.tasks.is_empty());
+		assert_eq!(fs::read(root.join("dst/a")).unwrap(), b"old");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn enqueue_delete_removes_a_directory_tree_permanently() {
 		let root = std::env::temp_dir().join(format!("tuzi-task-delete-{}", std::process::id()));
 		let _ = fs::remove_dir_all(&root);
@@ -698,8 +744,9 @@ mod tests {
 		fs::write(root.join("real"), b"data").unwrap();
 		std::os::unix::fs::symlink("real", root.join("link")).unwrap();
 		let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-		let mut counters = Counters::default();
-		copy_entry(1, &root.join("link"), &root.join("copy"), &AtomicBool::new(false), &tx, &mut counters).unwrap();
+		let config = crate::config::Config::default().tasks;
+		let mut counters = Counters::new(Duration::from_millis(config.progress_interval_ms));
+		copy_entry(1, &root.join("link"), &root.join("copy"), &AtomicBool::new(false), &tx, &mut counters, config.copy_buffer_size).unwrap();
 		assert_eq!(fs::read_link(root.join("copy")).unwrap(), PathBuf::from("real"));
 		fs::remove_dir_all(root).unwrap();
 	}

@@ -1,7 +1,7 @@
 use ratatui::{
 	Frame,
 	layout::Rect,
-	style::{Color, Modifier, Style},
+	style::{Modifier, Style},
 	text::{Line, Span},
 	widgets::{List, ListItem, ListState},
 };
@@ -11,6 +11,7 @@ use crate::{
 	core::{Filter, Node, Selection, Visual},
 	finder::Finder,
 	icon::{Icon, IconTheme},
+	theme::Theme,
 };
 
 pub struct TreeView;
@@ -24,6 +25,7 @@ pub struct TreeViewState<'a> {
 	pub clipboard_cut: bool,
 	pub column_mode: ColumnMode,
 	pub icon_theme: &'a IconTheme,
+	pub theme: &'a Theme,
 	pub finder: Option<&'a Finder>,
 	pub filter: Option<&'a Filter>,
 	/// The tab's persisted scroll offset — read to seed this frame's list,
@@ -48,59 +50,58 @@ impl TreeView {
 				let (lo, hi) = visual.range(state.cursor);
 				(lo..=hi).contains(&index).then_some(!visual.unset)
 			});
-			let marker_style = marker_style(visual_preview, state.selection.contains(&node.path), state.clipboard.contains(&node.path), state.clipboard_cut);
+			let marker_style = marker_style(visual_preview, state.selection.contains(&node.path), state.clipboard.contains(&node.path), state.clipboard_cut, state.theme);
 			// A load failure is a standing problem with this node, not a
 			// transient toast, so it's pinned to the row itself — checked
 			// ahead of the loading indicator since a collapsed, failed node
 			// isn't "loading" anymore, just broken until retried.
 			let suffix = if let Some(error) = &node.load_error {
-				Some((format!(" (Error: {error})"), Style::new().fg(Color::Red)))
+				Some((format!(" (Error: {error})"), state.theme.style("mgr.error")))
 			} else if node.loading {
-				Some((" (loading…)".to_string(), Style::new().fg(Color::Gray)))
+				Some((" (loading…)".to_string(), state.theme.style("mgr.loading")))
 			} else if let Some(target) = &node.cha.link_target {
-				let color = if node.cha.link_broken { Color::Red } else { Color::Gray };
-				Some((format!(" -> {}", target.display()), Style::new().fg(color)))
+				Some((format!(" -> {}", target.display()), if node.cha.link_broken { state.theme.style("mgr.error") } else { state.theme.style("mgr.symlink") }))
 			} else {
 				None
 			};
-			let name_style = (node.cha.is_link && node.cha.link_broken).then(|| Style::new().fg(Color::Red));
+			let name_style = (node.cha.is_link && node.cha.link_broken).then(|| state.theme.style("mgr.error"));
 			// An active filter already decided this row belongs in the tree;
 			// highlighting why doubles as a hint once `find` isn't also
 			// pointing at the same name.
 			let matches = state.finder.map(|finder| finder.ranges(&name)).or_else(|| state.filter.map(|filter| filter.ranges(&name))).unwrap_or_default();
-			let line = row_line("  ".repeat(*depth), marker_style, icon, name, name_style, matches, suffix, state.column_mode.text(node), area.width as usize, is_cursor_row);
+			let line = row_line("  ".repeat(*depth), marker_style, icon, name, name_style, matches, suffix, state.column_mode.text(node), area.width as usize, is_cursor_row, state.theme);
 
 			ListItem::new(line)
 		});
 
-		let list = List::new(items).highlight_style(cursor_style(state.focused));
+		let list = List::new(items).highlight_style(cursor_style(state.focused, state.theme));
 		let selected = state.cursor.checked_sub(row_offset).filter(|index| *index < rows.len());
 		let mut list_state = ListState::default().with_selected(selected);
 		frame.render_stateful_widget(list, area, &mut list_state);
 	}
 }
 
-fn cursor_style(focused: bool) -> Style {
+fn cursor_style(focused: bool, theme: &Theme) -> Style {
 	if focused {
 		Style::new().add_modifier(Modifier::REVERSED)
 	} else {
 		// A concrete color for now; keeping it in this one style boundary
 		// makes it straightforward to source from the theme config later.
-		Style::new().bg(Color::Rgb(0x31, 0x32, 0x44))
+		theme.style("mgr.cursor_unfocused")
 	}
 }
 
-fn marker_style(visual_preview: Option<bool>, selected: bool, clipboard: bool, clipboard_cut: bool) -> Option<Style> {
+fn marker_style(visual_preview: Option<bool>, selected: bool, clipboard: bool, clipboard_cut: bool, theme: &Theme) -> Option<Style> {
 	match visual_preview {
 		// Match the SEL status segment and take precedence over an older
 		// yellow selection marker (or a clipboard marker) on the same row.
-		Some(true) => Some(Style::new().fg(Color::Cyan).bg(Color::Cyan)),
+		Some(true) => Some(theme.style("mgr.marker_visual")),
 		// Visual-unset previews the row with no marker, even if it was
 		// selected before entering the range.
 		Some(false) => None,
-		None if selected => Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
-		None if clipboard && clipboard_cut => Some(Style::new().fg(Color::LightRed).bg(Color::LightRed)),
-		None if clipboard => Some(Style::new().fg(Color::LightGreen).bg(Color::LightGreen)),
+		None if selected => Some(theme.style("mgr.marker_selected")),
+		None if clipboard && clipboard_cut => Some(theme.style("mgr.marker_cut")),
+		None if clipboard => Some(theme.style("mgr.marker_copy")),
 		None => None,
 	}
 }
@@ -124,7 +125,7 @@ pub(crate) fn viewport(len: usize, cursor: usize, scroll: usize, height: usize) 
 fn row_line(
 	indent: String,
 	marker: Option<Style>,
-	icon: Icon,
+	icon: Option<Icon>,
 	body: String,
 	name_style: Option<Style>,
 	matches: Vec<std::ops::Range<usize>>,
@@ -132,16 +133,19 @@ fn row_line(
 	right: Option<String>,
 	width: usize,
 	is_cursor_row: bool,
+	theme: &Theme,
 ) -> Line<'static> {
 	let right_width = right.as_deref().map_or(0, |text| Line::from(text).width());
 	if right_width >= width {
 		return Line::from(right.unwrap_or_default());
 	}
 	let left_limit = if right.is_some() { width - right_width - 1 } else { width };
-	let prefix_width = Line::from(indent.as_str()).width() + 4;
+	let icon_width = icon.as_ref().map_or(0, |icon| Line::from(icon.text.as_str()).width() + 1);
+	let prefix_width = Line::from(indent.as_str()).width() + 2 + icon_width;
 	if prefix_width > left_limit {
 		let suffix_text = suffix.map_or_else(String::new, |(text, _)| text);
-		return Line::from(truncate(format!("{indent}  {} {body}{suffix_text}", icon.text), left_limit));
+		let icon_text = icon.as_ref().map_or_else(String::new, |icon| format!("{} ", icon.text));
+		return Line::from(truncate(format!("{indent}  {icon_text}{body}{suffix_text}"), left_limit));
 	}
 	let available = left_limit - prefix_width;
 	let suffix = suffix.map(|(text, style)| (truncate(text, available), style));
@@ -150,8 +154,12 @@ fn row_line(
 	let left_width = prefix_width + Line::from(body.as_str()).width() + suffix_width;
 	let padding = right.as_ref().map_or(0, |_| width.saturating_sub(left_width + right_width));
 	let marker = marker.map_or_else(|| Span::raw(" "), |style| Span::styled("│", style));
-	let mut spans = vec![Span::raw(indent), marker, Span::raw(" "), Span::styled(icon.text.to_string(), icon.style), Span::raw(" ")];
-	spans.extend(highlight_matches(body, &matches, name_style.unwrap_or_default()));
+	let mut spans = vec![Span::raw(indent), marker, Span::raw(" ")];
+	if let Some(icon) = icon {
+		spans.push(Span::styled(icon.text, icon.style));
+		spans.push(Span::raw(" "));
+	}
+	spans.extend(highlight_matches(body, &matches, name_style.unwrap_or_default(), theme));
 	if let Some((text, style)) = suffix {
 		spans.push(Span::styled(text, style));
 	}
@@ -175,7 +183,7 @@ fn row_line(
 	Line::from(spans)
 }
 
-fn highlight_matches(body: String, matches: &[std::ops::Range<usize>], name_style: Style) -> Vec<Span<'static>> {
+fn highlight_matches(body: String, matches: &[std::ops::Range<usize>], name_style: Style, theme: &Theme) -> Vec<Span<'static>> {
 	let chars: Vec<char> = body.chars().collect();
 	if matches.is_empty() {
 		return vec![Span::styled(body, name_style)];
@@ -191,7 +199,7 @@ fn highlight_matches(body: String, matches: &[std::ops::Range<usize>], name_styl
 		}
 		let text: String = chars[start..end].iter().collect();
 		if styled {
-			spans.push(Span::styled(text, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)));
+			spans.push(Span::styled(text, theme.style("mgr.find_match")));
 		} else {
 			spans.push(Span::styled(text, name_style));
 		}
@@ -227,11 +235,13 @@ mod tests {
 
 	use super::{cursor_style, highlight_matches, marker_style, row_line, viewport};
 	use crate::icon::Icon;
+	use crate::theme::Theme;
 
 	#[test]
 	fn unfocused_cursor_mutes_only_the_background() {
-		let focused = cursor_style(true);
-		let unfocused = cursor_style(false);
+		let theme = Theme::default();
+		let focused = cursor_style(true, &theme);
+		let unfocused = cursor_style(false, &theme);
 		assert!(focused.add_modifier.contains(Modifier::REVERSED));
 		assert_eq!(unfocused.bg, Some(Color::Rgb(0x31, 0x32, 0x44)));
 		assert!(!unfocused.add_modifier.contains(Modifier::REVERSED));
@@ -241,28 +251,30 @@ mod tests {
 	#[test]
 	#[allow(clippy::single_range_in_vec_init, reason = "one highlighted range is exactly what's under test")]
 	fn broken_link_names_get_the_name_style_outside_any_matched_range() {
+		let theme = Theme::default();
 		let red = Style::new().fg(Color::Red);
-		let spans = highlight_matches("dangling".to_string(), &[], red);
+		let spans = highlight_matches("dangling".to_string(), &[], red, &theme);
 		assert_eq!(spans, vec![ratatui::text::Span::styled("dangling", red)]);
 
 		// A find/filter match still wins the highlight over the broken-link
 		// styling for the matched substring itself.
 		let matched_ranges = vec![0..3];
-		let spans = highlight_matches("dangling".to_string(), &matched_ranges, red);
+		let spans = highlight_matches("dangling".to_string(), &matched_ranges, red, &theme);
 		assert_eq!(spans[0].style, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED));
 		assert_eq!(spans[1].style, red, "the rest of the name keeps the broken-link color");
 	}
 
 	#[test]
 	fn cursor_row_strips_colors_from_everything_but_the_marker() {
+		let theme = Theme::default();
 		let marker = Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow));
 		let icon = Icon {
-			text: 'i',
+			text: "i".into(),
 			style: Style::new().fg(Color::Blue),
 		};
 		let suffix = Some((" -> target".to_string(), Style::new().fg(Color::Gray)));
 
-		let line = row_line(String::new(), marker, icon, "name".to_string(), None, Vec::new(), suffix, None, 80, true);
+		let line = row_line(String::new(), marker, Some(icon), "name".to_string(), None, Vec::new(), suffix, None, 80, true, &theme);
 
 		assert_eq!(
 			line.spans[1].style,
@@ -277,30 +289,32 @@ mod tests {
 
 	#[test]
 	fn a_non_cursor_row_keeps_its_own_colors() {
+		let theme = Theme::default();
 		let icon = Icon {
-			text: 'i',
+			text: "i".into(),
 			style: Style::new().fg(Color::Blue),
 		};
-		let line = row_line(String::new(), None, icon, "name".to_string(), None, Vec::new(), None, None, 80, false);
+		let line = row_line(String::new(), None, Some(icon), "name".to_string(), None, Vec::new(), None, None, 80, false, &theme);
 		assert_eq!(line.spans[3].style, Style::new().fg(Color::Blue));
 	}
 
 	#[test]
 	fn visual_marker_uses_sel_color_and_overrides_older_markers() {
+		let theme = Theme::default();
 		let cyan = Some(Style::new().fg(Color::Cyan).bg(Color::Cyan));
-		assert_eq!(marker_style(Some(true), true, true, true), cyan);
-		assert_eq!(marker_style(Some(false), true, true, true), None);
+		assert_eq!(marker_style(Some(true), true, true, true, &theme), cyan);
+		assert_eq!(marker_style(Some(false), true, true, true, &theme), None);
 		assert_eq!(
-			marker_style(None, true, true, true),
+			marker_style(None, true, true, true, &theme),
 			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
 			"a committed visual selection remains visible over an older cut marker"
 		);
 		assert_eq!(
-			marker_style(None, true, true, false),
+			marker_style(None, true, true, false, &theme),
 			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
 			"a committed visual selection remains visible over an older copy marker"
 		);
-		assert_eq!(marker_style(None, true, false, false), Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)));
+		assert_eq!(marker_style(None, true, false, false, &theme), Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)));
 	}
 
 	#[test]

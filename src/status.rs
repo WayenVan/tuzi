@@ -1,5 +1,7 @@
 use ratatui::style::{Color, Style};
 
+use crate::theme::Theme;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusMode {
 	Normal,
@@ -8,15 +10,11 @@ pub enum StatusMode {
 }
 
 impl StatusMode {
-	pub fn color(self) -> Color {
-		match self {
-			Self::Normal => Color::Rgb(0x89, 0xb4, 0xfa),
-			Self::Select => Color::Rgb(0x94, 0xe2, 0xd5),
-			Self::Unset => Color::Rgb(0xf2, 0xcd, 0xcd),
-		}
+	pub fn color(self, theme: &Theme) -> Color {
+		self.style(theme).bg.unwrap_or(Color::Reset)
 	}
 
-	pub const fn alt_background(self) -> Color { Color::Rgb(0x31, 0x32, 0x44) }
+	pub fn alt_background(self, theme: &Theme) -> Color { self.alt_style(theme).bg.unwrap_or(Color::Reset) }
 
 	pub fn label(self) -> &'static str {
 		match self {
@@ -26,22 +24,17 @@ impl StatusMode {
 		}
 	}
 
-	pub fn style(self) -> Style {
-		Style::new().fg(Color::Rgb(0x1e, 0x1e, 0x2e)).bg(self.color())
+	pub fn style(self, theme: &Theme) -> Style {
+		theme.style(match self { Self::Normal => "status.normal", Self::Select => "status.select", Self::Unset => "status.unset" })
 	}
 
-	pub fn alt_style(self) -> Style { Style::new().fg(self.color()).bg(self.alt_background()) }
+	pub fn alt_style(self, theme: &Theme) -> Style {
+		theme.style(match self { Self::Normal => "status.normal_alt", Self::Select => "status.select_alt", Self::Unset => "status.unset_alt" })
+	}
 }
 
-pub fn permission_style(character: char) -> Style {
-	let color = match character {
-		'-' | '?' => Color::Rgb(0x7f, 0x84, 0x9c),
-		'r' => Color::Rgb(0xf9, 0xe2, 0xaf),
-		'w' => Color::Rgb(0xf3, 0x8b, 0xa8),
-		'x' | 's' | 'S' | 't' | 'T' => Color::Rgb(0xa6, 0xe3, 0xa1),
-		_ => Color::Rgb(0x89, 0xb4, 0xfa),
-	};
-	Style::new().fg(color)
+pub fn permission_style(character: char, theme: &Theme) -> Style {
+	theme.style(match character { '-' | '?' => "status.perm_none", 'r' => "status.perm_read", 'w' => "status.perm_write", 'x' | 's' | 'S' | 't' | 'T' => "status.perm_exec", _ => "status.perm_type" })
 }
 
 pub struct StatusLine {
@@ -90,6 +83,7 @@ mod tests {
 	use ratatui::style::Color;
 
 	use super::{permission_style, position_labels};
+	use crate::theme::Theme;
 
 	#[test]
 	fn position_uses_vim_style_edge_labels_and_percentages() {
@@ -101,10 +95,11 @@ mod tests {
 
 	#[test]
 	fn permissions_use_the_mocha_yazi_palette() {
-		assert_eq!(permission_style('-').fg, Some(Color::Rgb(0x7f, 0x84, 0x9c)));
-		assert_eq!(permission_style('r').fg, Some(Color::Rgb(0xf9, 0xe2, 0xaf)));
-		assert_eq!(permission_style('w').fg, Some(Color::Rgb(0xf3, 0x8b, 0xa8)));
-		assert_eq!(permission_style('x').fg, Some(Color::Rgb(0xa6, 0xe3, 0xa1)));
-		assert_eq!(permission_style('d').fg, Some(Color::Rgb(0x89, 0xb4, 0xfa)));
+		let theme = Theme::default();
+		assert_eq!(permission_style('-', &theme).fg, Some(Color::Rgb(0x7f, 0x84, 0x9c)));
+		assert_eq!(permission_style('r', &theme).fg, Some(Color::Rgb(0xf9, 0xe2, 0xaf)));
+		assert_eq!(permission_style('w', &theme).fg, Some(Color::Rgb(0xf3, 0x8b, 0xa8)));
+		assert_eq!(permission_style('x', &theme).fg, Some(Color::Rgb(0xa6, 0xe3, 0xa1)));
+		assert_eq!(permission_style('d', &theme).fg, Some(Color::Rgb(0x89, 0xb4, 0xfa)));
 	}
 }

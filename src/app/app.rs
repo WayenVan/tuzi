@@ -1,25 +1,28 @@
-use std::{collections::VecDeque, io, path::{Path, PathBuf}};
+use std::{collections::VecDeque, io, path::{Path, PathBuf}, sync::Arc};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::{
-	action::{CopyKind, DeleteMode},
+	command::{CopyKind, DeleteMode},
+	config::Config,
 	event::Event,
 	icon::IconTheme,
-	keymap::{Key, KeyContext, Route, Router, WhichCandidate},
+	keymap::{Key, KeyContext, Keymap, Route, Router, WhichCandidate},
 	notice::{Notice, NoticeLevel},
 	opener::OpenPicker,
 	process::ProcessRequest,
 	scheduler::OpenScheduler,
 	tasks::{TaskEvent, TaskKind, TaskManager},
+	theme::Theme,
 	tui::TerminalSession,
 };
 
 use super::{Dispatcher, Tab};
 
 pub struct App {
+	pub(super) config: Arc<Config>,
 	pub tabs: Vec<Tab>,
 	pub active: usize,
 	pub quit: bool,
@@ -36,6 +39,7 @@ pub struct App {
 	pub(super) mouse: MouseState,
 	pub(super) which: Vec<WhichCandidate>,
 	pub(super) icon_theme: IconTheme,
+	pub(super) theme: Theme,
 	pub(super) open: OpenScheduler,
 	pub(super) open_picker: Option<OpenPicker>,
 	pub(super) processes: VecDeque<ProcessRequest>,
@@ -68,11 +72,13 @@ impl Default for MouseState {
 }
 
 impl App {
-	pub async fn serve(path: PathBuf) -> io::Result<()> {
+	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme) -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
+		let config = Arc::new(config);
 
-		let first = Tab::open(0, path, tx.clone())?;
+		let first = Tab::open_configured(0, path, tx.clone(), config.clone())?;
 		let mut app = Self {
+			config: config.clone(),
 			tabs: vec![first],
 			active: 0,
 			quit: false,
@@ -82,18 +88,19 @@ impl App {
 			clipboard_cut: false,
 			tree_rows: 0,
 			terminal_focused: true,
-			mouse: MouseState::default(),
+			mouse: MouseState { preview_percent: config.preview.ratio, ..MouseState::default() },
 			which: Vec::new(),
-			icon_theme: IconTheme,
+			icon_theme: IconTheme::new(theme.icon.clone()),
+			theme,
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
 			processes: VecDeque::new(),
-			tasks: TaskManager::new(tx.clone()),
+			tasks: TaskManager::configured(tx.clone(), config.tasks.clone()),
 			notices: Vec::new(),
 			tx,
 		};
 		let mut terminal = TerminalSession::start()?;
-		let mut router = Router::default();
+		let mut router = Router::new(keymap);
 
 		app.render(terminal.terminal())?;
 		loop {
@@ -151,6 +158,7 @@ impl App {
 	}
 
 	fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+		if !self.config.ui.mouse { return false; }
 		// Like Yazi, overlays own the input layer: do not let a click leak
 		// through to the manager underneath them.
 		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
@@ -304,20 +312,20 @@ impl App {
 			return true;
 		}
 		if self.active_tab().input.is_some() {
-			self.active_tab_mut().handle_input_key(key);
+			if let Some(command) = self.active_tab_mut().handle_input_key(key) { self.execute(command); }
 			return true;
 		}
 
 		match router.route(KeyContext::Manager, Key::from(key)) {
-			Route::Actions(actions) => {
+			Route::Commands(commands) => {
 				self.which.clear();
-				for action in actions {
-					Dispatcher::dispatch(self, action);
+				for command in commands {
+					self.execute(command);
 				}
 				true
 			}
 			Route::Pending(candidates) => {
-				self.which = candidates;
+				self.which = if self.config.ui.which_key { candidates } else { Vec::new() };
 				true
 			}
 			Route::Unmatched if self.which.is_empty() => false,
@@ -364,7 +372,7 @@ impl App {
 		let path = self.active_tab().tree.root.path.clone();
 		let id = self.next_tab_id;
 		self.next_tab_id += 1;
-		if let Ok(tab) = Tab::open(id, path, self.tx.clone()) {
+		if let Ok(tab) = Tab::open_configured(id, path, self.tx.clone(), self.config.clone()) {
 			self.tabs.push(tab);
 			self.active = id;
 		}
@@ -438,6 +446,16 @@ impl App {
 		self.clipboard_cut = cut;
 	}
 
+	pub fn request_delete(&mut self, mode: DeleteMode) {
+		let confirm = match mode {
+			DeleteMode::Trash => self.config.confirm.trash,
+			DeleteMode::Permanent => self.config.confirm.delete,
+		};
+		if let Some((targets, mode)) = self.active_tab_mut().delete_selected_configured(mode, confirm) {
+			self.enqueue_delete(targets, mode);
+		}
+	}
+
 	/// Pastes the shared clipboard into the active tab. A cut clipboard is
 	/// consumed on the first successful paste; a copy can be pasted again.
 	pub fn paste(&mut self) {
@@ -450,8 +468,9 @@ impl App {
 		let Some(target) = self.active_tab().paste_destination() else {
 			return;
 		};
-		self.tasks.enqueue(paths, target, cut, tab);
-		if cut {
+		let conflicts = self.tasks.enqueue_with_policy(paths, target, cut, tab, self.config.fs.paste_conflict);
+		if conflicts > 0 { self.active_tab_mut().raise(NoticeLevel::Warn, format!("Skipped {conflicts} conflicting paste target(s)")); }
+		if cut && conflicts == 0 {
 			self.clipboard.clear();
 			self.clipboard_cut = false;
 		}
@@ -521,7 +540,12 @@ impl App {
 	/// notices `prune_notices` dropped it, even if nothing else happens in
 	/// the meantime.
 	pub fn push_notice(&mut self, level: NoticeLevel, message: impl Into<String>) {
-		let notice = Notice::new(level, message);
+		let seconds = match level {
+			NoticeLevel::Info => self.config.notify.info_timeout,
+			NoticeLevel::Warn => self.config.notify.warn_timeout,
+			NoticeLevel::Error => self.config.notify.error_timeout,
+		};
+		let notice = Notice::new(level, message, std::time::Duration::from_secs(seconds));
 		let wakeup = notice.remaining();
 		self.notices.push(notice);
 
@@ -555,8 +579,9 @@ fn contains(area: Rect, (x, y): (u16, u16)) -> bool {
 #[cfg(test)]
 mod tests {
 	use std::{fs, path::Path};
+	use crossterm::event::KeyEvent;
 
-	use crate::{action::Action, column_mode::ColumnMode};
+	use crate::{command::Command, column_mode::ColumnMode};
 
 	use super::*;
 
@@ -564,6 +589,7 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
+			config: Arc::new(Config::default()),
 			tabs: vec![first],
 			active: 0,
 			quit: false,
@@ -575,7 +601,8 @@ mod tests {
 			terminal_focused: true,
 			mouse: MouseState::default(),
 			which: Vec::new(),
-			icon_theme: IconTheme,
+			icon_theme: IconTheme::default(),
+			theme: Theme::default(),
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
 			processes: VecDeque::new(),
@@ -623,6 +650,23 @@ mod tests {
 		assert!(app.handle_event(Event::Term(crossterm::event::Event::FocusGained), &mut router));
 		assert!(app.terminal_focused);
 
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn disabled_mouse_and_which_key_do_not_expose_ui_overlays() {
+		let root = std::env::temp_dir().join("tuzi-app-test-disabled-ui-input");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let config = Arc::make_mut(&mut app.config);
+		config.ui.mouse = false;
+		config.ui.which_key = false;
+		assert!(!app.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0)));
+
+		let mut router = Router::default();
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &mut router));
+		assert!(app.which.is_empty());
 		fs::remove_dir_all(root).unwrap();
 	}
 
@@ -828,7 +872,7 @@ mod tests {
 		// Cursor starts on the tab's own tree root, so this is refused
 		// outright — Tab queues the refusal, and an ordinary dispatch (not
 		// a manual drain) is what's supposed to turn it into a toast.
-		Dispatcher::dispatch(&mut app, Action::Delete);
+		app.execute(Command::Delete);
 
 		assert!(app.active_tab().pending_delete.is_none(), "nothing was armed to confirm");
 		assert_eq!(app.notices.len(), 1);
@@ -979,11 +1023,11 @@ mod tests {
 		let root = root.canonicalize().unwrap();
 
 		let (mut app, _rx) = app(&root).await;
-		Dispatcher::dispatch(&mut app, Action::SetColumnMode(ColumnMode::Size));
+		app.execute(Command::SetColumnMode(ColumnMode::Size));
 		app.new_tab();
 		assert_eq!(app.active_tab().column_mode, ColumnMode::None, "new tabs start with the default mode");
 
-		Dispatcher::dispatch(&mut app, Action::SetColumnMode(ColumnMode::Permissions));
+		app.execute(Command::SetColumnMode(ColumnMode::Permissions));
 		app.switch_tab(-1);
 		assert_eq!(app.active_tab().column_mode, ColumnMode::Size);
 		app.switch_tab(1);
@@ -1000,13 +1044,71 @@ mod tests {
 
 		let (mut app, _rx) = app(&root).await;
 		assert!(!app.active_tab().preview.visible);
-		Dispatcher::dispatch(&mut app, Action::TogglePreview);
+		app.execute(Command::TogglePreview);
 		assert!(app.active_tab().preview.visible);
 
 		app.new_tab();
 		assert!(!app.active_tab().preview.visible, "new tabs hide preview by default");
 		app.switch_tab(-1);
 		assert!(app.active_tab().preview.visible, "each tab retains its own preview setting");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn command_prompt_executes_through_the_same_app_entry_point() {
+		let root = std::env::temp_dir().join("tuzi-app-test-command-prompt");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let mut router = Router::default();
+
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &mut router));
+		assert!(app.active_tab().input.is_some());
+		for ch in "preview toggle".chars() {
+			app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &mut router);
+		}
+		app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut router);
+		assert!(app.active_tab().preview.visible);
+		assert!(app.active_tab().input.is_none());
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn command_prompt_accepts_a_quoted_directory_path() {
+		let root = std::env::temp_dir().join("tuzi-app-test-command-path");
+		fs::create_dir_all(root.join("child path")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let mut router = Router::default();
+
+		app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &mut router);
+		for ch in "cd \"child path\"".chars() {
+			app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &mut router);
+		}
+		app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut router);
+		assert_eq!(app.active_tab().tree.root.path, root.join("child path"));
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn command_prompt_completes_like_the_directory_prompt() {
+		let root = std::env::temp_dir().join("tuzi-app-test-command-completion");
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		let mut router = Router::default();
+
+		app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &mut router);
+		for ch in "open --i".chars() {
+			app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &mut router);
+		}
+		pump(&mut app, &mut rx).await;
+		assert_eq!(app.active_tab().input.as_ref().unwrap().completion.as_ref().unwrap().candidates, ["open --interactive"]);
+		app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &mut router);
+		assert_eq!(app.active_tab().input.as_ref().unwrap().value(), "open --interactive");
 
 		fs::remove_dir_all(&root).unwrap();
 	}

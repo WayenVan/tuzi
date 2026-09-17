@@ -3,12 +3,7 @@ use std::{collections::VecDeque, fs::File, io::{BufRead, BufReader, Read}, path:
 use syntect_no_panic::{easy::{HighlightLines, HighlightOptions}, highlighting::{FontStyle, ThemeSet}, parsing::SyntaxSet};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{core::Node, event::Event, scheduler::PreviewScheduler};
-
-const MAX_SCAN_BYTES: usize = 5 * 1024 * 1024;
-const MAX_LINE_BYTES: usize = 16 * 1024;
-const CACHE_BYTES: usize = 16 * 1024 * 1024;
-const OVERSCAN_LINES: usize = 20;
+use crate::{config::Preview as PreviewConfig, core::Node, event::Event, scheduler::PreviewScheduler};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PreviewKey {
@@ -70,20 +65,29 @@ pub struct Preview {
 	scheduler:   PreviewScheduler,
 	cache:       VecDeque<(PreviewKey, Arc<PreviewData>, usize)>,
 	cache_bytes: usize,
+	config:      PreviewConfig,
 }
 
 impl Preview {
+	#[cfg(test)]
 	pub fn new(tab: usize, tx: UnboundedSender<Event>) -> Self {
+		let mut config = crate::config::Config::default().preview;
+		config.show = false;
+		Self::configured(tab, tx, config)
+	}
+
+	pub fn configured(tab: usize, tx: UnboundedSender<Event>, config: PreviewConfig) -> Self {
 		Self {
-			visible: false,
+			visible: config.show,
 			skip: 0,
 			width: 0,
 			height: 0,
 			state: PreviewState::Empty,
 			current: None,
-			scheduler: PreviewScheduler::new(tab, tx),
+			scheduler: PreviewScheduler::new(tab, tx, config.clone()),
 			cache: VecDeque::new(),
 			cache_bytes: 0,
+			config,
 		}
 	}
 
@@ -175,10 +179,10 @@ impl Preview {
 
 	fn cache_insert(&mut self, key: PreviewKey, data: Arc<PreviewData>) {
 		let bytes = data.lines.iter().flatten().map(|span| span.text.len()).sum();
-		if bytes > CACHE_BYTES {
+		if bytes > self.config.cache_bytes {
 			return;
 		}
-		while self.cache_bytes + bytes > CACHE_BYTES {
+		while self.cache_bytes + bytes > self.config.cache_bytes {
 			let Some((_, _, removed)) = self.cache.pop_front() else { break };
 			self.cache_bytes -= removed;
 		}
@@ -187,19 +191,19 @@ impl Preview {
 	}
 }
 
-pub(crate) fn read_text(key: &PreviewKey, guard: &AtomicU64, generation: u64) -> Result<PreviewData, String> {
+pub(crate) fn read_text(key: &PreviewKey, guard: &AtomicU64, generation: u64, config: &PreviewConfig) -> Result<PreviewData, String> {
 	let file = File::open(&key.path).map_err(|error| error.to_string())?;
 	// Bound the reader itself as well as the accounting below. `read_until`
 	// may otherwise allocate an entire pathological single-line file before
 	// we get a chance to reject it.
-	let mut reader = BufReader::new(file.take((MAX_SCAN_BYTES + 1) as u64));
+	let mut reader = BufReader::new(file.take((config.max_scan_bytes + 1) as u64));
 	let syntaxes = syntaxes();
 	let syntax = syntax_for(syntaxes, &key.path);
 	let themes = themes();
 	let theme = themes.themes.get("base16-ocean.dark").or_else(|| themes.themes.values().next()).ok_or("no syntax theme")?;
-	let mut highlighter = syntax.map(|syntax| HighlightLines::new(syntax, theme, HighlightOptions { ignore_errors: true }));
-	let mut lines = Vec::with_capacity(key.height as usize + OVERSCAN_LINES);
-	let limit = key.skip + key.height as usize + OVERSCAN_LINES;
+	let mut highlighter = config.syntax_highlight.then(|| syntax.map(|syntax| HighlightLines::new(syntax, theme, HighlightOptions { ignore_errors: true }))).flatten();
+	let mut lines = Vec::with_capacity(key.height as usize + config.overscan_lines);
+	let limit = key.skip + key.height as usize + config.overscan_lines;
 	let mut line_number = 0usize;
 	let mut scanned = 0usize;
 	let mut inspected = 0usize;
@@ -217,8 +221,8 @@ pub(crate) fn read_text(key: &PreviewKey, guard: &AtomicU64, generation: u64) ->
 			break;
 		}
 		scanned += count;
-		if scanned > MAX_SCAN_BYTES {
-			return Err("preview scan exceeded 5 MiB".into());
+		if scanned > config.max_scan_bytes {
+			return Err(format!("preview scan exceeded {} bytes", config.max_scan_bytes));
 		}
 		if inspected < 1024 {
 			let end = (1024 - inspected).min(buf.len());
@@ -229,7 +233,7 @@ pub(crate) fn read_text(key: &PreviewKey, guard: &AtomicU64, generation: u64) ->
 		}
 
 		let text = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_owned();
-		let spans = if text.len() > MAX_LINE_BYTES {
+		let spans = if text.len() > config.max_line_bytes {
 			highlighter = None;
 			vec![plain_span(text)]
 		} else if let Some(highlighter) = &mut highlighter {
@@ -281,12 +285,14 @@ mod tests {
 
 	use super::*;
 
+	fn config() -> PreviewConfig { crate::config::Config::default().preview }
+
 	#[test]
 	fn reads_only_the_requested_text_window() {
 		let path = std::env::temp_dir().join("tuzi-preview-window.txt");
 		fs::write(&path, "zero\none\ntwo\nthree\nfour\n").unwrap();
 		let key = PreviewKey { path: path.clone(), len: 24, modified: None, width: 40, height: 2, skip: 2 };
-		let data = read_text(&key, &AtomicU64::new(1), 1).unwrap();
+		let data = read_text(&key, &AtomicU64::new(1), 1, &config()).unwrap();
 		let text: Vec<String> = data.lines.iter().map(|line| line.iter().map(|span| span.text.as_str()).collect()).collect();
 		assert_eq!(&text[..2], ["two", "three"]);
 		fs::remove_file(path).unwrap();
@@ -297,7 +303,7 @@ mod tests {
 		let path = std::env::temp_dir().join("tuzi-preview-binary");
 		fs::write(&path, b"hello\0world").unwrap();
 		let key = PreviewKey { path: path.clone(), len: 11, modified: None, width: 40, height: 2, skip: 0 };
-		assert_eq!(read_text(&key, &AtomicU64::new(1), 1).unwrap_err(), "binary file");
+		assert_eq!(read_text(&key, &AtomicU64::new(1), 1, &config()).unwrap_err(), "binary file");
 		fs::remove_file(path).unwrap();
 	}
 
@@ -306,11 +312,46 @@ mod tests {
 		let path = std::env::temp_dir().join("tuzi-preview-empty");
 		fs::write(&path, []).unwrap();
 		let key = PreviewKey { path: path.clone(), len: 0, modified: None, width: 40, height: 2, skip: 0 };
-		let data = read_text(&key, &AtomicU64::new(1), 1).unwrap();
+		let data = read_text(&key, &AtomicU64::new(1), 1, &config()).unwrap();
 		assert!(data.lines.is_empty());
 		assert!(data.eof);
 		assert_eq!(data.max_skip, 0);
 		fs::remove_file(path).unwrap();
+	}
+
+	#[test]
+	fn scan_limit_stops_pathological_input() {
+		let path = std::env::temp_dir().join("tuzi-preview-scan-limit.txt");
+		fs::write(&path, vec![b'x'; 70 * 1024]).unwrap();
+		let key = PreviewKey { path: path.clone(), len: 70 * 1024, modified: None, width: 40, height: 2, skip: 0 };
+		let mut limits = config();
+		limits.max_scan_bytes = 64 * 1024;
+		let error = read_text(&key, &AtomicU64::new(1), 1, &limits).unwrap_err();
+		assert_eq!(error, "preview scan exceeded 65536 bytes");
+		fs::remove_file(path).unwrap();
+	}
+
+	#[test]
+	fn syntax_highlight_can_be_disabled() {
+		let path = std::env::temp_dir().join("tuzi-preview-plain.rs");
+		fs::write(&path, "fn main() {}\n").unwrap();
+		let key = PreviewKey { path: path.clone(), len: 13, modified: None, width: 40, height: 2, skip: 0 };
+		let mut limits = config();
+		limits.syntax_highlight = false;
+		let data = read_text(&key, &AtomicU64::new(1), 1, &limits).unwrap();
+		assert!(data.lines.iter().flatten().all(|span| span.foreground.is_none()));
+		fs::remove_file(path).unwrap();
+	}
+
+	#[test]
+	fn zero_cache_capacity_keeps_no_entries() {
+		let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+		let mut limits = config();
+		limits.cache_bytes = 0;
+		let mut preview = Preview::configured(0, tx, limits);
+		let key = PreviewKey { path: PathBuf::from("uncached.txt"), len: 4, modified: None, width: 40, height: 10, skip: 0 };
+		preview.cache_insert(key, Arc::new(PreviewData { lines: vec![vec![plain_span("text".into())]], eof: true, max_skip: 0 }));
+		assert!(preview.cache.is_empty());
 	}
 
 	#[test]

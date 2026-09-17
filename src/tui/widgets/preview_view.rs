@@ -6,16 +6,16 @@ use ratatui::{
 	widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::{core::Node, fs::format_size, preview::PreviewState};
+use crate::{core::Node, fs::format_size, preview::PreviewState, theme::Theme};
 
 pub struct PreviewView;
 
 impl PreviewView {
-	pub fn render(frame: &mut Frame, area: Rect, node: Option<&Node>, state: &PreviewState, skip: usize) {
-		let block = Block::new().borders(Borders::LEFT).title(" Preview ").title_style(Style::new().fg(Color::Cyan));
+	pub fn render(frame: &mut Frame, area: Rect, node: Option<&Node>, state: &PreviewState, skip: usize, theme: &Theme) {
+		let block = Block::new().borders(Borders::LEFT).title(" Preview ").title_style(theme.style("preview.border"));
 		let lines = match node {
 			Some(node) if node.cha.is_dir => directory_lines(node),
-			Some(_) => text_lines(state),
+			Some(_) => text_lines(state, theme),
 			None => Vec::new(),
 		};
 		frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }).scroll((0, 0)), area);
@@ -63,11 +63,11 @@ fn directory_lines(node: &Node) -> Vec<Line<'static>> {
 	lines
 }
 
-fn text_lines(state: &PreviewState) -> Vec<Line<'static>> {
+fn text_lines(state: &PreviewState, theme: &Theme) -> Vec<Line<'static>> {
 	match state {
 		PreviewState::Empty => Vec::new(),
 		PreviewState::Loading => vec![Line::from("Loading…")],
-		PreviewState::Error(error) => vec![Line::from(Span::styled(error.clone(), Style::new().fg(Color::Red)))],
+		PreviewState::Error(error) => vec![Line::from(Span::styled(error.clone(), theme.style("preview.error")))],
 		PreviewState::Ready(data) if data.lines.is_empty() && data.eof => {
 			vec![Line::from("Empty file")]
 		}

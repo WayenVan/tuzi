@@ -1,6 +1,6 @@
-use ratatui::{Frame, layout::{Alignment, Rect}, style::{Color, Style}, widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap}};
+use ratatui::{Frame, layout::{Alignment, Rect}, widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap}};
 
-use crate::notice::{Notice, NoticeLevel};
+use crate::{notice::{Notice, NoticeLevel}, theme::Theme};
 
 /// Stacks the most recent toasts in the top-right corner. No slide-in/out
 /// animation — a notice is either on screen or it's been pruned; `App`
@@ -8,7 +8,7 @@ use crate::notice::{Notice, NoticeLevel};
 pub struct Toast;
 
 impl Toast {
-	pub fn render(frame: &mut Frame, area: Rect, notices: &[Notice]) {
+	pub fn render(frame: &mut Frame, area: Rect, notices: &[Notice], theme: &Theme) {
 		if notices.is_empty() || area.width < 8 {
 			return;
 		}
@@ -22,21 +22,21 @@ impl Toast {
 				break;
 			}
 			let rect = Rect::new(area.right().saturating_sub(width), y, width, height);
-			let (color, title) = match notice.level {
-				NoticeLevel::Info => (Color::Cyan, " Info "),
-				NoticeLevel::Warn => (Color::Yellow, " Warning "),
-				NoticeLevel::Error => (Color::Red, " Error "),
+			let (style, title) = match notice.level {
+				NoticeLevel::Info => (theme.style("notify.info"), " Info "),
+				NoticeLevel::Warn => (theme.style("notify.warn"), " Warning "),
+				NoticeLevel::Error => (theme.style("notify.error"), " Error "),
 			};
 
 			frame.render_widget(Clear, rect);
 			let block = Block::new()
 				.borders(Borders::ALL)
 				.border_type(BorderType::Rounded)
-				.border_style(Style::new().fg(color))
+				.border_style(style)
 				.title(title)
 				.title_alignment(Alignment::Center);
 			frame.render_widget(
-				Paragraph::new(notice.message.as_str()).wrap(Wrap { trim: true }).style(Style::new().fg(color)).block(block),
+				Paragraph::new(notice.message.as_str()).wrap(Wrap { trim: true }).style(style).block(block),
 				rect,
 			);
 

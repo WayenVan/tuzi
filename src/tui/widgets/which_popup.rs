@@ -1,11 +1,11 @@
-use ratatui::{Frame, layout::{Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, BorderType, Borders, Clear, Paragraph}};
+use ratatui::{Frame, layout::{Constraint, Direction, Layout, Rect}, text::{Line, Span}, widgets::{Block, BorderType, Borders, Clear, Paragraph}};
 
-use crate::keymap::WhichCandidate;
+use crate::{keymap::WhichCandidate, theme::Theme};
 
 pub struct WhichPopup;
 
 impl WhichPopup {
-	pub fn render(frame: &mut Frame, area: Rect, candidates: &[WhichCandidate]) {
+	pub fn render(frame: &mut Frame, area: Rect, candidates: &[WhichCandidate], theme: &Theme) {
 		if candidates.is_empty() || area.width < 4 || area.height < 3 {
 			return;
 		}
@@ -22,7 +22,7 @@ impl WhichPopup {
 		let block = Block::new()
 			.borders(Borders::ALL)
 			.border_type(BorderType::Rounded)
-			.border_style(Style::new().fg(Color::Blue));
+			.border_style(theme.style("popup.border"));
 		let inner = block.inner(popup);
 		frame.render_widget(block, popup);
 
@@ -36,9 +36,9 @@ impl WhichPopup {
 			}
 			let keys = candidate.keys.iter().map(ToString::to_string).collect::<String>();
 			let line = Line::from(vec![
-				Span::styled(format!("{keys:>8}"), Style::new().fg(Color::LightCyan).add_modifier(Modifier::BOLD)),
-				Span::styled(" → ", Style::new().fg(Color::DarkGray)),
-				Span::styled(candidate.description.clone(), Style::new().fg(Color::LightMagenta)),
+				Span::styled(format!("{keys:>8}"), theme.style("which.key")),
+				Span::styled(" → ", theme.style("which.separator")),
+				Span::styled(candidate.description.clone(), theme.style("which.description")),
 			]);
 			let cell = Rect { y: inner.y + row as u16, height: 1, ..chunks[column] };
 			frame.render_widget(Paragraph::new(line), cell);

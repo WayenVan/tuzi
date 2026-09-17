@@ -13,6 +13,8 @@ infer = "0.22.0"
 mime_guess = "2.0.5"
 notify = "8.2.0"
 ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
 syntect-no-panic = "6.0.0"
 tokio = { version = "1.53.1", features = ["io-util", "rt-multi-thread", "macros", "process", "sync", "time"] }
+toml = "1.1.4"
 trash = "5.2.9"

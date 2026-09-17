@@ -1,7 +1,7 @@
 use std::{cell::Cell, io};
 
 use edtui::EditorMode;
-use ratatui::{layout::{Constraint, Direction, Layout}, style::{Color, Modifier, Style}};
+use ratatui::{layout::{Constraint, Direction, Layout}, style::{Modifier, Style}};
 
 use crate::{event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
@@ -15,6 +15,9 @@ impl App {
 		let redraw_tx = self.tx.clone();
 		let which = self.which.clone();
 		let icon_theme = &self.icon_theme;
+		let theme = &self.theme;
+		let popup_width = self.config.ui.popup_width;
+		let completion_max_items = self.config.ui.completion_max_items;
 		let cwd = self.active_tab().tree.root.path.clone();
 		let labels = self.tab_labels();
 		let preview_percent = self.mouse.preview_percent;
@@ -51,18 +54,18 @@ impl App {
 		// here — `StatusBar` itself just lays these two lists out. Adding a
 		// clock, a git branch, anything else later is just pushing another
 		// `Segment` into whichever of these two it belongs in.
-		let mode_edge = Style::new().fg(status.mode.color());
-		let mode_fill = status.mode.style().add_modifier(Modifier::BOLD);
-		let alt_fill = status.mode.alt_style();
+		let mode_edge = Style::new().fg(status.mode.color(theme));
+		let mode_fill = status.mode.style(theme).add_modifier(Modifier::BOLD);
+		let alt_fill = status.mode.alt_style(theme);
 		let mut status_left = vec![
 			Segment::new("", mode_edge),
 			Segment::new(format!(" {} ", status.mode.label()), mode_fill),
-			Segment::new("", Style::new().fg(status.mode.color()).bg(status.mode.alt_background())),
+			Segment::new("", Style::new().fg(status.mode.color(theme)).bg(status.mode.alt_background(theme))),
 			Segment::new(format!(" {} ", status.size), alt_fill),
-			Segment::new("", Style::new().fg(status.mode.alt_background())),
+			Segment::new("", Style::new().fg(status.mode.alt_background(theme))),
 		];
 		if let Some(error) = &status.error {
-			status_left.push(Segment::new(format!(" {error}"), Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)));
+			status_left.push(Segment::new(format!(" {error}"), theme.style("mgr.error").add_modifier(Modifier::BOLD)));
 		} else if !status.name.is_empty() {
 			status_left.push(Segment::new(format!(" {}", status.name), Style::new()));
 		}
@@ -70,16 +73,16 @@ impl App {
 		if let Some((count, percent)) = self.tasks.summary() {
 			status_right.push(Segment::new(
 				format!(" {percent:3.0}% · {count} tasks "),
-				Style::new().fg(Color::Rgb(0xa6, 0xe3, 0xa1)).bg(Color::Rgb(0x45, 0x47, 0x5a)),
+				theme.style("status.task"),
 			));
 		}
 		for character in status.permissions.chars() {
-			status_right.push(Segment::new(character.to_string(), permission_style(character)));
+			status_right.push(Segment::new(character.to_string(), permission_style(character, theme)));
 		}
 		let (position_percent, position_count) = position_labels(tab.cursor, visible_len);
-		status_right.push(Segment::new(" ", Style::new().fg(status.mode.alt_background())));
+		status_right.push(Segment::new(" ", Style::new().fg(status.mode.alt_background(theme))));
 		status_right.push(Segment::new(format!(" {position_percent} "), alt_fill));
-		status_right.push(Segment::new("", Style::new().fg(status.mode.color()).bg(status.mode.alt_background())));
+		status_right.push(Segment::new("", Style::new().fg(status.mode.color(theme)).bg(status.mode.alt_background(theme))));
 		status_right.push(Segment::new(format!(" {position_count} "), mode_fill));
 		status_right.push(Segment::new("", mode_edge));
 
@@ -102,8 +105,8 @@ impl App {
 			geometry.set(MouseState { tabs: tab_area, body: body_area, tree: tree_area, preview: preview_area, tree_row_offset: range.start, ..geometry.get() });
 			let rows = tab.visible_range(range.clone());
 
-			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query, badge: clipboard_badge });
-			TabBar::render(frame, tab_area, &labels);
+			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query, badge: clipboard_badge }, theme);
+			TabBar::render(frame, tab_area, &labels, theme);
 			TreeView::render(
 				frame,
 				tree_area,
@@ -118,6 +121,7 @@ impl App {
 					clipboard_cut: self.clipboard_cut,
 					column_mode,
 					icon_theme,
+					theme,
 					finder: tab.finder.as_ref(),
 					filter: tab.filter.as_ref(),
 					scroll: &mut scroll,
@@ -125,28 +129,28 @@ impl App {
 			);
 			if let Some(area) = preview_area {
 				preview_size.set((area.width.saturating_sub(1), area.height));
-				PreviewView::render(frame, area, selected_node, &tab.preview.state, tab.preview.skip);
+				PreviewView::render(frame, area, selected_node, &tab.preview.state, tab.preview.skip, theme);
 			}
 			StatusBar::render(frame, status_area, &status_left, &status_right);
-			WhichPopup::render(frame, frame.area(), &which);
+			WhichPopup::render(frame, frame.area(), &which, theme);
 			if let Some(picker) = &self.open_picker {
-				OpenPopup::render(frame, frame.area(), picker);
+				OpenPopup::render(frame, frame.area(), picker, theme, popup_width);
 			}
 			if let Some((targets, mode)) = &pending_delete {
-				ConfirmPopup::render_delete(frame, frame.area(), targets, *mode);
+				ConfirmPopup::render_delete(frame, frame.area(), targets, *mode, theme, popup_width);
 			}
 			if pending_quit {
-				ConfirmPopup::render_quit(frame, frame.area(), running);
+				ConfirmPopup::render_quit(frame, frame.area(), running, theme, popup_width);
 			}
 			if let Some(input) = &mut input {
-				let (x, y, rect) = Prompt::render(frame, frame.area(), input.title(), &mut input.state);
+				let (x, y, rect) = Prompt::render(frame, frame.area(), input.title(), &mut input.state, theme, popup_width);
 				if let Some(completion) = &input.completion {
-					CompletionPopup::render(frame, frame.area(), rect, &completion.candidates, completion.selected);
+					CompletionPopup::render(frame, frame.area(), rect, &completion.candidates, completion.selected, completion.command, completion_max_items);
 				}
 				frame.set_cursor_position((x, y));
 			}
-			if task_visible { TaskPopup::render(frame, frame.area(), tasks, task_cursor); }
-			Toast::render(frame, body_area, notices);
+			if task_visible { TaskPopup::render(frame, frame.area(), tasks, task_cursor, theme); }
+			Toast::render(frame, body_area, notices, theme);
 		})?;
 		tab.scroll = scroll;
 

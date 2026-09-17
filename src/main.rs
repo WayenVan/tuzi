@@ -1,4 +1,4 @@
-mod action;
+mod command;
 mod actor;
 mod app;
 mod clipboard;
@@ -18,51 +18,58 @@ mod runner;
 mod scheduler;
 mod status;
 mod tasks;
+mod theme;
 mod tui;
 mod watcher;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode};
 
+use config::{Config, LoadOptions};
+use keymap::Keymap;
+use theme::Theme;
+
 const HELP: &str = "tuzi - a tree-style terminal file manager
 
-Usage: tuzi [PATH]
+Usage: tuzi [OPTIONS] [PATH]
 
 Arguments:
   [PATH]  Directory to open [default: current directory]
 
 Options:
+      --config-dir <DIR>  Use a custom configuration directory
+      --no-config         Ignore all user configuration
   -h, --help     Print help
   -V, --version  Print version";
 
 enum Cli {
-	Run(PathBuf),
+	Run { path: PathBuf, config: LoadOptions },
 	Help,
 	Version,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli, String> {
 	let mut args = args.into_iter();
-	let Some(first) = args.next() else {
-		return Ok(Cli::Run(PathBuf::from(".")));
-	};
-	if first == "-h" || first == "--help" {
-		return no_extra_args(args, Cli::Help);
-	}
-	if first == "-V" || first == "--version" {
-		return no_extra_args(args, Cli::Version);
-	}
-	let path = if first == "--" {
-		args.next().ok_or_else(|| "expected PATH after '--'".to_owned())?
-	} else {
-		if first.to_string_lossy().starts_with('-') {
-			return Err(format!("unknown option: {}", first.to_string_lossy()));
+	let mut path = None;
+	let mut config = LoadOptions::default();
+	while let Some(arg) = args.next() {
+		match arg.to_string_lossy().as_ref() {
+			"-h" | "--help" => return no_extra_args(args, Cli::Help),
+			"-V" | "--version" => return no_extra_args(args, Cli::Version),
+			"--no-config" => config.no_config = true,
+			"--config-dir" => config.config_dir = Some(args.next().ok_or("expected DIR after '--config-dir'")?.into()),
+			"--" => {
+				let value = args.next().ok_or_else(|| "expected PATH after '--'".to_owned())?;
+				if path.replace(value.into()).is_some() { return Err("unexpected extra PATH".into()); }
+				if let Some(extra) = args.next() { return Err(format!("unexpected argument: {}", extra.to_string_lossy())); }
+				break;
+			},
+			value if value.starts_with('-') => return Err(format!("unknown option: {value}")),
+			_ if path.is_some() => return Err(format!("unexpected argument: {}", arg.to_string_lossy())),
+			_ => path = Some(arg.into()),
 		}
-		first
-	};
-	if let Some(extra) = args.next() {
-		return Err(format!("unexpected argument: {}", extra.to_string_lossy()));
 	}
-	Ok(Cli::Run(path.into()))
+	if config.no_config && config.config_dir.is_some() { return Err("--no-config and --config-dir cannot be used together".into()); }
+	Ok(Cli::Run { path: path.unwrap_or_else(|| PathBuf::from(".")), config })
 }
 
 fn no_extra_args(mut args: impl Iterator<Item = OsString>, command: Cli) -> Result<Cli, String> {
@@ -83,12 +90,18 @@ async fn main() -> ExitCode {
 			println!("tuzi {}", env!("CARGO_PKG_VERSION"));
 			ExitCode::SUCCESS
 		}
-		Ok(Cli::Run(path)) => match app::App::serve(path).await {
+		Ok(Cli::Run { path, config }) => match Config::load(&config).and_then(|behavior| Keymap::load(&config).and_then(|keymap| Theme::load(&config).map(|theme| (behavior, keymap, theme)))) {
+			Err(error) => {
+				eprintln!("tuzi: {error}");
+				ExitCode::FAILURE
+			},
+			Ok((config, keymap, theme)) => match app::App::serve(path, config, keymap, theme).await {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("tuzi: {error}");
 				ExitCode::FAILURE
 			}
+			},
 		},
 		Err(error) => {
 			eprintln!("tuzi: {error}\nTry 'tuzi --help' for more information.");
@@ -107,20 +120,27 @@ mod cli_tests {
 
 	#[test]
 	fn defaults_to_the_current_directory_and_accepts_one_path() {
-		assert!(matches!(parse(&[]).unwrap(), Cli::Run(path) if path.as_path() == std::path::Path::new(".")));
-		assert!(matches!(parse(&["somewhere"]).unwrap(), Cli::Run(path) if path.as_path() == std::path::Path::new("somewhere")));
+		assert!(matches!(parse(&[]).unwrap(), Cli::Run { path, .. } if path.as_path() == std::path::Path::new(".")));
+		assert!(matches!(parse(&["somewhere"]).unwrap(), Cli::Run { path, .. } if path.as_path() == std::path::Path::new("somewhere")));
 	}
 
 	#[test]
 	fn recognizes_help_version_and_double_dash() {
 		assert!(matches!(parse(&["--help"]).unwrap(), Cli::Help));
 		assert!(matches!(parse(&["-V"]).unwrap(), Cli::Version));
-		assert!(matches!(parse(&["--", "-directory"]).unwrap(), Cli::Run(path) if path.as_path() == std::path::Path::new("-directory")));
+		assert!(matches!(parse(&["--", "-directory"]).unwrap(), Cli::Run { path, .. } if path.as_path() == std::path::Path::new("-directory")));
 	}
 
 	#[test]
 	fn rejects_unknown_options_and_extra_paths() {
 		assert!(parse(&["--wat"]).is_err());
 		assert!(parse(&["one", "two"]).is_err());
+	}
+
+	#[test]
+	fn accepts_config_options_before_or_after_the_path() {
+		assert!(matches!(parse(&["--no-config", "somewhere"]).unwrap(), Cli::Run { config: LoadOptions { no_config: true, .. }, .. }));
+		assert!(matches!(parse(&["somewhere", "--config-dir", "settings"]).unwrap(), Cli::Run { config: LoadOptions { config_dir: Some(path), .. }, .. } if path == PathBuf::from("settings")));
+		assert!(parse(&["--no-config", "--config-dir", "settings"]).is_err());
 	}
 }

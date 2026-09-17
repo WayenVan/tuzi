@@ -9,16 +9,6 @@ pub enum NoticeLevel {
 	Error,
 }
 
-impl NoticeLevel {
-	fn timeout(self) -> Duration {
-		match self {
-			Self::Info => Duration::from_secs(3),
-			Self::Warn => Duration::from_secs(5),
-			Self::Error => Duration::from_secs(8),
-		}
-	}
-}
-
 /// A transient toast: an operational error or warning that isn't tied to any
 /// one place in the tree (unlike a directory load failure, which stays
 /// pinned to its node instead of expiring). No slide animation — it's just
@@ -30,8 +20,8 @@ pub struct Notice {
 }
 
 impl Notice {
-	pub fn new(level: NoticeLevel, message: impl Into<String>) -> Self {
-		Self { level, message: message.into(), expires_at: Instant::now() + level.timeout() }
+	pub fn new(level: NoticeLevel, message: impl Into<String>, timeout: Duration) -> Self {
+		Self { level, message: message.into(), expires_at: Instant::now() + timeout }
 	}
 
 	pub fn expired(&self) -> bool { Instant::now() >= self.expires_at }
@@ -47,16 +37,16 @@ mod tests {
 
 	#[test]
 	fn a_fresh_notice_is_not_expired() {
-		let notice = Notice::new(NoticeLevel::Warn, "test");
+		let notice = Notice::new(NoticeLevel::Warn, "test", Duration::from_secs(5));
 		assert!(!notice.expired());
 		assert!(notice.remaining() > Duration::ZERO);
 	}
 
 	#[test]
 	fn a_more_severe_level_stays_up_longer() {
-		let info = Notice::new(NoticeLevel::Info, "x");
-		let warn = Notice::new(NoticeLevel::Warn, "x");
-		let error = Notice::new(NoticeLevel::Error, "x");
+		let info = Notice::new(NoticeLevel::Info, "x", Duration::from_secs(3));
+		let warn = Notice::new(NoticeLevel::Warn, "x", Duration::from_secs(5));
+		let error = Notice::new(NoticeLevel::Error, "x", Duration::from_secs(8));
 		assert!(info.remaining() < warn.remaining());
 		assert!(warn.remaining() < error.remaining());
 	}

@@ -12,12 +12,13 @@ use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-	action::{CopyKind, DeleteMode},
+	command::{CopyKind, DeleteMode},
 	column_mode::ColumnMode,
+	config::Config,
 	core::{Filter, Node, Selection, Tree, Visual},
 	event::Event,
 	finder::Finder,
-	fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size},
+	fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size, unique_dest_avoiding},
 	notice::NoticeLevel,
 	preview::Preview,
 	scheduler::FsScheduler,
@@ -40,6 +41,7 @@ use super::{
 /// even after some *other* tab closes and every tab after it would
 /// otherwise shift position in `App::tabs`.
 pub struct Tab {
+	config: Arc<Config>,
 	pub id: usize,
 	pub tree: Tree,
 	projection: VisibleProjection,
@@ -109,12 +111,23 @@ impl PendingListing {
 }
 
 impl Tab {
+	#[cfg(test)]
 	pub fn open(id: usize, path: PathBuf, tx: UnboundedSender<Event>) -> io::Result<Self> {
+		Self::open_configured(id, path, tx, Arc::new(Config::default()))
+	}
+
+	pub fn open_configured(id: usize, path: PathBuf, tx: UnboundedSender<Event>, config: Arc<Config>) -> io::Result<Self> {
 		let mut tree = Tree::open(path)?;
 		let root_path = tree.root.path.clone();
 		let needs_fetch = tree.mark_expanded(&root_path).unwrap_or(false);
 
-		let watcher = Watcher::new(id, tx.clone())?;
+		let watcher = Watcher::new(
+			id,
+			tx.clone(),
+			Duration::from_millis(config.watcher.debounce_ms),
+			Duration::from_millis(config.watcher.max_wait_ms),
+			Duration::from_millis(config.watcher.poll_interval_ms),
+		)?;
 		watcher.watch(&root_path)?;
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
@@ -123,20 +136,21 @@ impl Tab {
 			fs_scheduler.refresh(root_path.clone());
 		}
 
-		let show_hidden = false;
+		let show_hidden = config.mgr.show_hidden;
 		let projection = VisibleProjection::new(&tree.root, None, show_hidden);
-		let path_history = PathHistory::new(root_path.clone());
+		let path_history = PathHistory::new(root_path.clone(), config.mgr.history_size);
 		Ok(Self {
+			config: config.clone(),
 			id,
 			tree,
 			projection,
 			cursor: 0,
 			scroll: 0,
-			column_mode: ColumnMode::None,
-			sort_policy: SortPolicy::default(),
+			column_mode: config.mgr.column_mode,
+			sort_policy: config.mgr.sort,
 			show_hidden,
 			path_history,
-			preview: Preview::new(id, tx.clone()),
+			preview: Preview::configured(id, tx.clone(), config.preview.clone()),
 			watcher,
 			fs_scheduler,
 			pending_listings: HashMap::new(),
@@ -424,6 +438,11 @@ impl Tab {
 		self.pending_delete = (!targets.is_empty()).then_some((targets, mode));
 	}
 
+	pub(super) fn delete_selected_configured(&mut self, mode: DeleteMode, confirm: bool) -> Option<(Vec<PathBuf>, DeleteMode)> {
+		self.delete_selected(mode);
+		if confirm { None } else { self.take_pending_delete(true) }
+	}
+
 	/// Takes the armed confirmation, handing the targets and mode to the
 	/// caller (which owns the task queue) only if the user actually
 	/// confirmed — declining or canceling just clears it.
@@ -477,14 +496,31 @@ impl Tab {
 		self.input = Some(input);
 	}
 
+	pub fn cd_path(&mut self, value: &str) -> io::Result<()> {
+		let path = resolve_path(&self.tree.root.path, value)?;
+		self.cd(path)
+	}
+
+	pub fn rename_selected(&mut self, name: String) {
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		if node.path != self.tree.root.path { self.confirm_rename(node.path.clone(), name); }
+	}
+
 	pub fn start_create(&mut self) {
-		let base = self
-			.visible_at(self.cursor)
-			.map(|(_, node)| (node.path.clone(), node.cha.is_dir && node.expanded))
-			.map(|(path, create_inside)| if create_inside { path.clone() } else { self.tree.parent_of(&path).unwrap_or_else(|| self.tree.root.path.clone()) })
-			.unwrap_or_else(|| self.tree.root.path.clone());
+		let base = self.create_base();
 		self.input_seq += 1;
 		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Create { base }, ""));
+	}
+
+	pub fn create_path(&mut self, value: String) {
+		if !value.is_empty() { self.fs_scheduler.create_with_policy(self.create_base(), value, self.config.fs.create_conflict); }
+	}
+
+	fn create_base(&self) -> PathBuf {
+		self.visible_at(self.cursor)
+			.map(|(_, node)| (node.path.clone(), node.cha.is_dir && node.expanded))
+			.map(|(path, create_inside)| if create_inside { path.clone() } else { self.tree.parent_of(&path).unwrap_or_else(|| self.tree.root.path.clone()) })
+			.unwrap_or_else(|| self.tree.root.path.clone())
 	}
 
 	pub fn start_find(&mut self, previous: bool) {
@@ -498,6 +534,13 @@ impl Tab {
 		self.rebuild_projection();
 		self.input_seq += 1;
 		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Filter, ""));
+	}
+
+	pub fn start_command(&mut self) {
+		self.input_seq += 1;
+		let mut input = InputSession::new(self.input_seq, InputPurpose::Command, "");
+		self.schedule_completion(&mut input);
+		self.input = Some(input);
 	}
 
 	pub fn find_arrow(&mut self, previous: bool, include_current: bool) {
@@ -526,39 +569,39 @@ impl Tab {
 	}
 
 	/// Handles the common vim input used by rename and interactive cd.
-	pub fn handle_input_key(&mut self, key: KeyEvent) {
+	pub fn handle_input_key(&mut self, key: KeyEvent) -> Option<crate::command::Command> {
 		let Some(mut input) = self.input.take() else {
-			return;
+			return None;
 		};
 
-		if input.is_cd() && input.completion.is_some() {
+		if input.completion.is_some() {
 			match key.code {
 				KeyCode::Up => {
 					input.move_completion(-1);
 					self.input = Some(input);
-					return;
+					return None;
 				}
 				KeyCode::Down => {
 					input.move_completion(1);
 					self.input = Some(input);
-					return;
+					return None;
 				}
 				KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
 					input.move_completion(-1);
 					self.input = Some(input);
-					return;
+					return None;
 				}
 				KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
 					input.move_completion(1);
 					self.input = Some(input);
-					return;
+					return None;
 				}
 				KeyCode::Tab => {
-					if input.complete_selected() {
+					if input.complete_selected() && input.is_cd() {
 						self.schedule_completion(&mut input);
 					}
 					self.input = Some(input);
-					return;
+					return None;
 				}
 				_ => {}
 			}
@@ -569,7 +612,7 @@ impl Tab {
 				if input.is_cd() {
 					input.complete_selected();
 				}
-				self.submit_input(input);
+				return self.submit_input(input);
 			}
 			KeyCode::Esc => {
 				if input.state.mode != EditorMode::Normal {
@@ -585,7 +628,7 @@ impl Tab {
 			KeyCode::Char('C') => {
 				if input.state.mode != EditorMode::Normal {
 					self.forward_input_key(input, key);
-					return;
+					return None;
 				}
 				// edtui's own uppercase-letter bindings (like this `D`) key
 				// off the modifier flag, not just the letter's case — and
@@ -600,13 +643,14 @@ impl Tab {
 				// line's current length rather than just flipping the mode.
 				input.state.cursor.col = input.state.lines.len_col(input.state.cursor.row).unwrap_or(0);
 				input.state.mode = EditorMode::Insert;
-				if input.is_cd() || input.find_previous().is_some() {
+				if input.is_cd() || input.find_previous().is_some() || input.is_command() {
 					self.input_changed(&mut input);
 				}
 				self.input = Some(input);
 			}
 			_ => self.forward_input_key(input, key),
 		}
+		None
 	}
 
 	fn forward_input_key(&mut self, mut input: InputSession, key: KeyEvent) {
@@ -614,7 +658,7 @@ impl Tab {
 		input.handler.on_key_event(key, &mut input.state);
 		input.error = None;
 		let after = (input.value(), input.state.cursor.col);
-		if (input.is_cd() && before != after) || ((input.find_previous().is_some() || input.is_filter()) && before.0 != after.0) {
+		if (input.is_cd() && before != after) || ((input.find_previous().is_some() || input.is_filter() || input.is_command()) && before.0 != after.0) {
 			self.input_changed(&mut input);
 		}
 		self.input = Some(input);
@@ -622,6 +666,9 @@ impl Tab {
 
 	fn input_changed(&mut self, input: &mut InputSession) {
 		if input.is_cd() {
+			self.schedule_completion(input);
+		}
+		if input.is_command() {
 			self.schedule_completion(input);
 		}
 		if let Some(previous) = input.find_previous() {
@@ -636,13 +683,17 @@ impl Tab {
 		}
 	}
 
-	fn submit_input(&mut self, mut input: InputSession) {
+	fn submit_input(&mut self, mut input: InputSession) -> Option<crate::command::Command> {
 		let value = input.value();
 		match &input.purpose {
+			InputPurpose::Command => match value.parse() {
+				Ok(command) => return Some(command),
+				Err(error) => { input.error = Some(error); self.input = Some(input); },
+			},
 			InputPurpose::Rename { target } => self.confirm_rename(target.clone(), value),
 			InputPurpose::Create { base } => {
 				if !value.is_empty() {
-					self.fs_scheduler.create(base.clone(), value);
+					self.fs_scheduler.create_with_policy(base.clone(), value, self.config.fs.create_conflict);
 				}
 			}
 			InputPurpose::Find { previous } => {
@@ -657,7 +708,7 @@ impl Tab {
 			}
 			InputPurpose::Cd { base } => {
 				if value.is_empty() {
-					return;
+					return None;
 				}
 				match resolve_path(base, &value).and_then(|path| self.cd(path)) {
 					Ok(()) => {}
@@ -668,14 +719,21 @@ impl Tab {
 				}
 			}
 		}
+		None
 	}
 
 	fn confirm_rename(&mut self, target: PathBuf, name: String) {
 		let Some(parent) = target.parent() else {
 			return;
 		};
-		let dest = parent.join(&name);
-		if name.is_empty() || dest == target || std::fs::rename(&target, &dest).is_err() {
+		let requested = parent.join(&name);
+		if name.is_empty() || requested == target { return; }
+		let dest = match self.config.fs.rename_conflict {
+			crate::config::ConflictPolicy::Rename => unique_dest_avoiding(parent, requested.file_name().unwrap_or_default(), |_| false),
+			crate::config::ConflictPolicy::Error if requested.exists() => { self.raise(NoticeLevel::Error, format!("{} already exists", requested.display())); return; },
+			crate::config::ConflictPolicy::Error => requested,
+		};
+		if std::fs::rename(&target, &dest).is_err() {
 			return;
 		}
 
@@ -698,14 +756,14 @@ impl Tab {
 		if path == self.tree.root.path {
 			return Ok(());
 		}
-		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
+		let mut replacement = Self::open_configured(self.id, path, self.tx.clone(), self.config.clone())?;
 		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
 		replacement.input_seq = self.input_seq;
 		replacement.sort_policy = self.sort_policy;
 		replacement.column_mode = self.column_mode;
 		replacement.show_hidden = self.show_hidden;
 		replacement.rebuild_projection();
-		replacement.path_history = std::mem::replace(&mut self.path_history, PathHistory::new(replacement.tree.root.path.clone()));
+		replacement.path_history = std::mem::replace(&mut self.path_history, PathHistory::new(replacement.tree.root.path.clone(), self.config.mgr.history_size));
 		if record {
 			replacement.path_history.push(replacement.tree.root.path.clone());
 		}
@@ -733,15 +791,6 @@ impl Tab {
 		}
 	}
 
-	pub fn cd_parent(&mut self) {
-		let Some(parent) = self.tree.root.path.parent().map(Path::to_path_buf) else {
-			return;
-		};
-		if let Err(error) = self.cd(parent) {
-			self.raise(NoticeLevel::Error, error.to_string());
-		}
-	}
-
 	pub fn cd_selected(&mut self) {
 		let Some(directory) = self.selected_dir() else {
 			return;
@@ -762,29 +811,8 @@ impl Tab {
 		}
 	}
 
-	pub fn cd_home(&mut self) {
-		match home_dir().and_then(|path| self.cd(path)) {
-			Ok(()) => {}
-			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
-		}
-	}
-
 	pub fn cd_config(&mut self) {
 		match home_dir().map(|home| home.join(".config")).and_then(|path| self.cd(path)) {
-			Ok(()) => {}
-			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
-		}
-	}
-
-	pub fn cd_downloads(&mut self) {
-		match home_dir().map(|home| home.join("Downloads")).and_then(|path| self.cd(path)) {
-			Ok(()) => {}
-			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
-		}
-	}
-
-	pub fn cd_desktop(&mut self) {
-		match home_dir().map(|home| home.join("Desktop")).and_then(|path| self.cd(path)) {
 			Ok(()) => {}
 			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
 		}
@@ -855,8 +883,10 @@ impl Tab {
 	/// `on_completion_loaded` replaces it once the fresh list actually
 	/// arrives (with `None` if that list turns out to be empty).
 	fn schedule_completion(&self, input: &mut InputSession) {
-		let InputPurpose::Cd { base } = &input.purpose else {
-			return;
+		let base = match &input.purpose {
+			InputPurpose::Cd { base } => Some(base.clone()),
+			InputPurpose::Command => None,
+			_ => return,
 		};
 		if let Some(task) = input.completion_task.take() {
 			task.abort();
@@ -865,13 +895,15 @@ impl Tab {
 		let tab = self.id;
 		let input_id = input.id;
 		let revision = input.revision;
-		let base = base.clone();
 		let value = input.value();
 		let cursor = input.state.cursor.col;
 		let tx = self.tx.clone();
 		input.completion_task = Some(tokio::spawn(async move {
 			tokio::time::sleep(Duration::from_millis(50)).await;
-			let result = tokio::task::spawn_blocking(move || complete_directories(&base, &value, cursor)).await.unwrap_or_else(|err| Err(io::Error::other(err)));
+			let result = tokio::task::spawn_blocking(move || match base {
+				Some(base) => complete_directories(&base, &value, cursor),
+				None => Ok(crate::command::completions(&value)),
+			}).await.unwrap_or_else(|err| Err(io::Error::other(err)));
 			let _ = tx.send(Event::CompletionLoaded { tab, input: input_id, revision, result });
 		}));
 	}
@@ -882,7 +914,8 @@ impl Tab {
 			return;
 		}
 		input.completion_task.take();
-		input.completion = result.ok().filter(|items| !items.is_empty()).map(|candidates| Completion { candidates, selected: 0 });
+		let command = matches!(input.purpose, InputPurpose::Command);
+		input.completion = result.ok().filter(|items| !items.is_empty()).map(|candidates| Completion { candidates, selected: 0, command });
 	}
 
 	/// Esc cancels whatever's most "in progress": an open visual selection
@@ -1397,7 +1430,7 @@ mod tests {
 		tab.cd_selected();
 		assert_eq!(tab.tree.root.path, root.join("child"));
 
-		tab.cd_parent();
+		tab.cd_path("..").unwrap();
 		assert_eq!(tab.tree.root.path, root);
 		fs::remove_dir_all(&root).unwrap();
 	}
