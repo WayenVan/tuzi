@@ -3,8 +3,9 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+#[cfg(test)]
 use super::Filter;
-use crate::fs::{Cha, SortPolicy, compare_for_sort, sort};
+use crate::fs::{Cha, FsChange, SortBy, SortPolicy, compare_for_sort, sort};
 
 pub struct Node {
 	pub path: PathBuf,
@@ -77,6 +78,53 @@ impl Node {
 				})
 				.collect(),
 		);
+	}
+
+	pub fn apply_changes(&mut self, changes: Vec<FsChange>, policy: SortPolicy) {
+		let Some(children) = &mut self.children else { return };
+		let mut pending: HashMap<PathBuf, Option<Cha>> = changes
+			.into_iter()
+			.map(|change| match change {
+				FsChange::Upsert { path, cha } => (path, Some(cha)),
+				FsChange::Delete { path } => (path, None),
+			})
+			.collect();
+
+		let mut reorder = matches!(policy.by, SortBy::Modified | SortBy::Size);
+		children.retain_mut(|node| match pending.remove(&node.path) {
+			Some(Some(cha)) => {
+			reorder |= node.cha.is_dir != cha.is_dir;
+				node.cha = cha;
+				true
+			}
+			Some(None) => false,
+			None => true,
+		});
+		let mut added: Vec<_> = pending.into_iter().filter_map(|(path, cha)| cha.map(|cha| Node::new(path, cha))).collect();
+		if added.is_empty() {
+			if reorder {
+				children.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
+			}
+			return;
+		}
+		if reorder {
+			children.extend(added);
+			children.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
+			return;
+		}
+
+		added.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
+		let mut old = std::mem::take(children).into_iter().peekable();
+		let mut new = added.into_iter().peekable();
+		while let (Some(a), Some(b)) = (old.peek(), new.peek()) {
+			if compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy).is_le() {
+				children.push(old.next().unwrap());
+			} else {
+				children.push(new.next().unwrap());
+			}
+		}
+		children.extend(old);
+		children.extend(new);
 	}
 
 	pub fn find_mut(&mut self, path: &Path) -> Option<&mut Node> {
@@ -156,15 +204,6 @@ impl Node {
 			}
 		}
 		true
-	}
-
-	pub fn has_visible_match(&self, filter: &Filter) -> bool {
-		self.path.file_name().is_some_and(|name| filter.matches(&name.to_string_lossy()))
-			|| (self.expanded
-				&& self
-					.children
-					.as_ref()
-					.is_some_and(|children| children.iter().any(|child| child.has_visible_match(filter))))
 	}
 
 	/// Like `visible`, but a node only appears if it matches `filter` itself
@@ -280,6 +319,28 @@ mod tests {
 		assert_eq!(kept.cha.len, 42);
 		assert_eq!(kept.load_error.as_deref(), Some("old error"));
 		assert_eq!(kept.children.as_ref().unwrap()[0].path, Path::new("nested.txt"));
+	}
+
+	#[test]
+	fn incremental_changes_preserve_cached_subtrees_and_apply_deletes_and_inserts() {
+		let kept = dir("kept", vec![file("nested.txt")]);
+		let mut root = dir("root", vec![kept, file("removed.txt")]);
+		let mut refreshed = cha(true);
+		refreshed.len = 42;
+
+		root.apply_changes(
+			vec![
+				FsChange::Upsert { path: PathBuf::from("kept"), cha: refreshed },
+				FsChange::Delete { path: PathBuf::from("removed.txt") },
+				FsChange::Upsert { path: PathBuf::from("new.txt"), cha: cha(false) },
+			],
+			SortPolicy::default(),
+		);
+
+		let children = root.children.as_ref().unwrap();
+		assert_eq!(children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("kept"), Path::new("new.txt")]);
+		assert_eq!(children[0].cha.len, 42);
+		assert_eq!(children[0].children.as_ref().unwrap()[0].path, Path::new("nested.txt"));
 	}
 
 	#[test]

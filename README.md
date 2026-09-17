@@ -1,33 +1,74 @@
-# tuzi
+<p align="center">
+  <img src="assets/tuzi-icon.png" width="180" alt="tuzi icon">
+</p>
 
-A tree-style TUI file manager, inspired by [yazi](https://github.com/sxyazi/yazi).
+<h1 align="center">tuzi</h1>
+
+<p align="center">
+  A tree-style <a href="https://github.com/sxyazi/yazi">Yazi</a> for the terminal.
+</p>
+
+## Install
+
+tuzi currently builds from source and requires a recent Rust toolchain. After cloning the repository, run:
+
+```sh
+cargo install --path .
+```
+
+For file icons, use a terminal font that includes Nerd Font symbols. `fzf` is optional and only required for the jump command.
 
 ## Usage
 
 ```sh
 tuzi [PATH]
-tuzi --help
-tuzi --version
 ```
 
 `PATH` must be a directory and defaults to the current directory.
 
-## Layout
+```sh
+tuzi --help
+tuzi --version
+```
 
-Modules mirror the crate boundaries yazi eventually grew into; each one
-splits out into its own crate once it needs independent compilation or reuse.
+## Keybindings
 
-- `event` — the `Event` enum and dispatch channel
-- `app` — event loop, dispatcher, keymap router (the composition root)
-- `core` — domain state: the node tree, selection, filter/find
-- `actor` — `Cmd -> Opt -> Actor::act` command handlers
-- `fs` — filesystem engine: cached metadata, read_dir backends, sorting
-- `scheduler` — background task queue (copy/move/delete/size)
-- `runner` — "open with" resolution
-- `watcher` — filesystem change notifications
-- `tui` — terminal backend and widgets, including the tree view
-- `config` — keymap/theme/config loading
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Move down / up |
+| `l` / `h` | Expand / collapse |
+| `Enter` | Toggle directory |
+| `;` | Toggle selection |
+| `v` | Visual selection |
+| `o` / `O` | Open / open with |
+| `a` | Create file or directory |
+| `r` | Rename |
+| `y` / `x` | Copy / cut selected files |
+| `p` | Paste |
+| `d` / `D` | Move to trash / delete permanently |
+| `/` / `?` | Find next / previous |
+| `f` | Filter |
+| `.` | Toggle hidden files |
+| `z` | Jump with `fzf` |
+| `g~` / `gc` | Go to home / config directory |
+| `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |
+| `w` | Show task manager |
+| `Ctrl-p` | Toggle preview |
+| `tt` / `W` | Create / close tab |
+| `[` / `]` | Previous / next tab |
+| `q` | Quit |
 
-Extraction order: `fs` first, then the tree `core`, then `event`/`app`,
-then `scheduler`/`runner`, then `watcher`. Scripting/plugins are deliberately
-out of scope until the core tree experience works.
+Prefix keys such as `g`, `c`, `m`, and `,` show their available commands inside tuzi.
+
+## Roadmap
+
+1. **User configuration** — configurable keybindings, themes, and behavior without rebuilding tuzi.
+2. **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
+
+## Acknowledgements
+
+tuzi would not exist without [Yazi](https://github.com/sxyazi/yazi). Most of its interaction design, keybindings, asynchronous architecture, task system, and implementation approach were learned from or adapted from Yazi. Sincere thanks to Yazi and all of its contributors for their outstanding work.
+
+## License
+
+tuzi is distributed under the [MIT License](LICENSE). Yazi's original copyright and MIT notice are preserved in [Third-Party Notices](THIRD_PARTY_NOTICES.md).

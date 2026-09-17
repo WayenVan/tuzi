@@ -3,7 +3,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use crate::fs::{Cha, SortPolicy};
+use crate::fs::{Cha, FsChange, SortPolicy};
 
 use super::Node;
 
@@ -50,6 +50,15 @@ impl Tree {
 			}
 			None => false,
 		}
+	}
+
+	pub fn apply_changes(&mut self, path: &Path, changes: Vec<FsChange>, policy: SortPolicy) -> bool {
+		let Some(node) = self.root.find_mut(path) else { return false };
+		if node.children.is_none() {
+			return false;
+		}
+		node.apply_changes(changes, policy);
+		true
 	}
 
 	/// Records why a listing attempt for `path` failed, and collapses it so

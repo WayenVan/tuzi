@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, io, path::{Path, PathBuf}, sync::{Arc
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::AbortHandle, time::Instant};
 
-use crate::event::Event;
+use crate::{event::Event, fs::{Cha, FsChange}};
 
 pub struct Watcher {
 	inner:   Box<dyn NotifyWatcher + Send>,
@@ -11,13 +11,22 @@ pub struct Watcher {
 	pending: PendingChanges,
 }
 
-const CHANGE_DEBOUNCE: Duration = Duration::from_millis(75);
+const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
+const MAX_CHANGE_BATCH: usize = 1000;
 
 type PendingChanges = Arc<Mutex<HashMap<PathBuf, PendingChange>>>;
 
 struct PendingChange {
 	deadline: Instant,
+	paths:    HashSet<PathBuf>,
+	refresh:  bool,
 	abort:    Option<AbortHandle>,
+}
+
+struct ChangeSet {
+	parent:  PathBuf,
+	paths:   HashSet<PathBuf>,
+	refresh: bool,
 }
 
 impl Watcher {
@@ -85,59 +94,88 @@ fn event_handler(
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
 	move |res| {
 		let Ok(event) = res else { return };
+		if event.kind.is_access() {
+			return;
+		}
 		let watched = matched.lock().unwrap();
-		let mut changed = HashSet::new();
+		let mut changed: HashMap<PathBuf, (HashSet<PathBuf>, bool)> = HashMap::new();
 		for path in event.paths {
-			let path = path.canonicalize().unwrap_or(path);
 			if let Some(dir) = nearest_watched(&watched, &path) {
-				changed.insert(dir);
+				let entry = changed.entry(dir.clone()).or_default();
+				if path == dir {
+					entry.1 = true;
+				} else if let Ok(relative) = path.strip_prefix(&dir)
+					&& let Some(component) = relative.components().next()
+				{
+					entry.0.insert(dir.join(component.as_os_str()));
+				}
 			}
 		}
 		drop(watched);
-		for path in changed {
-			debounce_changed(tab, tx.clone(), pending.clone(), &runtime, path, CHANGE_DEBOUNCE);
+		for (parent, (paths, refresh)) in changed {
+			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, CHANGE_DEBOUNCE);
 		}
 	}
 }
 
-fn debounce_changed(
+fn debounce_changes(
 	tab: usize,
 	tx: UnboundedSender<Event>,
 	pending: PendingChanges,
 	runtime: &Handle,
-	path: PathBuf,
+	change_set: ChangeSet,
 	delay: Duration,
 ) {
+	let ChangeSet { parent, paths, refresh } = change_set;
 	let deadline = Instant::now() + delay;
-	if let Some(change) = pending.lock().unwrap().get_mut(&path) {
-		change.deadline = deadline;
+	if let Some(change) = pending.lock().unwrap().get_mut(&parent) {
+		change.paths.extend(paths);
+		change.refresh |= refresh;
+		change.deadline = if change.paths.len() >= MAX_CHANGE_BATCH { Instant::now() } else { deadline };
 		return;
 	}
-	pending.lock().unwrap().insert(path.clone(), PendingChange { deadline, abort: None });
-	let task_path = path.clone();
+	pending.lock().unwrap().insert(parent.clone(), PendingChange { deadline, paths, refresh, abort: None });
+	let task_parent = parent.clone();
 	let task_pending = pending.clone();
 	let handle = runtime.spawn(async move {
 		loop {
-			let Some(deadline) = task_pending.lock().unwrap().get(&task_path).map(|change| change.deadline) else { return };
+			let Some(deadline) = task_pending.lock().unwrap().get(&task_parent).map(|change| change.deadline) else { return };
 			tokio::time::sleep_until(deadline).await;
-			let send = {
+			let change = {
 				let mut pending = task_pending.lock().unwrap();
-				if pending.get(&task_path).is_some_and(|change| change.deadline <= Instant::now()) {
-					pending.remove(&task_path);
-					true
+				if pending.get(&task_parent).is_some_and(|change| change.deadline <= Instant::now()) {
+					pending.remove(&task_parent)
 				} else {
-					false
+					None
 				}
 			};
-			if send {
-				let _ = tx.send(Event::Changed { tab, path: task_path });
+			if let Some(change) = change {
+				if change.refresh {
+					let _ = tx.send(Event::Changed { tab, path: task_parent });
+					return;
+				}
+				let changes = tokio::task::spawn_blocking(move || inspect_paths(change.paths)).await.unwrap_or_default();
+				if !changes.is_empty() {
+					let _ = tx.send(Event::FilesChanged { tab, parent: task_parent, changes });
+				}
 				return;
 			}
 		}
 	});
-	if let Some(change) = pending.lock().unwrap().get_mut(&path) {
+	if let Some(change) = pending.lock().unwrap().get_mut(&parent) {
 		change.abort = Some(handle.abort_handle());
 	}
+}
+
+fn inspect_paths(paths: HashSet<PathBuf>) -> Vec<FsChange> {
+	paths
+		.into_iter()
+		.filter_map(|path| match std::fs::metadata(&path) {
+			Ok(metadata) => Some(FsChange::Upsert { path, cha: Cha::from(metadata) }),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => Some(FsChange::Delete { path }),
+			Err(_) => None,
+		})
+		.collect()
 }
 
 fn nearest_watched(watched: &HashSet<PathBuf>, path: &Path) -> Option<PathBuf> {
@@ -164,14 +202,22 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::current();
-		let path = PathBuf::from("busy-directory");
+		let parent = PathBuf::from("busy-directory");
+		let path = parent.join("changed-file");
 
 		for _ in 0..5 {
-			debounce_changed(3, tx.clone(), pending.clone(), &runtime, path.clone(), Duration::from_millis(20));
+			debounce_changes(
+				3,
+				tx.clone(),
+				pending.clone(),
+				&runtime,
+				ChangeSet { parent: parent.clone(), paths: HashSet::from([path.clone()]), refresh: false },
+				Duration::from_millis(20),
+			);
 		}
 
 		let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
-		assert!(matches!(event, Event::Changed { tab: 3, path: ref changed } if changed == &path));
+		assert!(matches!(event, Event::FilesChanged { tab: 3, parent: ref changed, changes } if changed == &parent && matches!(changes.as_slice(), [FsChange::Delete { path: deleted }] if deleted == &path)));
 		assert!(tokio::time::timeout(Duration::from_millis(60), rx.recv()).await.is_err());
 	}
 
@@ -189,9 +235,10 @@ mod tests {
 
 		let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("channel closed");
 		match event {
-			Event::Changed { tab, path } => {
+			Event::FilesChanged { tab, parent, changes } => {
 				assert_eq!(tab, 7);
-				assert_eq!(path, dir);
+				assert_eq!(parent, dir);
+				assert!(matches!(changes.as_slice(), [FsChange::Upsert { path, .. }] if path == &dir.join("new.txt")));
 			}
 			_ => panic!("unexpected event"),
 		}

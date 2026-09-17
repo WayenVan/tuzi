@@ -4,9 +4,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{action::{CopyKind, DeleteMode}, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, LocalEngine, SortBy, SortPolicy, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{action::{CopyKind, DeleteMode}, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
 
-use super::{input::{Completion, InputPurpose, InputSession}, visible_projection::VisibleProjection};
+use super::{input::{Completion, InputPurpose, InputSession}, path_history::PathHistory, visible_projection::VisibleProjection};
 
 /// One tab: its own tree, cursor, selection and background workers —
 /// everything but whether the whole program should quit. The clipboard
@@ -28,6 +28,8 @@ pub struct Tab {
 	pub scroll:         usize,
 	pub column_mode:    ColumnMode,
 	pub sort_policy:    SortPolicy,
+	pub show_hidden:    bool,
+	path_history:       PathHistory,
 	pub preview:        Preview,
 	pub watcher:        Watcher,
 	pub fs_scheduler:   FsScheduler,
@@ -95,10 +97,12 @@ impl Tab {
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
 		let mut fs_scheduler = FsScheduler::new(id, tx.clone(), engine);
 		if needs_fetch {
-			fs_scheduler.refresh(root_path);
+			fs_scheduler.refresh(root_path.clone());
 		}
 
-		let projection = VisibleProjection::new(&tree.root, None);
+		let show_hidden = false;
+		let projection = VisibleProjection::new(&tree.root, None, show_hidden);
+		let path_history = PathHistory::new(root_path.clone());
 		Ok(Self {
 			id,
 			tree,
@@ -107,6 +111,8 @@ impl Tab {
 			scroll: 0,
 			column_mode: ColumnMode::None,
 			sort_policy: SortPolicy::default(),
+			show_hidden,
+			path_history,
 			preview: Preview::new(id, tx.clone()),
 			watcher,
 			fs_scheduler,
@@ -143,10 +149,10 @@ impl Tab {
 	fn visible_position(&self, path: &Path) -> Option<usize> { self.projection.position(path) }
 
 	fn sync_projection(&mut self, path: &Path) {
-		self.projection.sync_subtree(&self.tree.root, path, self.filter.as_ref());
+		self.projection.sync_subtree(&self.tree.root, path, self.filter.as_ref(), self.show_hidden);
 	}
 
-	fn rebuild_projection(&mut self) { self.projection.rebuild(&self.tree.root, self.filter.as_ref()); }
+	fn rebuild_projection(&mut self) { self.projection.rebuild(&self.tree.root, self.filter.as_ref(), self.show_hidden); }
 
 	fn cancel_listing(&mut self, path: &Path) {
 		if matches!(self.pending_listings.remove(path), Some(PendingListing::Incremental { .. })) {
@@ -194,6 +200,26 @@ impl Tab {
 		if let Some(path) = hovered {
 			self.select(&path);
 		}
+	}
+
+	pub fn toggle_hidden(&mut self) {
+		let hovered = self.visible_at(self.cursor).map(|(_, node)| node.path.clone());
+		let old_cursor = self.cursor;
+		self.show_hidden = !self.show_hidden;
+		self.visual = None;
+		self.rebuild_projection();
+
+		let mut target = hovered;
+		let mut cursor = None;
+		while let Some(path) = target {
+			if let Some(position) = self.visible_position(&path) {
+				cursor = Some(position);
+				break;
+			}
+			target = self.tree.parent_of(&path);
+		}
+		self.cursor = cursor.unwrap_or_else(|| old_cursor.min(self.visible_len().saturating_sub(1)));
+		self.preview.target_changed();
 	}
 
 	/// Marks the directory open immediately (the triangle flips, the row
@@ -557,7 +583,9 @@ impl Tab {
 		}
 	}
 
-	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> {
+	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> { self.cd_inner(path, true) }
+
+	fn cd_inner(&mut self, path: PathBuf, record: bool) -> io::Result<()> {
 		if !std::fs::metadata(&path)?.is_dir() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a directory"));
 		}
@@ -568,8 +596,30 @@ impl Tab {
 		replacement.input_seq = self.input_seq;
 		replacement.sort_policy = self.sort_policy;
 		replacement.column_mode = self.column_mode;
+		replacement.show_hidden = self.show_hidden;
+		replacement.rebuild_projection();
+		replacement.path_history = std::mem::replace(&mut self.path_history, PathHistory::new(replacement.tree.root.path.clone()));
+		if record {
+			replacement.path_history.push(replacement.tree.root.path.clone());
+		}
 		*self = replacement;
 		Ok(())
+	}
+
+	pub fn history_back(&mut self) {
+		let Some(path) = self.path_history.back().map(Path::to_path_buf) else { return };
+		if let Err(error) = self.cd_inner(path, false) {
+			self.path_history.forward();
+			self.raise(NoticeLevel::Error, error.to_string());
+		}
+	}
+
+	pub fn history_forward(&mut self) {
+		let Some(path) = self.path_history.forward().map(Path::to_path_buf) else { return };
+		if let Err(error) = self.cd_inner(path, false) {
+			self.path_history.back();
+			self.raise(NoticeLevel::Error, error.to_string());
+		}
 	}
 
 	pub fn cd_parent(&mut self) {
@@ -596,6 +646,20 @@ impl Tab {
 		};
 		if let Err(error) = self.cd(path) {
 			self.raise(NoticeLevel::Error, error.to_string());
+		}
+	}
+
+	pub fn cd_home(&mut self) {
+		match home_dir().and_then(|path| self.cd(path)) {
+			Ok(()) => {}
+			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
+		}
+	}
+
+	pub fn cd_config(&mut self) {
+		match home_dir().map(|home| home.join(".config")).and_then(|path| self.cd(path)) {
+			Ok(()) => {}
+			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
 		}
 	}
 
@@ -720,6 +784,25 @@ impl Tab {
 		}
 	}
 
+	pub fn on_files_changed(&mut self, parent: PathBuf, changes: Vec<FsChange>) {
+		if !self.tree.is_loaded(&parent) {
+			return;
+		}
+		let hovered = self.visible_at(self.cursor).map(|(_, node)| node.path.clone());
+		if !self.tree.apply_changes(&parent, changes, self.sort_policy) {
+			return;
+		}
+		self.sync_projection(&parent);
+		if let Some(path) = hovered
+			&& let Some(position) = self.visible_position(&path)
+		{
+			self.cursor = position;
+		}
+		self.clamp_cursor();
+		self.preview.target_changed();
+		self.continue_reveal();
+	}
+
 	/// A background listing message arrived — either one more batch, or the
 	/// final word on whether the whole listing succeeded. Just dispatches;
 	/// `on_listing_batch` and `on_listing_done` each own one concern.
@@ -750,7 +833,7 @@ impl Tab {
 			Some(PendingListing::Incremental { ticket: current }) if *current == ticket => {
 				let start = self.tree.root.find(&path).and_then(|node| node.children.as_ref()).map_or(0, Vec::len);
 				self.tree.append_listing(&path, entries);
-				self.projection.append_children(&self.tree.root, &path, start, self.filter.as_ref());
+				self.projection.append_children(&self.tree.root, &path, start, self.filter.as_ref(), self.show_hidden);
 			}
 			Some(PendingListing::Buffered { ticket: current, entries: buffered }) if *current == ticket => buffered.extend(entries),
 			_ => return,
@@ -1072,6 +1155,7 @@ mod tests {
 	fn apply(tab: &mut Tab, event: Event) {
 		match event {
 			Event::Changed { path, .. } => tab.on_changed(path),
+			Event::FilesChanged { parent, changes, .. } => tab.on_files_changed(parent, changes),
 			Event::Loaded { path, ticket, result, done, .. } => tab.on_loaded(path, ticket, result, done),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			_ => panic!("unexpected event in a single-tab test"),
@@ -1116,6 +1200,32 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn hidden_files_toggle_without_reloading_and_cursor_falls_back_to_parent() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-hidden");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join(".hidden"), b"").unwrap();
+		fs::write(root.join("visible"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+
+		assert!(!tab.show_hidden);
+		assert_eq!(tab.visible().len(), 2);
+		assert!(tab.tree.root.children.as_ref().unwrap().iter().any(|node| node.path == root.join(".hidden")));
+
+		tab.toggle_hidden();
+		let hidden = root.join(".hidden");
+		tab.cursor = tab.visible_position(&hidden).unwrap();
+		assert_eq!(tab.visible().len(), 3);
+
+		tab.toggle_hidden();
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root);
+		assert_eq!(tab.visible().len(), 2);
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn cd_selected_and_cd_parent_change_the_tab_root() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-cd-navigation");
 		fs::create_dir_all(root.join("child")).unwrap();
@@ -1129,6 +1239,52 @@ mod tests {
 		tab.cd_parent();
 		assert_eq!(tab.tree.root.path, root);
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn directory_history_is_per_tab_and_discards_the_forward_branch() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-directory-history");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("a")).unwrap();
+		fs::create_dir_all(root.join("b")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+
+		tab.cd(root.join("a")).unwrap();
+		tab.cd(root.join("b")).unwrap();
+		tab.history_back();
+		assert_eq!(tab.tree.root.path, root.join("a"));
+		tab.history_back();
+		assert_eq!(tab.tree.root.path, root);
+		tab.history_forward();
+		assert_eq!(tab.tree.root.path, root.join("a"));
+
+		tab.cd(root.clone()).unwrap();
+		tab.history_forward();
+		assert_eq!(tab.tree.root.path, root, "a new navigation discards the old forward branch");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn failed_history_navigation_restores_its_cursor() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-failed-directory-history");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("gone")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, _rx) = tab(&root).await;
+
+		tab.cd(root.join("gone")).unwrap();
+		tab.history_back();
+		fs::remove_dir_all(root.join("gone")).unwrap();
+		tab.history_forward();
+		assert_eq!(tab.tree.root.path, root);
+
+		fs::create_dir_all(root.join("gone")).unwrap();
+		tab.history_forward();
+		assert_eq!(tab.tree.root.path, root.join("gone"), "the failed attempt did not consume the forward entry");
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]

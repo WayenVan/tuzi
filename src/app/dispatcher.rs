@@ -19,6 +19,10 @@ impl Dispatcher {
 			Action::CdParent => app.active_tab_mut().cd_parent(),
 			Action::CdSelected => app.active_tab_mut().cd_selected(),
 			Action::CdTrash => app.active_tab_mut().cd_trash(),
+			Action::CdHome => app.active_tab_mut().cd_home(),
+			Action::CdConfig => app.active_tab_mut().cd_config(),
+			Action::HistoryBack => app.active_tab_mut().history_back(),
+			Action::HistoryForward => app.active_tab_mut().history_forward(),
 			Action::Expand => app.active_tab_mut().expand_selected(),
 			Action::ToggleExpand => app.active_tab_mut().toggle_expand_selected(),
 			Action::Collapse => app.active_tab_mut().collapse_selected(),
@@ -39,6 +43,7 @@ impl Dispatcher {
 			Action::SwitchTab(delta) => app.switch_tab(delta),
 			Action::SetColumnMode(mode) => app.active_tab_mut().column_mode = mode,
 			Action::SetSort(policy) => app.active_tab_mut().set_sort(policy),
+			Action::ToggleHidden => app.active_tab_mut().toggle_hidden(),
 			Action::TogglePreview => app.active_tab_mut().preview.toggle(),
 			Action::SeekPreview(units) => app.active_tab_mut().preview.seek(units),
 			Action::RepeatFind { opposite } => app.active_tab_mut().repeat_find(opposite),
@@ -55,6 +60,11 @@ impl Dispatcher {
 			Event::Changed { tab, path } => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
+				}
+			}
+			Event::FilesChanged { tab, parent, changes } => {
+				if let Some(t) = app.tab_mut(tab) {
+					t.on_files_changed(parent, changes);
 				}
 			}
 			Event::Loaded {

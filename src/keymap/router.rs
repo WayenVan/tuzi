@@ -105,6 +105,15 @@ mod tests {
 	}
 
 	#[test]
+	fn control_o_and_control_i_navigate_directory_history() {
+		let mut router = Router::default();
+		let control = |c| Key::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+		assert_eq!(router.route(KeyContext::Manager, control('o')), Route::Actions(vec![Action::HistoryBack]));
+		assert_eq!(router.route(KeyContext::Manager, control('i')), Route::Actions(vec![Action::HistoryForward]));
+		assert_eq!(router.route(KeyContext::Manager, Key::plain(KeyCode::Tab)), Route::Actions(vec![Action::HistoryForward]));
+	}
+
+	#[test]
 	fn semicolon_toggles_selection_and_plain_space_is_unbound() {
 		let mut router = Router::default();
 		assert_eq!(router.route(KeyContext::Manager, Key::char(';')), Route::Actions(vec![Action::ToggleSelect]));
@@ -150,6 +159,18 @@ mod tests {
 				Route::Actions(vec![Action::SetColumnMode(mode)])
 			);
 		}
+	}
+
+	#[test]
+	fn hidden_and_directory_shortcuts_match_yazi() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char('.')), Route::Actions(vec![Action::ToggleHidden]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('~')), Route::Actions(vec![Action::CdHome]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('c')), Route::Actions(vec![Action::CdConfig]));
 	}
 
 	#[test]
