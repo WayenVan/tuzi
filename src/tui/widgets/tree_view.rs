@@ -1,24 +1,35 @@
-use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{List, ListItem, ListState}};
+use ratatui::{
+	Frame,
+	layout::Rect,
+	style::{Color, Modifier, Style},
+	text::{Line, Span},
+	widgets::{List, ListItem, ListState},
+};
 
-use crate::{column_mode::ColumnMode, core::{Filter, Node, Selection, Visual}, finder::Finder, icon::{Icon, IconTheme}};
+use crate::{
+	column_mode::ColumnMode,
+	core::{Filter, Node, Selection, Visual},
+	finder::Finder,
+	icon::{Icon, IconTheme},
+};
 
 pub struct TreeView;
 
 pub struct TreeViewState<'a> {
-	pub cursor:        usize,
-	pub focused:       bool,
-	pub selection:     &'a Selection,
-	pub visual:        Option<Visual>,
-	pub clipboard:     &'a [std::path::PathBuf],
+	pub cursor: usize,
+	pub focused: bool,
+	pub selection: &'a Selection,
+	pub visual: Option<Visual>,
+	pub clipboard: &'a [std::path::PathBuf],
 	pub clipboard_cut: bool,
-	pub column_mode:   ColumnMode,
-	pub icon_theme:    &'a IconTheme,
-	pub finder:        Option<&'a Finder>,
-	pub filter:        Option<&'a Filter>,
+	pub column_mode: ColumnMode,
+	pub icon_theme: &'a IconTheme,
+	pub finder: Option<&'a Finder>,
+	pub filter: Option<&'a Filter>,
 	/// The tab's persisted scroll offset — read to seed this frame's list,
 	/// then written back with whatever ratatui settled on, so it only
 	/// shifts when the cursor would otherwise leave the viewport.
-	pub scroll:        &'a mut usize,
+	pub scroll: &'a mut usize,
 }
 
 impl TreeView {
@@ -27,10 +38,8 @@ impl TreeView {
 		let items = rows.iter().enumerate().map(|(visible_index, (depth, node))| {
 			let index = row_offset + visible_index;
 			let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
-			let mut icon = state.icon_theme.icon_for(node);
-			if index == state.cursor && state.focused {
-				icon.style = Style::new();
-			}
+			let icon = state.icon_theme.icon_for(node);
+			let is_cursor_row = index == state.cursor && state.focused;
 			// A pending visual range previews the outcome of committing it
 			// (Esc) rather than the current selection: rows inside it show
 			// as selected for a plain visual, or unselected for a visual
@@ -39,12 +48,7 @@ impl TreeView {
 				let (lo, hi) = visual.range(state.cursor);
 				(lo..=hi).contains(&index).then_some(!visual.unset)
 			});
-			let marker_style = marker_style(
-				visual_preview,
-				state.selection.contains(&node.path),
-				state.clipboard.contains(&node.path),
-				state.clipboard_cut,
-			);
+			let marker_style = marker_style(visual_preview, state.selection.contains(&node.path), state.clipboard.contains(&node.path), state.clipboard_cut);
 			// A load failure is a standing problem with this node, not a
 			// transient toast, so it's pinned to the row itself — checked
 			// ahead of the loading indicator since a collapsed, failed node
@@ -52,28 +56,19 @@ impl TreeView {
 			let suffix = if let Some(error) = &node.load_error {
 				Some((format!(" (Error: {error})"), Style::new().fg(Color::Red)))
 			} else if node.loading {
-				Some((" (loading…)".to_string(), Style::new().fg(Color::DarkGray)))
+				Some((" (loading…)".to_string(), Style::new().fg(Color::Gray)))
+			} else if let Some(target) = &node.cha.link_target {
+				let color = if node.cha.link_broken { Color::Red } else { Color::Gray };
+				Some((format!(" -> {}", target.display()), Style::new().fg(color)))
 			} else {
 				None
 			};
+			let name_style = (node.cha.is_link && node.cha.link_broken).then(|| Style::new().fg(Color::Red));
 			// An active filter already decided this row belongs in the tree;
 			// highlighting why doubles as a hint once `find` isn't also
 			// pointing at the same name.
-			let matches = state
-				.finder
-				.map(|finder| finder.ranges(&name))
-				.or_else(|| state.filter.map(|filter| filter.ranges(&name)))
-				.unwrap_or_default();
-			let line = row_line(
-				"  ".repeat(*depth),
-				marker_style,
-				icon,
-				name,
-				matches,
-				suffix,
-				state.column_mode.text(node),
-				area.width as usize,
-			);
+			let matches = state.finder.map(|finder| finder.ranges(&name)).or_else(|| state.filter.map(|filter| filter.ranges(&name))).unwrap_or_default();
+			let line = row_line("  ".repeat(*depth), marker_style, icon, name, name_style, matches, suffix, state.column_mode.text(node), area.width as usize, is_cursor_row);
 
 			ListItem::new(line)
 		});
@@ -131,10 +126,12 @@ fn row_line(
 	marker: Option<Style>,
 	icon: Icon,
 	body: String,
+	name_style: Option<Style>,
 	matches: Vec<std::ops::Range<usize>>,
 	suffix: Option<(String, Style)>,
 	right: Option<String>,
 	width: usize,
+	is_cursor_row: bool,
 ) -> Line<'static> {
 	let right_width = right.as_deref().map_or(0, |text| Line::from(text).width());
 	if right_width >= width {
@@ -153,16 +150,23 @@ fn row_line(
 	let left_width = prefix_width + Line::from(body.as_str()).width() + suffix_width;
 	let padding = right.as_ref().map_or(0, |_| width.saturating_sub(left_width + right_width));
 	let marker = marker.map_or_else(|| Span::raw(" "), |style| Span::styled("│", style));
-	let mut spans = vec![
-		Span::raw(indent),
-		marker,
-		Span::raw(" "),
-		Span::styled(icon.text.to_string(), icon.style),
-		Span::raw(" "),
-	];
-	spans.extend(highlight_matches(body, &matches));
+	let mut spans = vec![Span::raw(indent), marker, Span::raw(" "), Span::styled(icon.text.to_string(), icon.style), Span::raw(" ")];
+	spans.extend(highlight_matches(body, &matches, name_style.unwrap_or_default()));
 	if let Some((text, style)) = suffix {
 		spans.push(Span::styled(text, style));
+	}
+	// The list's own reversed `highlight_style` already marks this row; an
+	// explicit fg/bg on any of these spans would `patch` on top of it
+	// instead of being swapped along with everything else, leaving a
+	// mismatched-looking patch behind. The marker (index 1) is exempt: its
+	// fg == bg trick already survives a reversal untouched, and it's the
+	// one signal (multi-select/clipboard/visual) worth keeping visible even
+	// where the cursor currently sits.
+	if is_cursor_row {
+		for span in spans.iter_mut().skip(2) {
+			span.style.fg = None;
+			span.style.bg = None;
+		}
 	}
 	if let Some(right) = right {
 		spans.push(Span::raw(" ".repeat(padding)));
@@ -171,10 +175,10 @@ fn row_line(
 	Line::from(spans)
 }
 
-fn highlight_matches(body: String, matches: &[std::ops::Range<usize>]) -> Vec<Span<'static>> {
+fn highlight_matches(body: String, matches: &[std::ops::Range<usize>], name_style: Style) -> Vec<Span<'static>> {
 	let chars: Vec<char> = body.chars().collect();
 	if matches.is_empty() {
-		return vec![Span::raw(body)];
+		return vec![Span::styled(body, name_style)];
 	}
 	let matched = |index| matches.iter().any(|range| range.contains(&index));
 	let mut spans = Vec::new();
@@ -187,12 +191,9 @@ fn highlight_matches(body: String, matches: &[std::ops::Range<usize>]) -> Vec<Sp
 		}
 		let text: String = chars[start..end].iter().collect();
 		if styled {
-			spans.push(Span::styled(
-				text,
-				Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED),
-			));
+			spans.push(Span::styled(text, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)));
 		} else {
-			spans.push(Span::raw(text));
+			spans.push(Span::styled(text, name_style));
 		}
 		start = end;
 	}
@@ -224,7 +225,8 @@ fn truncate(text: String, width: usize) -> String {
 mod tests {
 	use ratatui::style::{Color, Modifier, Style};
 
-	use super::{cursor_style, marker_style, viewport};
+	use super::{cursor_style, highlight_matches, marker_style, row_line, viewport};
+	use crate::icon::Icon;
 
 	#[test]
 	fn unfocused_cursor_mutes_only_the_background() {
@@ -234,6 +236,53 @@ mod tests {
 		assert_eq!(unfocused.bg, Some(Color::Rgb(0x31, 0x32, 0x44)));
 		assert!(!unfocused.add_modifier.contains(Modifier::REVERSED));
 		assert!(!unfocused.add_modifier.contains(Modifier::DIM), "text must retain its original brightness");
+	}
+
+	#[test]
+	#[allow(clippy::single_range_in_vec_init, reason = "one highlighted range is exactly what's under test")]
+	fn broken_link_names_get_the_name_style_outside_any_matched_range() {
+		let red = Style::new().fg(Color::Red);
+		let spans = highlight_matches("dangling".to_string(), &[], red);
+		assert_eq!(spans, vec![ratatui::text::Span::styled("dangling", red)]);
+
+		// A find/filter match still wins the highlight over the broken-link
+		// styling for the matched substring itself.
+		let matched_ranges = vec![0..3];
+		let spans = highlight_matches("dangling".to_string(), &matched_ranges, red);
+		assert_eq!(spans[0].style, Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED));
+		assert_eq!(spans[1].style, red, "the rest of the name keeps the broken-link color");
+	}
+
+	#[test]
+	fn cursor_row_strips_colors_from_everything_but_the_marker() {
+		let marker = Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow));
+		let icon = Icon {
+			text: 'i',
+			style: Style::new().fg(Color::Blue),
+		};
+		let suffix = Some((" -> target".to_string(), Style::new().fg(Color::Gray)));
+
+		let line = row_line(String::new(), marker, icon, "name".to_string(), None, Vec::new(), suffix, None, 80, true);
+
+		assert_eq!(
+			line.spans[1].style,
+			Style::new().fg(Color::LightYellow).bg(Color::LightYellow),
+			"the marker's fg==bg trick survives a reversal untouched, so it's exempt"
+		);
+		for span in &line.spans[2..] {
+			assert_eq!(span.style.fg, None, "an explicit fg would patch on top of the reversed highlight instead of being swapped with it");
+			assert_eq!(span.style.bg, None);
+		}
+	}
+
+	#[test]
+	fn a_non_cursor_row_keeps_its_own_colors() {
+		let icon = Icon {
+			text: 'i',
+			style: Style::new().fg(Color::Blue),
+		};
+		let line = row_line(String::new(), None, icon, "name".to_string(), None, Vec::new(), None, None, 80, false);
+		assert_eq!(line.spans[3].style, Style::new().fg(Color::Blue));
 	}
 
 	#[test]
@@ -251,10 +300,7 @@ mod tests {
 			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
 			"a committed visual selection remains visible over an older copy marker"
 		);
-		assert_eq!(
-			marker_style(None, true, false, false),
-			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow))
-		);
+		assert_eq!(marker_style(None, true, false, false), Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)));
 	}
 
 	#[test]

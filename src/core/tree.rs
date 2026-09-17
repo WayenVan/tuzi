@@ -42,6 +42,27 @@ impl Tree {
 		}
 	}
 
+	pub fn collapse_subtree(&mut self, path: &Path) -> Vec<PathBuf> {
+		let mut collapsed = Vec::new();
+		if let Some(node) = self.root.find_mut(path) {
+			node.collapse_subtree(&mut collapsed);
+		}
+		collapsed
+	}
+
+	/// Collapses every cached directory below the root while keeping the
+	/// root itself open, so the current directory's immediate entries remain
+	/// usable after the operation.
+	pub fn collapse_all(&mut self) -> Vec<PathBuf> {
+		let mut collapsed = Vec::new();
+		if let Some(children) = &mut self.root.children {
+			for child in children {
+				child.collapse_subtree(&mut collapsed);
+			}
+		}
+		collapsed
+	}
+
 	pub fn apply_listing(&mut self, path: &Path, entries: Vec<(PathBuf, Cha)>, policy: SortPolicy) -> bool {
 		match self.root.find_mut(path) {
 			Some(node) => {
@@ -53,7 +74,9 @@ impl Tree {
 	}
 
 	pub fn apply_changes(&mut self, path: &Path, changes: Vec<FsChange>, policy: SortPolicy) -> bool {
-		let Some(node) = self.root.find_mut(path) else { return false };
+		let Some(node) = self.root.find_mut(path) else {
+			return false;
+		};
 		if node.children.is_none() {
 			return false;
 		}
@@ -87,12 +110,11 @@ impl Tree {
 		true
 	}
 
-	pub fn finish_incremental_listing(&mut self, path: &Path, policy: SortPolicy) -> bool {
+	pub fn finish_incremental_listing(&mut self, path: &Path, policy: SortPolicy) -> Option<Vec<usize>> {
 		let Some(node) = self.root.find_mut(path) else {
-			return false;
+			return None;
 		};
-		node.finish_incremental_listing(policy);
-		true
+		Some(node.finish_incremental_listing(policy))
 	}
 
 	pub fn discard_incremental_listing(&mut self, path: &Path) -> bool {

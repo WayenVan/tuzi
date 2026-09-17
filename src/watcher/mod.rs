@@ -1,14 +1,33 @@
-use std::{collections::{HashMap, HashSet}, io, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::Duration};
+use std::{
+	collections::{HashMap, HashSet},
+	io,
+	path::{Path, PathBuf},
+	sync::{
+		Arc, Mutex,
+		mpsc::{self, SyncSender},
+	},
+	thread,
+	time::Duration,
+};
 
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::AbortHandle, time::Instant};
 
-use crate::{event::Event, fs::{Cha, FsChange}};
+use crate::{
+	event::Event,
+	fs::{Cha, FsChange},
+};
 
 pub struct Watcher {
-	inner:   Box<dyn NotifyWatcher + Send>,
-	watched: Arc<Mutex<WatchIndex>>,
+	commands: mpsc::Sender<WatchCommand>,
+	worker: Option<thread::JoinHandle<()>>,
 	pending: PendingChanges,
+}
+
+enum WatchCommand {
+	Watch { path: PathBuf, reply: Option<SyncSender<io::Result<()>>> },
+	Unwatch(PathBuf),
+	Shutdown,
 }
 
 /// `notify` needs the canonical (symlink-resolved) path to actually register
@@ -20,7 +39,7 @@ pub struct Watcher {
 #[derive(Default)]
 struct WatchIndex {
 	by_canonical: HashMap<PathBuf, PathBuf>,
-	by_original:  HashMap<PathBuf, PathBuf>,
+	by_original: HashMap<PathBuf, PathBuf>,
 }
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -35,15 +54,15 @@ type PendingChanges = Arc<Mutex<HashMap<PathBuf, PendingChange>>>;
 
 struct PendingChange {
 	first_seen: Instant,
-	deadline:   Instant,
-	paths:      HashSet<PathBuf>,
-	refresh:    bool,
-	abort:      Option<AbortHandle>,
+	deadline: Instant,
+	paths: HashSet<PathBuf>,
+	refresh: bool,
+	abort: Option<AbortHandle>,
 }
 
 struct ChangeSet {
-	parent:  PathBuf,
-	paths:   HashSet<PathBuf>,
+	parent: PathBuf,
+	paths: HashSet<PathBuf>,
 	refresh: bool,
 }
 
@@ -53,7 +72,7 @@ impl Watcher {
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
 		let inner = RecommendedWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime), Config::default()).map_err(io::Error::other)?;
-		Ok(Self { inner: Box::new(inner), watched, pending })
+		Ok(Self::with_inner(Box::new(inner), watched, pending))
 	}
 
 	#[cfg(test)]
@@ -63,32 +82,51 @@ impl Watcher {
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
 		let config = Config::default().with_poll_interval(interval).with_compare_contents(true);
 		let inner = notify::PollWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime), config).map_err(io::Error::other)?;
-		Ok(Self { inner: Box::new(inner), watched, pending })
+		Ok(Self::with_inner(Box::new(inner), watched, pending))
+	}
+
+	fn with_inner(mut inner: Box<dyn NotifyWatcher + Send>, watched: Arc<Mutex<WatchIndex>>, pending: PendingChanges) -> Self {
+		let (commands, rx) = mpsc::channel();
+		let worker_watched = watched.clone();
+		let worker = thread::Builder::new()
+			.name("tuzi-watcher".into())
+			.spawn(move || {
+				while let Ok(command) = rx.recv() {
+					match command {
+						WatchCommand::Watch { path, reply } => {
+							let result = register_watch(inner.as_mut(), &worker_watched, &path);
+							if let Some(reply) = reply {
+								let _ = reply.send(result);
+							}
+						}
+						WatchCommand::Unwatch(path) => unregister_watch(inner.as_mut(), &worker_watched, &path),
+						WatchCommand::Shutdown => break,
+					}
+				}
+			})
+			.expect("watcher worker thread");
+		Self { commands, worker: Some(worker), pending }
 	}
 
 	/// Watches one directory level, non-recursively — nodes watch themselves
 	/// only while expanded, mirroring what's actually visible on screen.
-	pub fn watch(&mut self, path: &Path) -> io::Result<()> {
-		let canonical = path.canonicalize()?;
-		if self.watched.lock().unwrap().by_canonical.contains_key(&canonical) {
-			return Ok(());
-		}
-		self.inner.watch(&canonical, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
-		let mut watched = self.watched.lock().unwrap();
-		watched.by_canonical.insert(canonical.clone(), path.to_path_buf());
-		watched.by_original.insert(path.to_path_buf(), canonical);
-		Ok(())
+	pub fn watch(&self, path: &Path) -> io::Result<()> {
+		let (tx, rx) = mpsc::sync_channel(1);
+		self.commands.send(WatchCommand::Watch { path: path.to_path_buf(), reply: Some(tx) }).map_err(io::Error::other)?;
+		rx.recv().map_err(io::Error::other)?
+	}
+
+	/// Queues the complete canonicalize-and-register operation. Expanding a
+	/// node therefore never waits on a slow symlink target or network mount.
+	pub fn watch_async(&self, path: PathBuf) {
+		let _ = self.commands.send(WatchCommand::Watch { path, reply: None });
 	}
 
 	/// Takes the same (tree-space) path `watch` was given — not re-derived
 	/// from the filesystem, so this still works even if whatever the path
 	/// pointed at has already vanished.
-	pub fn unwatch(&mut self, path: &Path) {
-		let mut watched = self.watched.lock().unwrap();
-		let Some(canonical) = watched.by_original.remove(path) else { return };
-		watched.by_canonical.remove(&canonical);
-		drop(watched);
-		let _ = self.inner.unwatch(&canonical);
+	pub fn unwatch(&self, path: &Path) {
+		let _ = self.commands.send(WatchCommand::Unwatch(path.to_path_buf()));
 		if let Some(change) = self.pending.lock().unwrap().remove(path)
 			&& let Some(abort) = change.abort
 		{
@@ -99,6 +137,10 @@ impl Watcher {
 
 impl Drop for Watcher {
 	fn drop(&mut self) {
+		let _ = self.commands.send(WatchCommand::Shutdown);
+		if let Some(worker) = self.worker.take() {
+			let _ = worker.join();
+		}
 		for (_, change) in self.pending.lock().unwrap().drain() {
 			if let Some(abort) = change.abort {
 				abort.abort();
@@ -107,19 +149,35 @@ impl Drop for Watcher {
 	}
 }
 
+fn register_watch(inner: &mut dyn NotifyWatcher, watched: &Mutex<WatchIndex>, path: &Path) -> io::Result<()> {
+	let canonical = path.canonicalize()?;
+	if watched.lock().unwrap().by_canonical.contains_key(&canonical) {
+		return Ok(());
+	}
+	inner.watch(&canonical, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
+	let mut watched = watched.lock().unwrap();
+	watched.by_canonical.insert(canonical.clone(), path.to_path_buf());
+	watched.by_original.insert(path.to_path_buf(), canonical);
+	Ok(())
+}
+
+fn unregister_watch(inner: &mut dyn NotifyWatcher, watched: &Mutex<WatchIndex>, path: &Path) {
+	let mut watched = watched.lock().unwrap();
+	let Some(canonical) = watched.by_original.remove(path) else {
+		return;
+	};
+	watched.by_canonical.remove(&canonical);
+	drop(watched);
+	let _ = inner.unwatch(&canonical);
+}
+
 // The backend (FSEvents/inotify/...) doesn't consistently report a changed
 // child's path vs. its watched parent, and may resolve symlinks along the
 // way — so the ancestor walk below matches in canonical space. Everything
 // downstream of that match (the `changed` map, debounce bookkeeping, the
 // event finally sent out) is then translated back to the tree's own path,
 // which is what `Tab` actually indexes its nodes by.
-fn event_handler(
-	tab: usize,
-	tx: UnboundedSender<Event>,
-	matched: Arc<Mutex<WatchIndex>>,
-	pending: PendingChanges,
-	runtime: Handle,
-) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+fn event_handler(tab: usize, tx: UnboundedSender<Event>, matched: Arc<Mutex<WatchIndex>>, pending: PendingChanges, runtime: Handle) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
 	move |res| {
 		let Ok(event) = res else { return };
 		if event.kind.is_access() {
@@ -129,7 +187,9 @@ fn event_handler(
 		let mut changed: HashMap<PathBuf, (HashSet<PathBuf>, bool)> = HashMap::new();
 		for path in event.paths {
 			if let Some(canonical_dir) = nearest_watched(&watched.by_canonical, &path) {
-				let Some(original_dir) = watched.by_canonical.get(&canonical_dir) else { continue };
+				let Some(original_dir) = watched.by_canonical.get(&canonical_dir) else {
+					continue;
+				};
 				let entry = changed.entry(original_dir.clone()).or_default();
 				if path == canonical_dir {
 					entry.1 = true;
@@ -147,15 +207,7 @@ fn event_handler(
 	}
 }
 
-fn debounce_changes(
-	tab: usize,
-	tx: UnboundedSender<Event>,
-	pending: PendingChanges,
-	runtime: &Handle,
-	change_set: ChangeSet,
-	delay: Duration,
-	max_wait: Duration,
-) {
+fn debounce_changes(tab: usize, tx: UnboundedSender<Event>, pending: PendingChanges, runtime: &Handle, change_set: ChangeSet, delay: Duration, max_wait: Duration) {
 	let ChangeSet { parent, paths, refresh } = change_set;
 	let now = Instant::now();
 	let deadline = now + delay;
@@ -166,12 +218,23 @@ fn debounce_changes(
 		change.deadline = if change.paths.len() >= MAX_CHANGE_BATCH { now } else { deadline.min(capped) };
 		return;
 	}
-	pending.lock().unwrap().insert(parent.clone(), PendingChange { first_seen: now, deadline, paths, refresh, abort: None });
+	pending.lock().unwrap().insert(
+		parent.clone(),
+		PendingChange {
+			first_seen: now,
+			deadline,
+			paths,
+			refresh,
+			abort: None,
+		},
+	);
 	let task_parent = parent.clone();
 	let task_pending = pending.clone();
 	let handle = runtime.spawn(async move {
 		loop {
-			let Some(deadline) = task_pending.lock().unwrap().get(&task_parent).map(|change| change.deadline) else { return };
+			let Some(deadline) = task_pending.lock().unwrap().get(&task_parent).map(|change| change.deadline) else {
+				return;
+			};
 			tokio::time::sleep_until(deadline).await;
 			let change = {
 				let mut pending = task_pending.lock().unwrap();
@@ -202,8 +265,12 @@ fn debounce_changes(
 fn inspect_paths(paths: HashSet<PathBuf>) -> Vec<FsChange> {
 	paths
 		.into_iter()
-		.filter_map(|path| match std::fs::metadata(&path) {
-			Ok(metadata) => Some(FsChange::Upsert { path, cha: Cha::from(metadata) }),
+		.filter_map(|path| match std::fs::symlink_metadata(&path) {
+			Ok(metadata) => {
+				let mut cha = Cha::from(metadata);
+				cha.resolve_symlink(&path);
+				Some(FsChange::Upsert { path, cha })
+			}
 			Err(error) if error.kind() == io::ErrorKind::NotFound => Some(FsChange::Delete { path }),
 			Err(_) => None,
 		})
@@ -223,7 +290,10 @@ fn nearest_watched(by_canonical: &HashMap<PathBuf, PathBuf>, path: &Path) -> Opt
 
 #[cfg(test)]
 mod tests {
-	use std::{fs, time::{Duration, SystemTime, UNIX_EPOCH}};
+	use std::{
+		fs,
+		time::{Duration, SystemTime, UNIX_EPOCH},
+	};
 
 	use tokio::sync::mpsc;
 
@@ -243,7 +313,11 @@ mod tests {
 				tx.clone(),
 				pending.clone(),
 				&runtime,
-				ChangeSet { parent: parent.clone(), paths: HashSet::from([path.clone()]), refresh: false },
+				ChangeSet {
+					parent: parent.clone(),
+					paths: HashSet::from([path.clone()]),
+					refresh: false,
+				},
 				Duration::from_millis(20),
 				Duration::from_secs(1),
 			);
@@ -272,7 +346,11 @@ mod tests {
 					churn_tx.clone(),
 					churn_pending.clone(),
 					&runtime,
-					ChangeSet { parent: churn_parent.clone(), paths: HashSet::from([churn_path.clone()]), refresh: false },
+					ChangeSet {
+						parent: churn_parent.clone(),
+						paths: HashSet::from([churn_path.clone()]),
+						refresh: false,
+					},
 					Duration::from_millis(60),
 					Duration::from_millis(120),
 				);
@@ -295,7 +373,7 @@ mod tests {
 		let dir = dir.canonicalize().unwrap();
 
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let mut watcher = Watcher::new_polling(7, tx, Duration::from_millis(25)).unwrap();
+		let watcher = Watcher::new_polling(7, tx, Duration::from_millis(25)).unwrap();
 		watcher.watch(&dir).unwrap();
 		fs::write(dir.join("new.txt"), b"hi").unwrap();
 
@@ -323,7 +401,7 @@ mod tests {
 		std::os::unix::fs::symlink(&real, &link).unwrap();
 
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let mut watcher = Watcher::new_polling(11, tx, Duration::from_millis(25)).unwrap();
+		let watcher = Watcher::new_polling(11, tx, Duration::from_millis(25)).unwrap();
 		// The tree only ever knows about `link` — it never sees `real`, the
 		// canonicalized form `watch` resolves internally to register the OS
 		// watch.
@@ -341,5 +419,22 @@ mod tests {
 		}
 
 		fs::remove_dir_all(&base).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn inspect_paths_lstats_a_changed_symlink_instead_of_following_it() {
+		let root = std::env::temp_dir().join(format!("tuzi-watcher-inspect-test-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("real")).unwrap();
+		std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+
+		let changes = inspect_paths(HashSet::from([root.join("link")]));
+		let [FsChange::Upsert { cha, .. }] = changes.as_slice() else { panic!("expected one upsert") };
+		assert!(cha.is_link, "a live refresh must still see this as a symlink, not silently follow through to the target");
+		assert!(cha.is_dir, "still expandable, since it points at a directory");
+		assert_eq!(cha.link_target, Some(PathBuf::from("real")));
+
+		fs::remove_dir_all(&root).unwrap();
 	}
 }

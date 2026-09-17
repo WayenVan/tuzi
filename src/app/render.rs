@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::{layout::{Constraint, Direction, Layout}, style::{Color, Modifier, Style}};
 
-use crate::{event::Event, preview::PreviewTarget, status::Segment, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
+use crate::{event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::{App, app::MouseState};
 
@@ -51,17 +51,37 @@ impl App {
 		// here — `StatusBar` itself just lays these two lists out. Adding a
 		// clock, a git branch, anything else later is just pushing another
 		// `Segment` into whichever of these two it belongs in.
-		let mut status_left = vec![Segment::new(format!(" {} ", status.mode.label()), status.mode.style().add_modifier(Modifier::BOLD))];
+		let mode_edge = Style::new().fg(status.mode.color());
+		let mode_fill = status.mode.style().add_modifier(Modifier::BOLD);
+		let alt_fill = status.mode.alt_style();
+		let mut status_left = vec![
+			Segment::new("", mode_edge),
+			Segment::new(format!(" {} ", status.mode.label()), mode_fill),
+			Segment::new("", Style::new().fg(status.mode.color()).bg(status.mode.alt_background())),
+			Segment::new(format!(" {} ", status.size), alt_fill),
+			Segment::new("", Style::new().fg(status.mode.alt_background())),
+		];
 		if let Some(error) = &status.error {
 			status_left.push(Segment::new(format!(" {error}"), Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)));
 		} else if !status.name.is_empty() {
-			status_left.push(Segment::new(format!(" {}", status.name), Style::new().fg(Color::Gray)));
-			status_left.push(Segment::new(format!("  {}  {}", status.size, status.permissions), Style::new().fg(Color::DarkGray)));
+			status_left.push(Segment::new(format!(" {}", status.name), Style::new()));
 		}
 		let mut status_right = Vec::new();
 		if let Some((count, percent)) = self.tasks.summary() {
-			status_right.push(Segment::new(format!(" {percent:3.0}% · {count} tasks "), Style::new().fg(Color::Black).bg(Color::Blue)));
+			status_right.push(Segment::new(
+				format!(" {percent:3.0}% · {count} tasks "),
+				Style::new().fg(Color::Rgb(0xa6, 0xe3, 0xa1)).bg(Color::Rgb(0x45, 0x47, 0x5a)),
+			));
 		}
+		for character in status.permissions.chars() {
+			status_right.push(Segment::new(character.to_string(), permission_style(character)));
+		}
+		let (position_percent, position_count) = position_labels(tab.cursor, visible_len);
+		status_right.push(Segment::new(" ", Style::new().fg(status.mode.alt_background())));
+		status_right.push(Segment::new(format!(" {position_percent} "), alt_fill));
+		status_right.push(Segment::new("", Style::new().fg(status.mode.color()).bg(status.mode.alt_background())));
+		status_right.push(Segment::new(format!(" {position_count} "), mode_fill));
+		status_right.push(Segment::new("", mode_edge));
 
 		term.terminal.draw(|frame| {
 			let [win_area, tab_area, body_area, status_area] = Layout::default()

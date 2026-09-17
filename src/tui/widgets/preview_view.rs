@@ -1,4 +1,10 @@
-use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line, Span}, widgets::{Block, Borders, Paragraph, Wrap}};
+use ratatui::{
+	Frame,
+	layout::Rect,
+	style::{Color, Modifier, Style},
+	text::{Line, Span},
+	widgets::{Block, Borders, Paragraph, Wrap},
+};
 
 use crate::{core::Node, fs::format_size, preview::PreviewState};
 
@@ -24,7 +30,13 @@ fn directory_lines(node: &Node) -> Vec<Line<'static>> {
 	// `is_link` takes precedence: a symlinked directory is expandable (so
 	// `is_dir` is true, see `fs::engine::cha_for`), but it should still read
 	// as a symlink here rather than an indistinguishable plain directory.
-	let kind = if node.cha.is_link { "symlink" } else if node.cha.is_dir { "directory" } else { "file" };
+	let kind = if node.cha.is_link {
+		if node.cha.link_broken { "symlink (broken)" } else { "symlink" }
+	} else if node.cha.is_dir {
+		"directory"
+	} else {
+		"file"
+	};
 	let mut lines = vec![
 		Line::from(node.path.display().to_string()),
 		Line::from(""),
@@ -32,6 +44,9 @@ fn directory_lines(node: &Node) -> Vec<Line<'static>> {
 		Line::from(format!("Size: {}", format_size(node.cha.len))),
 		Line::from(format!("Mode: {}", node.cha.permissions())),
 	];
+	if let Some(target) = &node.cha.link_target {
+		lines.push(Line::from(format!("Target: {}", target.display())));
+	}
 
 	if node.cha.is_dir {
 		lines.push(Line::from(""));
@@ -53,8 +68,11 @@ fn text_lines(state: &PreviewState) -> Vec<Line<'static>> {
 		PreviewState::Empty => Vec::new(),
 		PreviewState::Loading => vec![Line::from("Loading…")],
 		PreviewState::Error(error) => vec![Line::from(Span::styled(error.clone(), Style::new().fg(Color::Red)))],
-		PreviewState::Ready(data) if data.lines.is_empty() && data.eof => vec![Line::from("Empty file")],
-		PreviewState::Ready(data) => data.lines
+		PreviewState::Ready(data) if data.lines.is_empty() && data.eof => {
+			vec![Line::from("Empty file")]
+		}
+		PreviewState::Ready(data) => data
+			.lines
 			.iter()
 			.map(|line| {
 				Line::from(
@@ -64,9 +82,15 @@ fn text_lines(state: &PreviewState) -> Vec<Line<'static>> {
 							if let Some((r, g, b)) = span.foreground {
 								style = style.fg(Color::Rgb(r, g, b));
 							}
-							if span.bold { style = style.add_modifier(Modifier::BOLD); }
-							if span.italic { style = style.add_modifier(Modifier::ITALIC); }
-							if span.underline { style = style.add_modifier(Modifier::UNDERLINED); }
+							if span.bold {
+								style = style.add_modifier(Modifier::BOLD);
+							}
+							if span.italic {
+								style = style.add_modifier(Modifier::ITALIC);
+							}
+							if span.underline {
+								style = style.add_modifier(Modifier::UNDERLINED);
+							}
 							Span::styled(span.text.clone(), style)
 						})
 						.collect::<Vec<_>>(),

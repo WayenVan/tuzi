@@ -5,7 +5,7 @@ use crate::core::Node;
 
 #[derive(Clone, Copy)]
 pub struct Icon {
-	pub text:  char,
+	pub text: char,
 	pub style: Style,
 }
 
@@ -15,7 +15,8 @@ pub struct IconTheme;
 impl IconTheme {
 	pub fn icon_for(&self, node: &Node) -> Icon {
 		if node.cha.is_link {
-			return Icon::new('', Color::Rgb(0x9e, 0x9e, 0x9e));
+			let color = if node.cha.link_broken { Color::Rgb(0xf4, 0x43, 0x36) } else { Color::Rgb(0x9e, 0x9e, 0x9e) };
+			return Icon::new('', color);
 		}
 		if node.cha.is_dir {
 			return if node.expanded {
@@ -35,7 +36,9 @@ impl IconTheme {
 }
 
 impl Icon {
-	fn new(text: char, color: Color) -> Self { Self { text, style: Style::new().fg(color) } }
+	fn new(text: char, color: Color) -> Self {
+		Self { text, style: Style::new().fg(color) }
+	}
 }
 
 fn parse_hex(value: &str) -> Option<Color> {
@@ -58,7 +61,22 @@ mod tests {
 	use super::*;
 
 	fn node(path: &str, is_dir: bool, is_link: bool, expanded: bool) -> Node {
-		Node { path: PathBuf::from(path), cha: Cha { len: 0, is_dir, is_link, modified: None, mode: 0 }, expanded, children: None, loading: false, load_error: None }
+		Node {
+			path: PathBuf::from(path),
+			cha: Cha {
+				len: 0,
+				is_dir,
+				is_link,
+				link_target: None,
+				link_broken: false,
+				modified: None,
+				mode: 0,
+			},
+			expanded,
+			children: None,
+			loading: false,
+			load_error: None,
+		}
 	}
 
 	#[test]
@@ -73,5 +91,16 @@ mod tests {
 		let theme = IconTheme;
 		assert_ne!(theme.icon_for(&node("main.rs", false, false, false)).text, '');
 		assert_eq!(theme.icon_for(&node("unknown-file", false, false, false)).text, '');
+	}
+
+	#[test]
+	fn a_broken_link_gets_a_red_icon_instead_of_the_usual_grey() {
+		let theme = IconTheme;
+		let mut broken = node("dangling-link", false, true, false);
+		broken.cha.link_broken = true;
+		let live = node("live-link", false, true, false);
+
+		assert_eq!(theme.icon_for(&broken).style, Style::new().fg(Color::Rgb(0xf4, 0x43, 0x36)));
+		assert_eq!(theme.icon_for(&live).style, Style::new().fg(Color::Rgb(0x9e, 0x9e, 0x9e)));
 	}
 }

@@ -114,10 +114,27 @@ mod tests {
 	}
 
 	#[test]
-	fn semicolon_toggles_selection_and_plain_space_is_unbound() {
+	fn space_prefix_exposes_fzf_and_symlink_paste() {
 		let mut router = Router::default();
 		assert_eq!(router.route(KeyContext::Manager, Key::char(';')), Route::Actions(vec![Action::ToggleSelect]));
-		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Unmatched);
+		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char(' ')), Route::Actions(vec![Action::Fzf]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('-')), Route::Actions(vec![Action::PasteLink { absolute: false }]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char(' ')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('_')), Route::Actions(vec![Action::PasteLink { absolute: true }]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('P')), Route::Unmatched);
+	}
+
+	#[test]
+	fn z_prefix_controls_tree_folding_and_cursor_centering() {
+		let mut router = Router::default();
+		for (key, action) in [('c', Action::CollapseSubtree), ('m', Action::CollapseAll), ('z', Action::CenterCursor)] {
+			assert!(matches!(router.route(KeyContext::Manager, Key::char('z')), Route::Pending(_)));
+			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Actions(vec![action]));
+		}
 	}
 
 	#[test]

@@ -76,6 +76,8 @@ mod tests {
 			len,
 			is_dir,
 			is_link: false,
+			link_target: None,
+			link_broken: false,
 			modified: None,
 			mode: 0,
 		}
@@ -83,29 +85,15 @@ mod tests {
 
 	#[test]
 	fn reverse_never_moves_directories_behind_files() {
-		let mut entries = vec![
-			(PathBuf::from("small.txt"), cha(1, false)),
-			(PathBuf::from("large-dir"), cha(100, true)),
-			(PathBuf::from("large.txt"), cha(100, false)),
-		];
+		let mut entries = vec![(PathBuf::from("small.txt"), cha(1, false)), (PathBuf::from("large-dir"), cha(100, true)), (PathBuf::from("large.txt"), cha(100, false))];
 		sort(&mut entries, SortPolicy::new(SortBy::Size, true));
-		assert_eq!(
-			entries.iter().map(|entry| entry.0.as_path()).collect::<Vec<_>>(),
-			[Path::new("large-dir"), Path::new("large.txt"), Path::new("small.txt")]
-		);
+		assert_eq!(entries.iter().map(|entry| entry.0.as_path()).collect::<Vec<_>>(), [Path::new("large-dir"), Path::new("large.txt"), Path::new("small.txt")]);
 	}
 
 	#[test]
 	fn extension_sort_falls_back_to_name() {
-		let mut entries = vec![
-			(PathBuf::from("z.rs"), cha(0, false)),
-			(PathBuf::from("a.txt"), cha(0, false)),
-			(PathBuf::from("a.rs"), cha(0, false)),
-		];
+		let mut entries = vec![(PathBuf::from("z.rs"), cha(0, false)), (PathBuf::from("a.txt"), cha(0, false)), (PathBuf::from("a.rs"), cha(0, false))];
 		sort(&mut entries, SortPolicy::new(SortBy::Extension, false));
-		assert_eq!(
-			entries.iter().map(|entry| entry.0.as_path()).collect::<Vec<_>>(),
-			[Path::new("a.rs"), Path::new("z.rs"), Path::new("a.txt")]
-		);
+		assert_eq!(entries.iter().map(|entry| entry.0.as_path()).collect::<Vec<_>>(), [Path::new("a.rs"), Path::new("z.rs"), Path::new("a.txt")]);
 	}
 }

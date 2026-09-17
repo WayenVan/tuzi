@@ -55,6 +55,8 @@ tuzi --version
 | `j` / `k` | Move down / up |
 | `l` / `h` | Expand / collapse |
 | `Enter` | Toggle directory |
+| `zc` / `zm` | Collapse current subtree / all subtrees |
+| `zz` | Center current row |
 | `;` | Toggle selection |
 | `v` | Visual selection |
 | `o` / `O` | Open / open with |
@@ -62,11 +64,12 @@ tuzi --version
 | `r` | Rename |
 | `y` / `x` | Copy / cut selected files |
 | `p` | Paste |
+| `Space Space` | Jump with `fzf` |
+| `Space -` / `Space _` | Paste as a relative / absolute symlink |
 | `d` / `D` | Move to trash / delete permanently |
 | `/` / `?` | Find next / previous |
 | `f` | Filter |
 | `.` | Toggle hidden files |
-| `z` | Jump with `fzf` |
 | `g~` / `gc` | Go to home / config directory |
 | `gd` / `gD` | Go to Downloads / Desktop |
 | `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |
@@ -76,7 +79,7 @@ tuzi --version
 | `[` / `]` | Previous / next tab |
 | `q` | Quit |
 
-Prefix keys such as `g`, `c`, `m`, and `,` show their available commands inside Tuzi.
+Prefix keys such as `Space`, `g`, `c`, `m`, and `,` show their available commands inside Tuzi.
 
 ## Roadmap
 

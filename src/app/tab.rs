@@ -1,12 +1,35 @@
-use std::{collections::HashMap, io, os::unix::ffi::OsStrExt, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+	collections::HashMap,
+	io,
+	os::unix::ffi::OsStrExt,
+	path::{Path, PathBuf},
+	sync::Arc,
+	time::Duration,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use edtui::EditorMode;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{action::{CopyKind, DeleteMode}, column_mode::ColumnMode, core::{Filter, Node, Selection, Tree, Visual}, event::Event, finder::Finder, fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size}, notice::NoticeLevel, preview::Preview, scheduler::FsScheduler, status::{StatusLine, StatusMode}, watcher::Watcher};
+use crate::{
+	action::{CopyKind, DeleteMode},
+	column_mode::ColumnMode,
+	core::{Filter, Node, Selection, Tree, Visual},
+	event::Event,
+	finder::Finder,
+	fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size},
+	notice::NoticeLevel,
+	preview::Preview,
+	scheduler::FsScheduler,
+	status::{StatusLine, StatusMode},
+	watcher::Watcher,
+};
 
-use super::{input::{Completion, InputPurpose, InputSession}, path_history::PathHistory, visible_projection::VisibleProjection};
+use super::{
+	input::{Completion, InputPurpose, InputSession},
+	path_history::PathHistory,
+	visible_projection::VisibleProjection,
+};
 
 /// One tab: its own tree, cursor, selection and background workers —
 /// everything but whether the whole program should quit. The clipboard
@@ -17,42 +40,42 @@ use super::{input::{Completion, InputPurpose, InputSession}, path_history::PathH
 /// even after some *other* tab closes and every tab after it would
 /// otherwise shift position in `App::tabs`.
 pub struct Tab {
-	pub id:             usize,
-	pub tree:           Tree,
-	projection:         VisibleProjection,
-	pub cursor:         usize,
+	pub id: usize,
+	pub tree: Tree,
+	projection: VisibleProjection,
+	pub cursor: usize,
 	/// The tree view's scroll offset (index of its first visible row),
 	/// persisted across frames so ratatui only nudges it when the cursor
 	/// would otherwise leave the viewport, instead of recomputing it from
 	/// scratch — which would re-track the cursor on every move.
-	pub scroll:         usize,
-	pub column_mode:    ColumnMode,
-	pub sort_policy:    SortPolicy,
-	pub show_hidden:    bool,
-	path_history:       PathHistory,
-	pub preview:        Preview,
-	pub watcher:        Watcher,
-	pub fs_scheduler:   FsScheduler,
-	pending_listings:   HashMap<PathBuf, PendingListing>,
-	pub selection:      Selection,
-	pub visual:         Option<Visual>,
+	pub scroll: usize,
+	pub column_mode: ColumnMode,
+	pub sort_policy: SortPolicy,
+	pub show_hidden: bool,
+	path_history: PathHistory,
+	pub preview: Preview,
+	pub watcher: Watcher,
+	pub fs_scheduler: FsScheduler,
+	pending_listings: HashMap<PathBuf, PendingListing>,
+	pub selection: Selection,
+	pub visual: Option<Visual>,
 	pub pending_delete: Option<(Vec<PathBuf>, DeleteMode)>,
-	pub finder:         Option<Finder>,
-	pub filter:         Option<Filter>,
+	pub finder: Option<Finder>,
+	pub filter: Option<Filter>,
 	/// A one-off operational message (an invalid cd, a refused delete, …)
 	/// waiting to be drained into `App`'s toast queue — this is an outbox,
 	/// not something rendered from `Tab` directly. A directory listing
 	/// failure is a different, persistent kind of problem and lives on the
 	/// `Node` itself (`Node::load_error`) instead of here.
 	pub(super) pending_notice: Option<(NoticeLevel, String)>,
-	pending_reveal:     Option<RevealState>,
-	pub(super) input:   Option<InputSession>,
-	input_seq:          u64,
-	tx:                 UnboundedSender<Event>,
+	pending_reveal: Option<RevealState>,
+	pub(super) input: Option<InputSession>,
+	input_seq: u64,
+	tx: UnboundedSender<Event>,
 }
 
 struct RevealState {
-	target:           PathBuf,
+	target: PathBuf,
 	refreshed_parent: bool,
 }
 
@@ -91,7 +114,7 @@ impl Tab {
 		let root_path = tree.root.path.clone();
 		let needs_fetch = tree.mark_expanded(&root_path).unwrap_or(false);
 
-		let mut watcher = Watcher::new(id, tx.clone())?;
+		let watcher = Watcher::new(id, tx.clone())?;
 		watcher.watch(&root_path)?;
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
@@ -138,21 +161,29 @@ impl Tab {
 		self.projection.range(&self.tree, 0..self.projection.len())
 	}
 
-	pub fn visible_len(&self) -> usize { self.projection.len() }
+	pub fn visible_len(&self) -> usize {
+		self.projection.len()
+	}
 
-	pub fn visible_at(&self, target: usize) -> Option<(usize, &Node)> { self.projection.get(&self.tree, target) }
+	pub fn visible_at(&self, target: usize) -> Option<(usize, &Node)> {
+		self.projection.get(&self.tree, target)
+	}
 
 	pub fn visible_range(&self, range: std::ops::Range<usize>) -> Vec<(usize, &Node)> {
 		self.projection.range(&self.tree, range)
 	}
 
-	fn visible_position(&self, path: &Path) -> Option<usize> { self.projection.position(path) }
+	fn visible_position(&self, path: &Path) -> Option<usize> {
+		self.projection.position(path)
+	}
 
 	fn sync_projection(&mut self, path: &Path) {
 		self.projection.sync_subtree(&self.tree.root, path, self.filter.as_ref(), self.show_hidden);
 	}
 
-	fn rebuild_projection(&mut self) { self.projection.rebuild(&self.tree.root, self.filter.as_ref(), self.show_hidden); }
+	fn rebuild_projection(&mut self) {
+		self.projection.rebuild(&self.tree.root, self.filter.as_ref(), self.show_hidden);
+	}
 
 	fn cancel_listing(&mut self, path: &Path) {
 		if matches!(self.pending_listings.remove(path), Some(PendingListing::Incremental { .. })) {
@@ -227,17 +258,21 @@ impl Tab {
 	/// read — the listing lands later as a `Loaded` event instead of
 	/// blocking this call.
 	pub fn expand_selected(&mut self) {
-		let Some(path) = self.selected_dir() else { return };
+		let Some(path) = self.selected_dir() else {
+			return;
+		};
 		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
 		self.sync_projection(&path);
-		let _ = self.watcher.watch(&path);
+		self.watcher.watch_async(path.clone());
 		if needs_fetch {
 			self.fs_scheduler.refresh(path);
 		}
 	}
 
 	pub fn toggle_expand_selected(&mut self) {
-		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else {
+			return;
+		};
 		if !node.cha.is_dir {
 			return;
 		}
@@ -258,7 +293,9 @@ impl Tab {
 	/// and moves the cursor there instead — pressing "collapse" always does
 	/// something visible, the way it does in most tree file managers.
 	pub fn collapse_selected(&mut self) {
-		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else {
+			return;
+		};
 		let path = node.path.clone();
 
 		let target = if node.cha.is_dir && node.expanded { path } else { self.tree.parent_of(&path).unwrap_or(path) };
@@ -271,6 +308,32 @@ impl Tab {
 		self.select(&target);
 	}
 
+	pub fn collapse_subtree(&mut self) {
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		let path = node.path.clone();
+		let target = if node.cha.is_dir { path } else { self.tree.parent_of(&path).unwrap_or(path) };
+		for collapsed in self.tree.collapse_subtree(&target) {
+			self.cancel_listing(&collapsed);
+			self.watcher.unwatch(&collapsed);
+			self.fs_scheduler.forget(&collapsed);
+		}
+		self.sync_projection(&target);
+		self.select(&target);
+		self.preview.target_changed();
+	}
+
+	pub fn collapse_all(&mut self) {
+		let root = self.tree.root.path.clone();
+		for collapsed in self.tree.collapse_all() {
+			self.cancel_listing(&collapsed);
+			self.watcher.unwatch(&collapsed);
+			self.fs_scheduler.forget(&collapsed);
+		}
+		self.sync_projection(&root);
+		self.select(&root);
+		self.preview.target_changed();
+	}
+
 	pub fn toggle_selected(&mut self) {
 		if let Some((_, node)) = self.visible_at(self.cursor) {
 			self.selection.toggle(node.path.clone());
@@ -278,14 +341,18 @@ impl Tab {
 		self.move_cursor(1);
 	}
 
-	pub fn enter_visual(&mut self, unset: bool) { self.visual = Some(Visual::new(self.cursor, unset)); }
+	pub fn enter_visual(&mut self, unset: bool) {
+		self.visual = Some(Visual::new(self.cursor, unset));
+	}
 
 	/// Applies the pending visual range to the selection — adding every row
 	/// in it if this was a select, removing them if it was an unset — and
 	/// leaves visual mode. Mirrors yazi: the range only touches `selection`
 	/// once, on commit, not row-by-row as the cursor moves over it.
 	fn commit_visual(&mut self) -> bool {
-		let Some(visual) = self.visual.take() else { return false };
+		let Some(visual) = self.visual.take() else {
+			return false;
+		};
 		let last = self.visible_len().saturating_sub(1);
 		let (lo, hi) = visual.range(self.cursor.min(last));
 		let paths: Vec<PathBuf> = self.visible_range(lo..hi.min(last).saturating_add(1)).into_iter().map(|(_, node)| node.path.clone()).collect();
@@ -312,12 +379,7 @@ impl Tab {
 		self.visual = None;
 		let last = self.visible_len().saturating_sub(1);
 		let (lo, hi) = visual.range(self.cursor.min(last));
-		Some(
-			self.visible_range(lo..hi.min(last).saturating_add(1))
-				.into_iter()
-				.map(|(_, node)| node.path.clone())
-				.collect(),
-		)
+		Some(self.visible_range(lo..hi.min(last).saturating_add(1)).into_iter().map(|(_, node)| node.path.clone()).collect())
 	}
 
 	/// Resolves one operation's targets. A plain visual range is an explicit
@@ -353,11 +415,7 @@ impl Tab {
 		}
 		let root = &self.tree.root.path;
 		let root = root.clone();
-		let targets: Vec<_> = visual_targets
-			.unwrap_or_else(|| self.take_action_targets())
-			.into_iter()
-			.filter(|path| path != &root)
-			.collect();
+		let targets: Vec<_> = visual_targets.unwrap_or_else(|| self.take_action_targets()).into_iter().filter(|path| path != &root).collect();
 		if targets.is_empty() {
 			self.pending_delete = None;
 			self.raise(NoticeLevel::Warn, "The current tree root cannot be deleted");
@@ -390,14 +448,18 @@ impl Tab {
 	/// Copies or moves `paths` into the directory under the cursor, or next
 	/// to the cursor when it is a file (see
 	/// `paste_target`). App hands this destination to its global task queue.
-	pub(super) fn paste_destination(&self) -> Option<PathBuf> { self.paste_target() }
+	pub(super) fn paste_destination(&self) -> Option<PathBuf> {
+		self.paste_target()
+	}
 
 	/// Opens the rename prompt for whatever's under the cursor, prefilled
 	/// with its current name in Insert mode, cursor at the end — ready to
 	/// type over it. Renaming the tree's own root is refused — it would
 	/// orphan every path already cached under it.
 	pub fn start_rename(&mut self) {
-		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		let Some((_, node)) = self.visible_at(self.cursor) else {
+			return;
+		};
 		if node.path == self.tree.root.path {
 			return;
 		}
@@ -419,13 +481,7 @@ impl Tab {
 		let base = self
 			.visible_at(self.cursor)
 			.map(|(_, node)| (node.path.clone(), node.cha.is_dir && node.expanded))
-			.map(|(path, create_inside)| {
-				if create_inside {
-					path.clone()
-				} else {
-					self.tree.parent_of(&path).unwrap_or_else(|| self.tree.root.path.clone())
-				}
-			})
+			.map(|(path, create_inside)| if create_inside { path.clone() } else { self.tree.parent_of(&path).unwrap_or_else(|| self.tree.root.path.clone()) })
 			.unwrap_or_else(|| self.tree.root.path.clone());
 		self.input_seq += 1;
 		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Create { base }, ""));
@@ -452,11 +508,7 @@ impl Tab {
 		}
 		let first = usize::from(!include_current);
 		let found = (first..len).find_map(|offset| {
-			let index = if previous {
-				(self.cursor + len - offset % len) % len
-			} else {
-				(self.cursor + offset) % len
-			};
+			let index = if previous { (self.cursor + len - offset % len) % len } else { (self.cursor + offset) % len };
 			let name = node_name(self.visible_at(index)?.1);
 			finder.matches(&name).then_some(index)
 		});
@@ -475,7 +527,9 @@ impl Tab {
 
 	/// Handles the common vim input used by rename and interactive cd.
 	pub fn handle_input_key(&mut self, key: KeyEvent) {
-		let Some(mut input) = self.input.take() else { return };
+		let Some(mut input) = self.input.take() else {
+			return;
+		};
 
 		if input.is_cd() && input.completion.is_some() {
 			match key.code {
@@ -560,9 +614,7 @@ impl Tab {
 		input.handler.on_key_event(key, &mut input.state);
 		input.error = None;
 		let after = (input.value(), input.state.cursor.col);
-		if (input.is_cd() && before != after)
-			|| ((input.find_previous().is_some() || input.is_filter()) && before.0 != after.0)
-		{
+		if (input.is_cd() && before != after) || ((input.find_previous().is_some() || input.is_filter()) && before.0 != after.0) {
 			self.input_changed(&mut input);
 		}
 		self.input = Some(input);
@@ -573,7 +625,7 @@ impl Tab {
 			self.schedule_completion(input);
 		}
 		if let Some(previous) = input.find_previous() {
-				self.finder = Finder::new(input.value(), previous);
+			self.finder = Finder::new(input.value(), previous);
 			if self.finder.is_some() {
 				self.find_arrow(previous, true);
 			}
@@ -619,7 +671,9 @@ impl Tab {
 	}
 
 	fn confirm_rename(&mut self, target: PathBuf, name: String) {
-		let Some(parent) = target.parent() else { return };
+		let Some(parent) = target.parent() else {
+			return;
+		};
 		let dest = parent.join(&name);
 		if name.is_empty() || dest == target || std::fs::rename(&target, &dest).is_err() {
 			return;
@@ -633,7 +687,9 @@ impl Tab {
 		}
 	}
 
-	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> { self.cd_inner(path, true) }
+	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> {
+		self.cd_inner(path, true)
+	}
 
 	fn cd_inner(&mut self, path: PathBuf, record: bool) -> io::Result<()> {
 		if !std::fs::metadata(&path)?.is_dir() {
@@ -658,7 +714,9 @@ impl Tab {
 	}
 
 	pub fn history_back(&mut self) {
-		let Some(path) = self.path_history.back().map(Path::to_path_buf) else { return };
+		let Some(path) = self.path_history.back().map(Path::to_path_buf) else {
+			return;
+		};
 		if let Err(error) = self.cd_inner(path, false) {
 			self.path_history.forward();
 			self.raise(NoticeLevel::Error, error.to_string());
@@ -666,7 +724,9 @@ impl Tab {
 	}
 
 	pub fn history_forward(&mut self) {
-		let Some(path) = self.path_history.forward().map(Path::to_path_buf) else { return };
+		let Some(path) = self.path_history.forward().map(Path::to_path_buf) else {
+			return;
+		};
 		if let Err(error) = self.cd_inner(path, false) {
 			self.path_history.back();
 			self.raise(NoticeLevel::Error, error.to_string());
@@ -674,14 +734,18 @@ impl Tab {
 	}
 
 	pub fn cd_parent(&mut self) {
-		let Some(parent) = self.tree.root.path.parent().map(Path::to_path_buf) else { return };
+		let Some(parent) = self.tree.root.path.parent().map(Path::to_path_buf) else {
+			return;
+		};
 		if let Err(error) = self.cd(parent) {
 			self.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
 	pub fn cd_selected(&mut self) {
-		let Some(directory) = self.selected_dir() else { return };
+		let Some(directory) = self.selected_dir() else {
+			return;
+		};
 		if let Err(error) = self.cd(directory) {
 			self.raise(NoticeLevel::Error, error.to_string());
 		}
@@ -689,9 +753,7 @@ impl Tab {
 
 	pub fn cd_trash(&mut self) {
 		let dirs = trash_dirs();
-		let Some(path) = dirs.iter().position(|path| path == &self.tree.root.path)
-			.and_then(|index| dirs.get((index + 1) % dirs.len()))
-			.or_else(|| dirs.first()).cloned() else {
+		let Some(path) = dirs.iter().position(|path| path == &self.tree.root.path).and_then(|index| dirs.get((index + 1) % dirs.len())).or_else(|| dirs.first()).cloned() else {
 			self.raise(NoticeLevel::Warn, "No trash location found for this platform");
 			return;
 		};
@@ -739,7 +801,9 @@ impl Tab {
 	}
 
 	fn continue_reveal(&mut self) {
-		let Some(state) = &self.pending_reveal else { return };
+		let Some(state) = &self.pending_reveal else {
+			return;
+		};
 		let target = state.target.clone();
 		if self.visible_position(&target).is_some() {
 			self.select(&target);
@@ -771,7 +835,9 @@ impl Tab {
 			}
 		}
 
-		let Some(state) = &mut self.pending_reveal else { return };
+		let Some(state) = &mut self.pending_reveal else {
+			return;
+		};
 		if !state.refreshed_parent {
 			state.refreshed_parent = true;
 			self.fs_scheduler.refresh(parent);
@@ -789,7 +855,9 @@ impl Tab {
 	/// `on_completion_loaded` replaces it once the fresh list actually
 	/// arrives (with `None` if that list turns out to be empty).
 	fn schedule_completion(&self, input: &mut InputSession) {
-		let InputPurpose::Cd { base } = &input.purpose else { return };
+		let InputPurpose::Cd { base } = &input.purpose else {
+			return;
+		};
 		if let Some(task) = input.completion_task.take() {
 			task.abort();
 		}
@@ -803,9 +871,7 @@ impl Tab {
 		let tx = self.tx.clone();
 		input.completion_task = Some(tokio::spawn(async move {
 			tokio::time::sleep(Duration::from_millis(50)).await;
-			let result = tokio::task::spawn_blocking(move || complete_directories(&base, &value, cursor))
-				.await
-				.unwrap_or_else(|err| Err(io::Error::other(err)));
+			let result = tokio::task::spawn_blocking(move || complete_directories(&base, &value, cursor)).await.unwrap_or_else(|err| Err(io::Error::other(err)));
 			let _ = tx.send(Event::CompletionLoaded { tab, input: input_id, revision, result });
 		}));
 	}
@@ -917,16 +983,21 @@ impl Tab {
 		let pending = self.pending_listings.remove(&path);
 		match result {
 			Ok(_) => {
+				let mut reordered = false;
 				match PendingListing::finish(pending, ticket) {
 					Some(ListingOutcome::Incremental) => {
-						self.tree.finish_incremental_listing(&path, self.sort_policy);
+						if let Some(order) = self.tree.finish_incremental_listing(&path, self.sort_policy) {
+							reordered = self.filter.is_none() && self.projection.reorder_new_children(&self.tree.root, &path, &order, self.show_hidden);
+						}
 					}
 					Some(ListingOutcome::Full(entries)) => {
 						self.tree.apply_listing(&path, entries, self.sort_policy);
 					}
 					None => return,
 				}
-				self.sync_projection(&path);
+				if !reordered {
+					self.sync_projection(&path);
+				}
 				if let Some(hovered) = hovered {
 					self.select(&hovered);
 				}
@@ -952,7 +1023,10 @@ impl Tab {
 			return;
 		}
 
-		self.pending_reveal = Some(RevealState { target: target.clone(), refreshed_parent: false });
+		self.pending_reveal = Some(RevealState {
+			target: target.clone(),
+			refreshed_parent: false,
+		});
 		let mut refresh = target.parent();
 		while let Some(path) = refresh {
 			if self.tree.is_loaded(path) {
@@ -1015,10 +1089,7 @@ impl Tab {
 		paths.sort();
 		if matches!(kind, CopyKind::DirectoryPath | CopyKind::DirectoryUrl) {
 			let root = &self.tree.root.path;
-			paths = paths
-				.into_iter()
-				.filter_map(|path| if path == *root { Some(path) } else { path.parent().map(Path::to_path_buf) })
-				.collect();
+			paths = paths.into_iter().filter_map(|path| if path == *root { Some(path) } else { path.parent().map(Path::to_path_buf) }).collect();
 			paths.dedup();
 			if paths.is_empty() {
 				paths.push(root.clone());
@@ -1073,12 +1144,20 @@ impl Tab {
 			Some(_) => StatusMode::Select,
 			None => StatusMode::Normal,
 		};
-		let Some((_, node)) = self.visible_at(self.cursor) else { return StatusLine::empty(mode) };
+		let Some((_, node)) = self.visible_at(self.cursor) else {
+			return StatusLine::empty(mode);
+		};
 		let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 		// `error` here is left for `render.rs` to fill in from the active
 		// input's own validation error, if any — `pending_notice` is a
 		// separate, App-level toast now, not something the status line shows.
-		StatusLine { mode, name, size: format_size(node.cha.len), permissions: node.cha.permissions(), error: None }
+		StatusLine {
+			mode,
+			name,
+			size: format_size(node.cha.len),
+			permissions: node.cha.permissions(),
+			error: None,
+		}
 	}
 }
 
@@ -1133,7 +1212,9 @@ fn trash_dirs() -> Vec<PathBuf> {
 	}
 	#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), not(target_os = "android")))]
 	{
-		let Ok(folders) = trash::os_limited::trash_folders() else { return Vec::new() };
+		let Ok(folders) = trash::os_limited::trash_folders() else {
+			return Vec::new();
+		};
 		let home = home_dir().ok();
 		let mut folders: Vec<_> = folders.into_iter().collect();
 		folders.sort_by_key(|folder| (!home.as_deref().is_some_and(|home| folder.starts_with(home)), folder.clone()));
@@ -1147,7 +1228,9 @@ fn trash_dirs() -> Vec<PathBuf> {
 
 fn ancestor_directories(root: &Path, parent: &Path) -> Vec<PathBuf> {
 	let mut directories = vec![root.to_path_buf()];
-	let Ok(relative) = parent.strip_prefix(root) else { return directories };
+	let Ok(relative) = parent.strip_prefix(root) else {
+		return directories;
+	};
 	let mut path = root.to_path_buf();
 	for component in relative.components() {
 		path.push(component.as_os_str());
@@ -1238,7 +1321,9 @@ mod tests {
 		}
 	}
 
-	fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
+	fn key(code: KeyCode) -> KeyEvent {
+		KeyEvent::new(code, KeyModifiers::NONE)
+	}
 
 	fn rename_value(tab: &Tab) -> String {
 		tab.input.as_ref().unwrap().state.lines.to_vecs().into_iter().next().unwrap_or_default().into_iter().collect()

@@ -48,6 +48,18 @@ impl Node {
 		self.loading = false;
 	}
 
+	pub fn collapse_subtree(&mut self, collapsed: &mut Vec<PathBuf>) {
+		if let Some(children) = &mut self.children {
+			for child in children {
+				child.collapse_subtree(collapsed);
+			}
+		}
+		if self.expanded || self.loading {
+			collapsed.push(self.path.clone());
+		}
+		self.collapse();
+	}
+
 	/// Reconciles a freshly-fetched directory listing into this node,
 	/// keeping the cached subtree (and expanded state) of any entry that's
 	/// still present — only genuinely new or removed entries change
@@ -59,13 +71,7 @@ impl Node {
 		self.loading = false;
 		sort(&mut entries, policy);
 
-		let mut old: HashMap<_, _> = self
-			.children
-			.take()
-			.unwrap_or_default()
-			.into_iter()
-			.map(|node| (node.path.clone(), node))
-			.collect();
+		let mut old: HashMap<_, _> = self.children.take().unwrap_or_default().into_iter().map(|node| (node.path.clone(), node)).collect();
 		self.children = Some(
 			entries
 				.into_iter()
@@ -81,7 +87,9 @@ impl Node {
 	}
 
 	pub fn apply_changes(&mut self, changes: Vec<FsChange>, policy: SortPolicy) {
-		let Some(children) = &mut self.children else { return };
+		let Some(children) = &mut self.children else {
+			return;
+		};
 		let mut pending: HashMap<PathBuf, Option<Cha>> = changes
 			.into_iter()
 			.map(|change| match change {
@@ -93,7 +101,7 @@ impl Node {
 		let mut reorder = matches!(policy.by, SortBy::Modified | SortBy::Size);
 		children.retain_mut(|node| match pending.remove(&node.path) {
 			Some(Some(cha)) => {
-			reorder |= node.cha.is_dir != cha.is_dir;
+				reorder |= node.cha.is_dir != cha.is_dir;
 				node.cha = cha;
 				true
 			}
@@ -152,16 +160,20 @@ impl Node {
 	}
 
 	pub fn append_listing(&mut self, entries: Vec<(PathBuf, Cha)>) {
-		self.children
-			.get_or_insert_with(Vec::new)
-			.extend(entries.into_iter().map(|(path, cha)| Node::new(path, cha)));
+		self.children.get_or_insert_with(Vec::new).extend(entries.into_iter().map(|(path, cha)| Node::new(path, cha)));
 	}
 
-	pub fn finish_incremental_listing(&mut self, policy: SortPolicy) {
-		if let Some(children) = &mut self.children {
-			children.sort_by(|a, b| compare_for_sort(&a.path, &a.cha, &b.path, &b.cha, policy));
-		}
+	pub fn finish_incremental_listing(&mut self, policy: SortPolicy) -> Vec<usize> {
+		let Some(children) = &mut self.children else {
+			self.loading = false;
+			return Vec::new();
+		};
+		let mut order: Vec<_> = (0..children.len()).collect();
+		order.sort_by(|&a, &b| compare_for_sort(&children[a].path, &children[a].cha, &children[b].path, &children[b].cha, policy));
+		let mut old: Vec<_> = std::mem::take(children).into_iter().map(Some).collect();
+		children.extend(order.iter().map(|&index| old[index].take().unwrap()));
 		self.loading = false;
+		order
 	}
 
 	pub fn sort_recursive(&mut self, policy: SortPolicy) {
@@ -240,6 +252,8 @@ mod tests {
 			len: 0,
 			is_dir,
 			is_link: false,
+			link_target: None,
+			link_broken: false,
 			modified: None,
 			mode: 0,
 		}
@@ -284,10 +298,7 @@ mod tests {
 		root.children.as_mut().unwrap()[0].expanded = false;
 		let filter = Filter::new("target".into()).unwrap();
 
-		assert!(
-			root.visible_filtered(0, &filter).is_none(),
-			"a collapsed subtree's contents aren't visible to filter into"
-		);
+		assert!(root.visible_filtered(0, &filter).is_none(), "a collapsed subtree's contents aren't visible to filter into");
 	}
 
 	#[test]
@@ -309,10 +320,7 @@ mod tests {
 		root.apply_listing(vec![(PathBuf::from("new.txt"), cha(false)), (PathBuf::from("kept"), refreshed)], SortPolicy::default());
 
 		let children = root.children.as_ref().unwrap();
-		assert_eq!(
-			children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(),
-			[Path::new("kept"), Path::new("new.txt")]
-		);
+		assert_eq!(children.iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("kept"), Path::new("new.txt")]);
 
 		let kept = &children[0];
 		assert!(kept.expanded);
@@ -332,7 +340,10 @@ mod tests {
 			vec![
 				FsChange::Upsert { path: PathBuf::from("kept"), cha: refreshed },
 				FsChange::Delete { path: PathBuf::from("removed.txt") },
-				FsChange::Upsert { path: PathBuf::from("new.txt"), cha: cha(false) },
+				FsChange::Upsert {
+					path: PathBuf::from("new.txt"),
+					cha: cha(false),
+				},
 			],
 			SortPolicy::default(),
 		);
@@ -378,19 +389,13 @@ mod tests {
 
 	#[test]
 	fn sorting_recurses_per_directory_without_flattening_the_tree() {
-		let mut root = dir(
-			"root",
-			vec![dir("nested", vec![file("small"), file("large")]), file("sibling")],
-		);
+		let mut root = dir("root", vec![dir("nested", vec![file("small"), file("large")]), file("sibling")]);
 		root.children.as_mut().unwrap()[0].children.as_mut().unwrap()[0].cha.len = 1;
 		root.children.as_mut().unwrap()[0].children.as_mut().unwrap()[1].cha.len = 2;
 
 		root.sort_recursive(SortPolicy::new(crate::fs::SortBy::Size, true));
 
 		let nested = &root.children.as_ref().unwrap()[0];
-		assert_eq!(
-			nested.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(),
-			[Path::new("large"), Path::new("small")]
-		);
+		assert_eq!(nested.children.as_ref().unwrap().iter().map(|node| node.path.as_path()).collect::<Vec<_>>(), [Path::new("large"), Path::new("small")]);
 	}
 }

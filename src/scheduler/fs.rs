@@ -1,28 +1,42 @@
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
+use std::{
+	collections::HashMap,
+	path::{Path, PathBuf},
+	sync::Arc,
+};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{event::Event, fs::{Engine, create_symlink, symlink_target, unique_dest_avoiding}};
+use crate::{
+	event::Event,
+	fs::{Engine, create_symlink, symlink_target, unique_dest_avoiding},
+};
 
+const FIRST_LISTING_BATCH_SIZE: usize = 64;
 const LISTING_BATCH_SIZE: usize = 512;
 
 #[derive(Default)]
 struct Entry {
-	busy:  Option<u64>,
+	busy: Option<u64>,
 	dirty: bool,
 }
 
 pub struct FsScheduler {
-	tab:     usize,
-	tx:      UnboundedSender<Event>,
-	engine:  Arc<dyn Engine>,
+	tab: usize,
+	tx: UnboundedSender<Event>,
+	engine: Arc<dyn Engine>,
 	entries: HashMap<PathBuf, Entry>,
-	next:    u64,
+	next: u64,
 }
 
 impl FsScheduler {
 	pub fn new(tab: usize, tx: UnboundedSender<Event>, engine: Arc<dyn Engine>) -> Self {
-		Self { tab, tx, engine, entries: HashMap::new(), next: 0 }
+		Self {
+			tab,
+			tx,
+			engine,
+			entries: HashMap::new(),
+			next: 0,
+		}
 	}
 
 	pub fn refresh(&mut self, path: PathBuf) {
@@ -47,8 +61,16 @@ impl FsScheduler {
 			let chunk_tx = tx.clone();
 			let chunk_path = path.clone();
 			let result = tokio::task::spawn_blocking(move || {
-				engine.read_dir_batches(&target, LISTING_BATCH_SIZE, &mut |entries| {
-					chunk_tx.send(Event::Loaded { tab, path: chunk_path.clone(), ticket, result: Ok(entries), done: false }).is_ok()
+				engine.read_dir_batches(&target, FIRST_LISTING_BATCH_SIZE, LISTING_BATCH_SIZE, &mut |entries| {
+					chunk_tx
+						.send(Event::Loaded {
+							tab,
+							path: chunk_path.clone(),
+							ticket,
+							result: Ok(entries),
+							done: false,
+						})
+						.is_ok()
 				})
 			})
 			.await
@@ -59,7 +81,9 @@ impl FsScheduler {
 	}
 
 	pub fn accept(&mut self, path: &Path, ticket: u64, done: bool) -> bool {
-		let Some(entry) = self.entries.get_mut(path) else { return false };
+		let Some(entry) = self.entries.get_mut(path) else {
+			return false;
+		};
 		if entry.busy != Some(ticket) {
 			return false;
 		}
@@ -73,7 +97,9 @@ impl FsScheduler {
 		true
 	}
 
-	pub fn forget(&mut self, path: &Path) { self.entries.remove(path); }
+	pub fn forget(&mut self, path: &Path) {
+		self.entries.remove(path);
+	}
 
 	pub fn create(&self, base: PathBuf, value: String) {
 		let tab = self.tab;
@@ -115,7 +141,9 @@ impl FsScheduler {
 		tokio::spawn(async move {
 			let result = tokio::task::spawn_blocking(move || {
 				for source in &sources {
-					let Some(name) = source.file_name() else { continue };
+					let Some(name) = source.file_name() else {
+						continue;
+					};
 					let dest = unique_dest_avoiding(&task_target_dir, name, |_| false);
 					let content = symlink_target(&task_target_dir, source, absolute);
 					let is_dir = std::fs::metadata(source).is_ok_and(|meta| meta.is_dir());
@@ -132,7 +160,10 @@ impl FsScheduler {
 
 #[cfg(test)]
 mod tests {
-	use std::{sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+	use std::{
+		sync::atomic::{AtomicUsize, Ordering},
+		time::Duration,
+	};
 
 	use super::*;
 	use crate::fs::Cha;
@@ -151,7 +182,20 @@ mod tests {
 	impl Engine for LargeEngine {
 		fn read_dir(&self, path: &Path) -> std::io::Result<Vec<(PathBuf, Cha)>> {
 			Ok((0..1_200)
-				.map(|index| (path.join(format!("file-{index}")), Cha { len: 0, is_dir: false, is_link: false, modified: None, mode: 0 }))
+				.map(|index| {
+					(
+						path.join(format!("file-{index}")),
+						Cha {
+							len: 0,
+							is_dir: false,
+							is_link: false,
+							link_target: None,
+							link_broken: false,
+							modified: None,
+							mode: 0,
+						},
+					)
+				})
 				.collect())
 		}
 	}
@@ -174,7 +218,7 @@ mod tests {
 			sizes.push(result.unwrap().len());
 		}
 
-		assert_eq!(sizes, [512, 512, 176]);
+		assert_eq!(sizes, [64, 512, 512, 112]);
 	}
 
 	#[tokio::test]

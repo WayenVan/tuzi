@@ -1,22 +1,22 @@
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+	fs, io,
+	path::{Path, PathBuf},
+};
 
 use super::Cha;
 
 pub trait Engine: Send + Sync {
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, Cha)>>;
 
-	fn read_dir_batches(
-		&self,
-		path: &Path,
-		batch_size: usize,
-		emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool,
-	) -> io::Result<()> {
+	fn read_dir_batches(&self, path: &Path, first_batch_size: usize, batch_size: usize, emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool) -> io::Result<()> {
 		let mut entries = self.read_dir(path)?.into_iter();
+		let mut limit = first_batch_size;
 		loop {
-			let batch: Vec<_> = entries.by_ref().take(batch_size).collect();
+			let batch: Vec<_> = entries.by_ref().take(limit).collect();
 			if batch.is_empty() || !emit(batch) {
 				return Ok(());
 			}
+			limit = batch_size;
 		}
 	}
 }
@@ -34,19 +34,19 @@ impl Engine for LocalEngine {
 			.collect()
 	}
 
-	fn read_dir_batches(
-		&self,
-		path: &Path,
-		batch_size: usize,
-		emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool,
-	) -> io::Result<()> {
-		let mut batch = Vec::with_capacity(batch_size);
+	fn read_dir_batches(&self, path: &Path, first_batch_size: usize, batch_size: usize, emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool) -> io::Result<()> {
+		let mut limit = first_batch_size;
+		let mut batch = Vec::with_capacity(limit);
 		for entry in fs::read_dir(path)? {
 			let entry = entry?;
 			let cha = cha_for(&entry)?;
 			batch.push((entry.path(), cha));
-			if batch.len() == batch_size && !emit(std::mem::take(&mut batch)) {
-				return Ok(());
+			if batch.len() == limit {
+				if !emit(std::mem::take(&mut batch)) {
+					return Ok(());
+				}
+				limit = batch_size;
+				batch.reserve(limit);
 			}
 		}
 		if !batch.is_empty() {
@@ -62,9 +62,7 @@ impl Engine for LocalEngine {
 /// a broken link, or one pointing at a file, just stays a leaf.
 fn cha_for(entry: &fs::DirEntry) -> io::Result<Cha> {
 	let mut cha = Cha::from(entry.metadata()?);
-	if cha.is_link {
-		cha.is_dir = fs::metadata(entry.path()).is_ok_and(|meta| meta.is_dir());
-	}
+	cha.resolve_symlink(&entry.path());
 	Ok(cha)
 }
 
@@ -106,12 +104,18 @@ mod tests {
 
 		let dir_link = &entries[std::ffi::OsStr::new("dir-link")];
 		assert!(dir_link.is_link && dir_link.is_dir, "a symlink to a directory must stay a link but become expandable");
+		assert_eq!(dir_link.link_target, Some(PathBuf::from("real")));
+		assert!(!dir_link.link_broken);
 
 		let file_link = &entries[std::ffi::OsStr::new("file-link")];
 		assert!(file_link.is_link && !file_link.is_dir, "a symlink to a file is still just a link, not a directory");
+		assert_eq!(file_link.link_target, Some(PathBuf::from("target-file")));
+		assert!(!file_link.link_broken);
 
 		let broken_link = &entries[std::ffi::OsStr::new("broken-link")];
 		assert!(broken_link.is_link && !broken_link.is_dir, "a broken symlink must not become expandable");
+		assert_eq!(broken_link.link_target, Some(PathBuf::from("missing")));
+		assert!(broken_link.link_broken, "a dangling target must be flagged broken");
 
 		fs::remove_dir_all(&root).unwrap();
 	}

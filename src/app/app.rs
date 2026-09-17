@@ -420,6 +420,13 @@ impl App {
 		self.active_tab_mut().move_cursor(delta);
 	}
 
+	pub fn center_cursor(&mut self) {
+		let rows = self.tree_rows.max(1);
+		let tab = self.active_tab_mut();
+		let max_scroll = tab.visible_len().saturating_sub(rows);
+		tab.scroll = tab.cursor.saturating_sub(rows / 2).min(max_scroll);
+	}
+
 	/// Yanks the active tab's targets onto the shared clipboard, so any tab
 	/// can paste them afterward.
 	pub fn yank_selected(&mut self, cut: bool) {
