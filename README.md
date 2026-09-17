@@ -10,7 +10,9 @@
 
 ## Install
 
-tuzi currently builds from source and requires a recent Rust toolchain. After cloning the repository, run:
+Download the archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` (or `tuzi.exe` on Windows) somewhere on your `PATH`.
+
+To build from source, install a recent Rust toolchain, clone the repository, and run:
 
 ```sh
 cargo install --path .
