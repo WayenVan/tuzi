@@ -9,8 +9,19 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/WayenVan/tuzi/releases/latest"><img src="https://img.shields.io/github/v/release/WayenVan/tuzi?style=flat-square&label=release" alt="Latest release"></a>
+  <a href="https://github.com/WayenVan/tuzi/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/WayenVan/tuzi/release.yml?style=flat-square&label=build" alt="Release build"></a>
+  <a href="https://github.com/WayenVan/tuzi/releases"><img src="https://img.shields.io/github/downloads/WayenVan/tuzi/total?style=flat-square&label=downloads" alt="Total downloads"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/WayenVan/tuzi?style=flat-square" alt="MIT license"></a>
+</p>
+
+<p align="center">
   <img src="assets/demo.gif" width="960" alt="tuzi demo">
 </p>
+
+## Why tuzi?
+
+I love Yazi, but some of my work calls for a more convenient tree-shaped view, especially inside Neovim. After spending hours looking for something that fit, I finally decided to sell my soul to Codex and Claude and build exactly what I wanted.
 
 ## Install
 
