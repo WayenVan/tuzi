@@ -71,13 +71,16 @@ dispatch）做了裁剪。
 
 ```text
 src/dds/
-  mod.rs        // 对外入口：re-export Body/Registry                         [P1 已实现]
-  body.rs       // Body 枚举：Cd/Yank/Renamed/TaskDone/Custom               [P1+P2 已实现]
-  registry.rs   // Registry：kind -> {subscriber -> handler}，App 的字段     [P1 已实现]
-  payload.rs    // Payload{receiver,sender,body} envelope + 序列化           [P3 待实现]
-  transport.rs  // Unix Socket client/server（首个实例自举为 server）        [P3 待实现]
-  state.rs      // 可选：@ 前缀 static topic 的磁盘持久化                    [P4 待实现]
+  mod.rs        // 对外入口：re-export BUILTIN_KINDS/Body/Registry/Client   [P1+P3 已实现]
+  body.rs       // Body 枚举：Hi/Hey/Cd/Yank/Renamed/TaskDone/Custom        [P1+P2+P3 已实现]
+  registry.rs   // Registry：kind -> {subscriber -> handler}，App 的字段    [P1 已实现]
+  payload.rs    // Payload{receiver,sender,body} envelope + 序列化          [P3 已实现]
+  transport.rs  // Unix Socket Client/Server（首个实例自举为 server）       [P3 已实现]
 ```
+
+没有 `state.rs`：`@` 静态消息持久化被明确否决（见「会话状态跨重启」
+一节），P4 不需要新增 dds 子模块，只改 `main.rs`（`--state` 解析）和
+`App::serve`（退出广播）。
 
 `Custom(kind, data)` 兜底分支和 `serde_json` 依赖已随 P2 落地（见下面
 「实施阶段」）。`Registry` 仍然没有 yazi 那样的 `LOCAL`/`REMOTE` 两张表：
@@ -176,9 +179,8 @@ impl Registry {
   （全量 peer 表）。
 - 转发过滤：`receiver==0` 只广播给声明了对应 ability 的 peer（或声明了
   通配符 `"*"`，见下）；否则定点转发。
-- 第一期不做 `@` 静态消息持久化；等真的出现「新开 tab/实例需要立刻拿到
-  当前状态」的需求再加（跟「Event/State 双轨模型」一节的 State 路径是
-  同一件事，那边已经把接口形状定下来了）。
+- 不做 `@` 静态消息持久化/服务端缓存——跨重启的状态恢复已经明确划给
+  外部程序负责（见「会话状态跨重启」一节），tuzi 自己不缓存任何保留值。
 
 ### CLI 对外接口（P3 已实现）
 
@@ -197,78 +199,61 @@ impl Registry {
   `run = "emit my-kind {...}"` 可以直接发布事件，在脚本引擎出现之前先
   提供一定可编程性。
 
-### Event/State 双轨模型（状态恢复的通用抽象）
+### Event/State 双轨模型（概念记录，未被采用于跨重启恢复）
 
-「新开 tab 要恢复上次的路径和选中文件」这类需求，不该靠订阅方重放历史
-事件来重建状态，而是需要在消息模型里正交切出第二种语义。这不是给
-`Body` 加一个 `TabState` 变体那么简单，而是 Registry 从一开始就要区分
-两种发布方式：
+讨论过程中曾提出一个通用抽象：消息除了「一次性事实」（Event，不保留，
+过时即丢）之外，还可以有「保留最新一份」的语义（State，按 key 覆盖式
+保留，随时可查询，类比 Kafka 的 compacted topic）。这个区分本身是对的、
+仍然是有效的词汇，但**最终决定不用它来做"tuzi 重启后记得上次状态"这
+件事**——原因见下面新方案，这里只留概念记录，避免以后又绕回来重新发明。
 
-| | Event（事实流） | State（状态视图） |
-|---|---|---|
-| 语义 | "发生了一次什么" | "现在是什么" |
-| 保留 | 不保留，过时即丢 | 按 key 保留**最新一份** |
-| 投递 | 推模型：广播给当前在线订阅者 | 拉模型：消费方随时主动 `get_state` 查询，没有"订阅时补发"的推送机制 |
-| 类比 | Kafka 的 stream / 日志 | Kafka 的 compacted topic / 数据库表 |
-| tuzi 现有例子 | `cd`/`yank`/`renamed`/`task-done`（P1 已有） | tab 的 `(path, selection)`、当前排序策略、当前主题（P4 待做） |
-| 对应 yazi 概念 | 普通 kind | `@` 前缀 kind + server 端缓存 + 握手重放 |
+### 会话状态跨重启：交给外部程序，tuzi 只管"退出广播 + 启动注入"
 
-接口形状：
+明确决定：tuzi **不自己维护任何跨重启的状态缓存**（不管内存还是磁盘）。
+"记住上次打开的目录/选中了哪些文件"这件事，由外部包装程序（shell 脚本
+或更上层的 session 管理器）自己订阅、自己存、自己在下次启动时喂回来。
+tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接收**，不是
+"保留最新值供查询"：
 
-```rust
-// Event：一次性广播，不保留（P1 已实现的 Registry::deliver 路径）
-registry.publish(Body::Cd { .. });
+1. **启动时注入**：新增 CLI 参数 `--state <JSON>`，外部程序调用
+   `tuzi --state '{"selection":["a.txt","b.txt"]}' /path/to/dir` 时把它
+   自己存好的状态喂进来。`path` 沿用已有的位置参数，不重复放进
+   `--state` 里；`--state` 目前只携带 `selection`（选中的文件列表），
+   应用方式是启动第一个 tab 后把这些路径塞进
+   `tab.selection`（存在于当前列表里的才生效，找不到的静默忽略，不算
+   错误——目标目录的内容随时可能变化）。
+   ```rust
+   enum Cli {
+       Run { path: PathBuf, config: LoadOptions, state: Option<RestoreState> },
+       ...
+   }
+   struct RestoreState { selection: Vec<PathBuf> }
+   ```
+2. **退出时广播**：`App::serve` 主循环 `app.quit` 即将返回前，做一次
+   跟 `tuzi emit` 内部逻辑完全一样的一次性发布——连接 DDS socket、
+   `client.publish(Body::Custom { kind: "exit-state", data: {"path":
+   ..., "selection": [...]} })`、`client.flush().await`、再真正退出。
+   **不需要**让 App 常驻加入 socket、不需要解决"App 该声明哪些
+   ability"这个之前搁置的难题——退出广播只是最后连一下、发一条、走人，
+   跟正在运行时是否已经是 DDS peer无关。给这次连接+发布+flush 包一个
+   超时（例如 500ms），避免 socket 有问题时卡住退出流程。
 
-// State：按 key 覆盖式保留，任何时候可查询当前值（P4 待实现）
-registry.publish_state("tab-state:0", TabState { path, selection });
-let current: Option<TabState> = registry.get_state("tab-state:0");
-```
+这样设计的关键含义，需要用户理解并在写外部包装脚本时对应处理：
 
-`publish_state` 内部就是 `HashMap<Key, LatestValue>` 的 upsert；
-`get_state` 就是查表。有没有订阅者不影响这份保留值是否存在——这是它和
-Event 的本质区别，也是「新开 tab 能不能立刻拿到上次状态」的关键：不用
-等下一次事件恰好发生，直接查当前值。
-
-**`publish_state`/`get_state` 不经过 `Event::Pubsub`/主循环，是对
-`Registry` 的直接同步调用。** 这一点和 Event 路径不同，要分清楚为什么：
-Event 路径（`publish` -> `Event::Pubsub` -> `tx.send` -> 下一轮
-`dispatch_event` -> `deliver` -> `Vec<Command>` -> `app.execute()`）必须
-绕回主循环，是因为它最终要执行 `Command`，需要和其它所有触碰 `App`
-状态的操作（按键、后台事件）保持同一个串行顺序。而 State 只是写一份
-`HashMap` 缓存，不产生 `Command`、不触碰 `App` 的其它字段，没有需要
-排队的理由，直接在调用点同步执行即可：
-
-```rust
-// 发布者决定调哪个方法——不是先包成同一种消息，dispatch 时再按 kind 分叉
-app.pubsub.publish(Body::Cd { .. });                          // Event：仍经 tx.send(Event::Pubsub(..))
-app.pubsub.publish_state("tab-state:0", TabState { .. });     // State：直接同步写，不经过 channel
-```
-
-（这是本设计和最初讨论时的一处分歧：曾经设想过「一条 `Event::Pubsub`
-消息里带 kind，`dispatch_event` 内部再判断是 Event 还是 State」，类比
-yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那样的执行
-顺序约束，硬塞进 channel 只是多绕一圈，没有必要。）
-
-`Command` 在两条路径里的角色不变，只是产生方式不同：
-
-- Event 路径：订阅者收到 Event -> 产生若干小粒度 Command（跟用户按键
-  等价），沿用 P1 已有的 `Registry::deliver -> Vec<Command> ->
-  App::execute()`。
-- State 路径：消费方（tab 初始化逻辑）主动 `get_state` 拿到一份完整
-  快照 -> 产生**一个**"应用快照"的 Command，一次性灌回去，例如：
-
-  ```rust
-  Command::RestoreTab { path: PathBuf, selection: Vec<PathBuf> }
+- **这是纯 Event，没有保留值**：`exit-state` 广播时，外部程序必须已经
+  有一个类似 `tuzi sub` 的监听者正连着 socket，否则这条消息广播出去
+  没人接住就彻底丢了，不会有任何地方能"事后查询"到它。典型用法是
+  包装脚本形如：
+  ```sh
+  tuzi sub | grep '"kind":"exit-state"' > /tmp/tuzi-last-state.json &
+  SUB_PID=$!
+  tuzi --state "$(cat ~/.cache/tuzi-last-state.json 2>/dev/null)" "$dir"
+  kill "$SUB_PID"
   ```
-
-  `App::execute` 直接对目标 tab 做批量赋值（cd 到 path，再重建
-  selection），而不是拆成一串 `Cd`/`ToggleSelect` 重放。
-
-跨进程持久化（真正扛得住重启）就是把 `get_state`/`publish_state` 的
-存储后端从纯内存 `HashMap` 换成「内存 + 落盘」，退出时把保留值写入磁盘，
-下次启动前先加载回来——语义完全一致，只是保留值的来源变了。这正是
-`state.rs`（P4）要做的事，现在只是把它的设计明确下来，不再是「等需求
-场景再定」的空白。
+- 之所以选这个方案而不是内存/磁盘 State 缓存，是因为「新开 tab 恢复
+  同一次运行里的状态」（内存 State 就够用）和「关掉 tuzi 再打开还记得
+  上次」（这次讨论的场景）其实是两个不同的需求，而后者被明确划给外部
+  程序负责，tuzi 没有必要为了自己不需要的持久化能力增加复杂度。
 
 ## 实施阶段
 
@@ -337,13 +322,18 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
    - **P3 没做的事**：交互式 `App` 还没接入 `Client`——正在跑的 TUI 收不
      到别的实例或 `tuzi emit` 发来的消息（见「尚待确认事项」）；`Body`
      没有 `Bye` 变体，靠连接断开（EOF）让 server 清理 peer 表，没做
-     yazi 那样的优雅下线握手；没有 `@` 静态消息持久化（P4 的事）。
-4. **P4（可选，按需）**：按上面「Event/State 双轨模型」给 `Registry` 加
-   `publish_state`/`get_state`（内存 `HashMap<Key, LatestValue>`），以及
-   `state.rs` 的磁盘持久化（退出时落盘、启动时加载）。第一个消费场景是
-   tab 状态恢复（路径 + 选中文件），落地为一个新的 `Command::RestoreTab`
-   变体。未来若要嵌入脚本引擎（Lua/Rhai），只需在 `registry` 里加一种
-   新的 handler 变体，接线不用动。
+     yazi 那样的优雅下线握手；没有 `@` 静态消息持久化（已明确不做，
+     见「会话状态跨重启」一节）。
+4. **P4 会话状态跨重启**：按上面「会话状态跨重启：交给外部程序」一节
+   实施——`Cli::Run` 加 `state: Option<RestoreState>` 字段和
+   `--state <JSON>` 解析；`RestoreState { selection: Vec<PathBuf> }`
+   应用到初始 tab 的 `selection`；`App::serve` 的 `quit` 分支退出前用
+   一次性 DDS 连接广播 `Body::Custom { kind: "exit-state", data: {...} }`
+   （加超时，避免 socket 异常时卡住退出）。**不需要**
+   `publish_state`/`get_state`、不需要磁盘持久化、不需要
+   `Command::RestoreTab`——应用注入状态直接在 tab 初始化时做，不用
+   走 `Command`/`Event` 那一整套（没有"运行时响应消息"这个场景，纯粹
+   是启动参数）。
 
 每阶段应可独立验证、独立提交，不必一次性大改完才能用。
 
@@ -362,13 +352,11 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
   'refresh' 时让所有开着的 tuzi 都刷新当前目录」）时再接，不要为了接
   而接。
 - `src/actor/` 空存根是否要在本计划里复用或先删除，需与用户确认。
-- State 落盘（P4 `state.rs`）的具体文件格式、路径、key 命名规则
-  （如 `"tab-state:{id}"` 还是更结构化的 key 类型）尚未设计，落地 P4
-  时再定；`publish_state`/`get_state` 的内存版接口形状已经在
-  「Event/State 双轨模型」一节定下来了。
-- `Command::RestoreTab`（或等价变体）的具体字段和「哪些状态值得恢复」
-  （path/selection 之外要不要包含 sort_policy、column_mode、展开的子树）
-  待 P4 实现时按需扩展，不必一次性照搬全部 Tab 字段。
+- `--state` 目前只设计了 `selection` 一个字段；要不要扩展到
+  `sort_policy`/`column_mode`/展开的子树等，等外部程序真的需要时再加，
+  不必一次性照搬全部 Tab 字段。
+- 退出广播的超时时长（草案 500ms）、以及 socket 连接失败时是否要给用户
+  一个可见的警告还是静默放弃退出流程，留到 P4 实现时定。
 
 ## 续接建议
 
