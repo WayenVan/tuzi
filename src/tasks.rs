@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fs, io::{self, Read, Write}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
+use serde::{Deserialize, Serialize};
 use tokio::{sync::{Semaphore, mpsc::UnboundedSender, watch}, task::JoinHandle};
 
 use crate::{config::{ConflictPolicy, Tasks as TaskConfig}, event::Event, fs::{format_size, remove, unique_dest_avoiding}};
@@ -10,7 +11,9 @@ use trash_backend::{SystemTrash, TrashBackend};
 
 pub type TaskId = u64;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// `Serialize`/`Deserialize` are for `dds::Body::TaskDone`, which travels
+/// over the DDS wire format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TaskKind { Copy, Move, Trash, Delete }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

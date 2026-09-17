@@ -141,42 +141,58 @@ yazi 的关键改造点：yazi 的回调直接操作 Lua 侧的 `Ctx`，Tuzi 没
 层，用「handler 返回 Command 列表」替代，天然复用现有的同步执行路径，
 不需要额外锁。
 
-### 本地订阅 API
+### 本地订阅 API（P1 已实现，见下面「实施阶段」的实际签名）
 
 ```rust
 pub type Handler = Box<dyn Fn(&Body) -> Vec<Command> + Send + Sync>;
 
-impl Pubsub {
-    pub fn sub(subscriber: &str, kind: &str, f: Handler) -> bool;
-    pub fn sub_remote(subscriber: &str, kind: &str, f: Handler) -> bool;
-    pub fn unsub(subscriber: &str, kind: &str);
-    pub fn publish(body: Body);                    // receiver = 0
-    pub fn publish_to(receiver: PeerId, body: Body);
+impl Registry {
+    pub fn sub(&mut self, subscriber: &str, kind: &str, f: Handler) -> bool;
+    pub fn unsub(&mut self, subscriber: &str, kind: &str);
+    pub fn deliver(&self, body: &Body) -> Vec<Command>;
 }
 ```
 
-同一 subscriber 对同一 kind 只能注册一次（对齐 yazi 防重复订阅行为），
-`sub_remote` 触发一次能力重新广播（重发 `Hi`）。
+同一 subscriber 对同一 kind 只能注册一次（对齐 yazi 防重复订阅行为）。
 
-### 跨实例传输
+这里没有 yazi 式的 `sub_remote`/统一 `Pubsub` 门面——`Registry`（本地订阅
+表）和 `dds::Client`（P3 的 socket 客户端）目前是两个独立的东西，没有
+互相打通：`Registry` 只服务进程内订阅（`Event::Pubsub` -> `deliver` ->
+`Command`），`Client` 只服务 `tuzi emit`/`tuzi sub` 这两个不跑 TUI 的
+独立 CLI 调用。交互式的 `App` 目前不持有 `Client`，也就是说**正在运行
+的 TUI 还没有接入 socket，收不到别的实例/`tuzi emit` 发来的消息**——
+这是刻意搁置的集成工作，见下面「尚待确认事项」。
 
-- Socket 路径：`$XDG_RUNTIME_DIR/tuzi/dds.sock`，缺省回退
-  `Xdg::state_dir()`。
-- 协议：换行分隔的单行 JSON object（比 yazi 的逗号分隔混合格式更不易
-  踩转义坑，仍保持纯文本可 `nc`/`cat` 调试）。
-- 握手：`Hi`（携带本实例 `sub_remote` 过的 kind 集合）-> server 记录
-  -> 广播 `Hey`（全量 peer 表）。
-- 转发过滤：`receiver==0` 只广播给声明了对应 ability 的 peer；否则定点
-  转发。没有任何 peer 声明兴趣时，`publish` 直接跳过 socket 写入（对齐
-  yazi 的 `any_remote_own` 优化，避免每次 `cd` 都写 socket）。
+### 跨实例传输（P3 已实现，见下面「实施阶段」的细节）
+
+- Socket 路径：`$XDG_RUNTIME_DIR/tuzi/dds.sock`，缺省回退系统临时目录
+  （`src/dds/payload.rs::socket_path`，手写 env 查找，风格对齐
+  `config::default_config_dir`，没有引入 XDG crate）。
+- 协议：换行分隔的单行 JSON object，用 `Payload`/`Body` 的默认 serde
+  enum 表示（`{"Cd":{"path":"..."}}` 这种外部打标签形式），比 yazi 的
+  逗号分隔混合格式更简单，两端都是 Rust，不需要跨语言兼容，仍保持纯
+  文本可 `nc`/`cat` 调试。
+- 握手：`Hi`（携带本实例声明的 kind 集合）-> server 记录 -> 广播 `Hey`
+  （全量 peer 表）。
+- 转发过滤：`receiver==0` 只广播给声明了对应 ability 的 peer（或声明了
+  通配符 `"*"`，见下）；否则定点转发。
 - 第一期不做 `@` 静态消息持久化；等真的出现「新开 tab/实例需要立刻拿到
-  当前状态」的需求再加。
+  当前状态」的需求再加（跟「Event/State 双轨模型」一节的 State 路径是
+  同一件事，那边已经把接口形状定下来了）。
 
-### CLI 对外接口
+### CLI 对外接口（P3 已实现）
 
-- 新增 `tuzi emit <kind> [json]` / `tuzi sub [--local-events|--remote-events]`
-  子命令，对齐 `ya emit`/`ya sub`，复用 `dds::transport` 客户端逻辑，
-  不需要跑完整 TUI 即可收发消息。
+- `tuzi emit <kind> [json]`：一次性发布，`json` 缺省 `null`，`kind` 为空
+  或撞上 `dds::BUILTIN_KINDS` 会被拒绝。不需要声明 ability（只发不收）。
+- `tuzi sub`：声明通配符 ability `dds::WILDCARD_ABILITY`（`"*"`），打印
+  收到的每条消息（一行一个 JSON `Body`），直到被中断——`ya sub` 的等价
+  物，没有做 yazi 那样的 `--local-events`/`--remote-events` 过滤参数
+  （用不上：`tuzi sub` 本身就是唯一目的是看流量的调试用途，不像 yazi
+  那样要跟正常运行的 TUI 共享同一个二进制的参数体系）。
+- 两个子命令都是 `src/main.rs` 里 `Cli` 枚举新增的两个变体，识别方式是
+  "第一个参数字面量等于 `emit`/`sub`"，跟已有的 `[PATH]` 位置参数解析
+  共用同一个 `parse_args`。真有目录字面量叫 `emit`/`sub` 时用
+  `tuzi -- emit`/`tuzi -- sub` 转义（复用已有的 `--` 语法，不是新加的）。
 - `Command` 新增 `Command::Emit(kind, Option<json>)` 变体，使 keymap 的
   `run = "emit my-kind {...}"` 可以直接发布事件，在脚本引擎出现之前先
   提供一定可编程性。
@@ -292,8 +308,36 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
    - 端到端测试：`app::tests::the_emit_command_publishes_a_custom_kind_with_its_json_payload`
      跑通 `":emit ..."` 解析 -> `execute` -> `Event::Pubsub` ->
      `Dispatcher` -> 订阅者收到 `data` 且产生的 `Command` 被执行。
-3. **P3 跨实例 socket**：新增 `transport.rs`（client 自举为 server）+
-   `tuzi emit`/`tuzi sub` 子命令，打通多实例/外部脚本集成。
+3. **P3 跨实例 socket**（已完成）：新增 `src/dds/{payload,transport}.rs`
+   + `Cargo.toml` 加 `serde_json`/tokio `net` feature + `TaskKind` 补
+   `Serialize`/`Deserialize` + `Body`/`PeerInfo`/`Payload` 全部可序列化。
+   - `Client::connect(socket_path, abilities)`：先 `UnixStream::connect`，
+     失败则 `connect_or_bootstrap` 尝试自举 server 再连自己；返回
+     `(Client, mpsc::UnboundedReceiver<Payload>)`。`Client::publish`/
+     `publish_to`/`flush`（后者给 `tuzi emit` 这种一次性调用用，关闭
+     发送端并等后台写任务把已入队的消息真正落到 socket 上再返回）。
+   - `Server`（`transport.rs` 内部私有，外部拿不到句柄）：`try_bind` +
+     `serve`（accept 循环，每个连接一对读写 task + 一份 `PeerTable`）。
+     `Hi` -> 记录 ability -> 广播 `Hey`；`receiver==0` 按 ability 过滤
+     广播（含通配符 `dds::WILDCARD_ABILITY = "*"`，`tuzi sub` 用它收
+     全部消息）；`receiver!=0` 定点转发；连接断开时移出 peer 表。
+   - `tuzi emit <kind> [json]` / `tuzi sub`：`src/main.rs` 新增 `Cli`
+     变体，`parse_args` 在进入原有的位置参数解析前先看第一个参数是不是
+     字面量 `emit`/`sub`。
+   - **自举竞态**：多个进程同时冷启动（谁都连不上，都要抢着 `bind`）时，
+     `bind` 失败的一方要连去赢家那里而不是直接报错，且不能无条件
+     `remove_file` 抢位置——那样会把刚绑定成功、活得好好的赢家 socket
+     从文件系统里删掉，产生孤儿 server。`connect_or_bootstrap` 用带
+     随机抖动的指数退避重试（避免所有竞争者在同一个 tick 上一起判定
+     "死了"然后一起冲上去删）+ 连续 3 次判定"既绑不上也连不上"才清理
+     stale 文件。压测过：15 个进程同时冷启动能把失败率控制在个位数百
+     分比（不追求归零——那需要真正的 flock 文件锁，对"一个长驻 TUI +
+     偶尔几次 emit/sub"这个实际使用模式不值得），5 个进程同时冷启动在
+     75 次试验里 0 失败，这才是这套机制真正要扛住的场景。
+   - **P3 没做的事**：交互式 `App` 还没接入 `Client`——正在跑的 TUI 收不
+     到别的实例或 `tuzi emit` 发来的消息（见「尚待确认事项」）；`Body`
+     没有 `Bye` 变体，靠连接断开（EOF）让 server 清理 peer 表，没做
+     yazi 那样的优雅下线握手；没有 `@` 静态消息持久化（P4 的事）。
 4. **P4（可选，按需）**：按上面「Event/State 双轨模型」给 `Registry` 加
    `publish_state`/`get_state`（内存 `HashMap<Key, LatestValue>`），以及
    `state.rs` 的磁盘持久化（退出时落盘、启动时加载）。第一个消费场景是
@@ -305,6 +349,18 @@ yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那
 
 ## 尚待确认事项
 
+- **交互式 `App` 还没加入 DDS socket**：`Registry`（进程内订阅）和
+  `dds::Client`（P3 的 socket 客户端）目前互不相通。要让正在运行的
+  TUI 真正参与跨实例总线，需要：(a) `App::serve` 启动时 `Client::connect`
+  一次，(b) 后台读到的 `Payload` 转成 `Event::Pubsub(body)` 灌回
+  `tx`（复用现有本地投递路径，不用新写分发逻辑），(c) 决定 `App` 的
+  `abilities` 怎么来——目前 `Registry` 没有区分"只本地"和"也接受远程"
+  的订阅（yazi 的 `sub`/`sub_remote` 区分），如果照搬现状，`abilities`
+  只能是"当前 Registry 里已注册的所有 kind"或者干脆留空（等于什么都不
+  接收远程）。没有做这一步是因为目前没有真实的订阅者会用到它——跟 P1
+  的 `sub`/`unsub` 一样，等真的有一个要跨实例响应的场景（比如「emit
+  'refresh' 时让所有开着的 tuzi 都刷新当前目录」）时再接，不要为了接
+  而接。
 - `src/actor/` 空存根是否要在本计划里复用或先删除，需与用户确认。
 - State 落盘（P4 `state.rs`）的具体文件格式、路径、key 命名规则
   （如 `"tab-state:{id}"` 还是更结构化的 key 类型）尚未设计，落地 P4
