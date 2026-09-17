@@ -16,6 +16,7 @@ use crate::{
 	column_mode::ColumnMode,
 	config::Config,
 	core::{Filter, Node, Selection, Tree, Visual},
+	dds::Body,
 	event::Event,
 	finder::Finder,
 	fs::{Cha, Engine, FsChange, LocalEngine, SortBy, SortPolicy, format_size, unique_dest_avoiding},
@@ -736,6 +737,7 @@ impl Tab {
 		if std::fs::rename(&target, &dest).is_err() {
 			return;
 		}
+		let _ = self.tx.send(Event::Pubsub(Body::Renamed { from: target.clone(), to: dest.clone() }));
 
 		self.watcher.unwatch(&target);
 		self.fs_scheduler.forget(&target);
@@ -758,6 +760,7 @@ impl Tab {
 		}
 		let mut replacement = Self::open_configured(self.id, path, self.tx.clone(), self.config.clone())?;
 		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
+		let _ = self.tx.send(Event::Pubsub(Body::Cd { path: replacement.tree.root.path.clone() }));
 		replacement.input_seq = self.input_seq;
 		replacement.sort_policy = self.sort_policy;
 		replacement.column_mode = self.column_mode;
@@ -1333,7 +1336,7 @@ mod tests {
 	async fn pump(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
 		loop {
 			let event = rx.recv().await.unwrap();
-			let done = !matches!(&event, Event::Loaded { done: false, .. });
+			let done = !matches!(&event, Event::Loaded { done: false, .. } | Event::Pubsub(_));
 			apply(tab, event);
 			if done {
 				break;
@@ -1350,6 +1353,9 @@ mod tests {
 			Event::FilesChanged { parent, changes, .. } => tab.on_files_changed(parent, changes),
 			Event::Loaded { path, ticket, result, done, .. } => tab.on_loaded(path, ticket, result, done),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
+			// No subscriber exists yet in these single-tab tests; a DDS
+			// publish from `cd`/rename is a no-op here.
+			Event::Pubsub(_) => {}
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}

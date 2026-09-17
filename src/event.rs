@@ -1,5 +1,6 @@
 use std::{io, path::PathBuf};
 
+use crate::dds::Body;
 use crate::fs::{Cha, FsChange};
 use crate::preview::{PreviewData, PreviewKey};
 use crate::opener::OpenTarget;
@@ -22,4 +23,9 @@ pub enum Event {
 	/// same way a shell's `cd` hook would.
 	Visited(PathBuf),
 	Task(TaskEvent),
+	/// A message published on the internal DDS bus (see `.ai/dds-plan.md`).
+	/// Round-tripping through the event channel — even for same-process
+	/// delivery — keeps subscriber-produced `Command`s on the same
+	/// synchronous execution path as everything else touching `App`.
+	Pubsub(Body),
 }

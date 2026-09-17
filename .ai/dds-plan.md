@@ -71,14 +71,19 @@ dispatch）做了裁剪。
 
 ```text
 src/dds/
-  mod.rs        // 对外入口：Pubsub::publish / subscribe
-  payload.rs    // Payload envelope + 序列化（换行分隔 JSON，比 yazi 的
-                // csv+json 混合格式更简单，仍可 nc/cat 调试）
-  body.rs       // Body 枚举：内建 kind + Custom(kind: String, data: serde_json::Value)
-  registry.rs   // LOCAL / REMOTE 订阅表 + ability 广播
-  transport.rs  // Unix Socket client/server（首个实例自举为 server）
-  state.rs      // 可选：@ 前缀 static topic 的磁盘持久化，第一期不做
+  mod.rs        // 对外入口：re-export Body/Registry                         [P1 已实现]
+  body.rs       // Body 枚举：Cd/Yank/Renamed/TaskDone                        [P1 已实现]
+  registry.rs   // Registry：kind -> {subscriber -> handler}，App 的字段     [P1 已实现]
+  payload.rs    // Payload{receiver,sender,body} envelope + 序列化           [P3 待实现]
+  transport.rs  // Unix Socket client/server（首个实例自举为 server）        [P3 待实现]
+  state.rs      // 可选：@ 前缀 static topic 的磁盘持久化                    [P4 待实现]
 ```
+
+P1 阶段 `Body` 还没有 `Custom(kind, data)` 兜底分支——外部/动态 kind 要等
+P2 的 `Command::Emit` 落地、真的有调用方产生任意 JSON 时再加，避免现在
+就引入未使用的 `serde_json` 依赖。`Registry` 也没有 yazi 那样的
+`LOCAL`/`REMOTE` 两张表：P1 是单实例场景，`REMOTE`（转发给其他实例的订阅）
+要等 P3 有了真正的跨实例概念才有意义。
 
 ### Body 内建 kind
 
@@ -163,10 +168,23 @@ impl Pubsub {
 
 ## 实施阶段
 
-1. **P1 内部骨架**：`src/dds/{payload,body,registry}.rs` + `Event::Pubsub`
-   接线，纯进程内、无 socket。先把 `cd`/`yank`/`rename`/任务完成几个最
-   有价值的内部事件迁到这条路径，验证「handler 返回 Command」这套接线
-   跑得通。
+1. **P1 内部骨架**（已完成）：`src/dds/{body,registry}.rs` + `Event::Pubsub`
+   接线，纯进程内、无 socket。已把 `cd`（`Tab::cd_inner`）、`yank`
+   （`App::yank_selected`）、`rename`（`Tab::confirm_rename`）、任务完成
+   （`App::on_task_event`）四个内部事件迁到这条路径。`Registry` 是
+   `App` 的一个字段（不是全局静态），`sub`/`unsub` 按 kind+subscriber
+   name 去重，`deliver` 返回 `Vec<Command>` 交给 `App::execute()` 执行，
+   与用户按键走同一条同步路径。P1 阶段暂未引入 `Payload{receiver,
+   sender,...}` 信封结构——单实例场景下这些字段没有意义，留到 P3 引入
+   跨实例传输时再加。已用
+   `app::tests::a_pubsub_subscriber_can_drive_app_state_through_a_yank`
+   验证端到端链路：订阅 -> 发布 -> `Event::Pubsub` -> `Dispatcher` ->
+   `App::execute()`。
+   - 涉及测试基础设施的连带修改：`app.rs`/`tab.rs` 测试模块里的 `pump`/
+     `apply` 辅助函数原先假设事件通道里只有测试期望的那一个事件，新增
+     的 `Event::Pubsub` 会先于目标事件被消费掉，导致既有测试断言错位。
+     两处 `pump` 都已改为「跳过 Pubsub 事件继续等待」，`tab.rs` 的
+     `apply` 对 `Event::Pubsub(_)` 显式忽略（无订阅者时是合法的空操作）。
 2. **P2 CLI 可编程**：新增 `Command::Emit`，让 keymap/`:` 命令能发布任意
    custom kind，不依赖 socket。
 3. **P3 跨实例 socket**：新增 `transport.rs`（client 自举为 server）+

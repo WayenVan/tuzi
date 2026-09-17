@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::{
 	command::{CopyKind, DeleteMode},
 	config::Config,
+	dds::{self, Body},
 	event::Event,
 	icon::IconTheme,
 	keymap::{Key, KeyContext, Keymap, Route, Router, WhichCandidate},
@@ -44,6 +45,7 @@ pub struct App {
 	pub(super) open_picker: Option<OpenPicker>,
 	pub(super) processes: VecDeque<ProcessRequest>,
 	pub(super) tx: mpsc::UnboundedSender<Event>,
+	pub(super) pubsub: dds::Registry,
 	pub tasks: TaskManager,
 	/// One-off toasts (invalid cd, refused delete, a failed external
 	/// process, …) — global, not tied to whichever tab is active, and
@@ -97,6 +99,7 @@ impl App {
 			processes: VecDeque::new(),
 			tasks: TaskManager::configured(tx.clone(), config.tasks.clone()),
 			notices: Vec::new(),
+			pubsub: dds::Registry::new(),
 			tx,
 		};
 		let mut terminal = TerminalSession::start()?;
@@ -444,6 +447,15 @@ impl App {
 		}
 		self.clipboard = targets;
 		self.clipboard_cut = cut;
+		self.publish(Body::Yank { paths: self.clipboard.clone(), cut });
+	}
+
+	/// Publishes a message on the internal DDS bus (`.ai/dds-plan.md`).
+	/// Round-trips through the event channel instead of calling subscriber
+	/// handlers directly, so delivery stays serialized with everything
+	/// else touching `App`.
+	pub(super) fn publish(&self, body: Body) {
+		let _ = self.tx.send(Event::Pubsub(body));
 	}
 
 	pub fn request_delete(&mut self, mode: DeleteMode) {
@@ -507,6 +519,7 @@ impl App {
 		if matches!(kind, TaskKind::Trash | TaskKind::Delete) {
 			self.forget_clipboard_path(&subject);
 		}
+		self.publish(Body::TaskDone { kind, ok: true });
 		let Some(tab) = self.tab_mut(tab) else { return };
 		match kind {
 			TaskKind::Copy | TaskKind::Move => tab.on_pasted(subject),
@@ -608,6 +621,7 @@ mod tests {
 			processes: VecDeque::new(),
 			tasks: TaskManager::new(tx.clone()),
 			notices: Vec::new(),
+			pubsub: dds::Registry::new(),
 			tx,
 		};
 
@@ -623,8 +637,12 @@ mod tests {
 			let task_finished = matches!(&event, Event::Task(TaskEvent::Finished { .. }));
 			let task_event = matches!(&event, Event::Task(_));
 			let listing_pending = matches!(&event, Event::Loaded { done: false, .. });
+			// A DDS publish (e.g. from `cd`/`yank`/rename) has no subscriber
+			// yet in these tests, but it's still queued ahead of whatever
+			// "real" event the test is waiting for — keep draining past it.
+			let pubsub_event = matches!(&event, Event::Pubsub(_));
 			Dispatcher::dispatch_event(app, event);
-			if (!task_event || task_finished) && !listing_pending {
+			if (!task_event || task_finished) && !listing_pending && !pubsub_event {
 				break;
 			}
 		}
@@ -1255,6 +1273,28 @@ mod tests {
 			app.tab_mut(0).unwrap().tree.is_loaded(&root.join("a")),
 			"but it still lands on the tab it was meant for"
 		);
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_pubsub_subscriber_can_drive_app_state_through_a_yank() {
+		let root = std::env::temp_dir().join("tuzi-app-test-pubsub-yank");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("src")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.pubsub.sub("test", "yank", Box::new(|_| vec![Command::ToggleTasks]));
+
+		app.active_tab_mut().selection.insert(root.join("src"));
+		assert!(!app.tasks.visible);
+		app.yank_selected(false);
+		let event = rx.recv().await.unwrap();
+		assert!(matches!(event, Event::Pubsub(_)));
+		Dispatcher::dispatch_event(&mut app, event);
+
+		assert!(app.tasks.visible, "the subscriber's Command actually ran through App::execute");
 
 		fs::remove_dir_all(&root).unwrap();
 	}

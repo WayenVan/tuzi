@@ -5,6 +5,7 @@ mod clipboard;
 mod column_mode;
 mod config;
 mod core;
+mod dds;
 mod event;
 mod finder;
 mod fs;

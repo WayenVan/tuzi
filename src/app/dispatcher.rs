@@ -122,6 +122,11 @@ impl Dispatcher {
 			Event::OpenResolved { tab, cwd, interactive, result } => app.on_open_resolved(tab, cwd, interactive, result),
 			Event::Visited(path) => app.record_visit(path),
 			Event::Task(event) => app.on_task_event(event),
+			Event::Pubsub(body) => {
+				for command in app.pubsub.deliver(&body) {
+					app.execute(command);
+				}
+			}
 			Event::Term(_) => {}
 		}
 		app.drain_tab_notices();
