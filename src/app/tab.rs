@@ -300,6 +300,36 @@ impl Tab {
 		true
 	}
 
+	/// Takes the paths highlighted by a plain visual selection without
+	/// merging them into an older committed selection. Visual-unset is not
+	/// an operation range: it still needs `commit_visual` to subtract from
+	/// the existing selection.
+	fn take_visual_targets(&mut self) -> Option<Vec<PathBuf>> {
+		let visual = self.visual?;
+		if visual.unset {
+			return None;
+		}
+		self.visual = None;
+		let last = self.visible_len().saturating_sub(1);
+		let (lo, hi) = visual.range(self.cursor.min(last));
+		Some(
+			self.visible_range(lo..hi.min(last).saturating_add(1))
+				.into_iter()
+				.map(|(_, node)| node.path.clone())
+				.collect(),
+		)
+	}
+
+	/// Resolves one operation's targets. A plain visual range is an explicit
+	/// one-off target set and therefore wins over an older selection.
+	fn take_action_targets(&mut self) -> Vec<PathBuf> {
+		if let Some(targets) = self.take_visual_targets() {
+			return targets;
+		}
+		self.commit_visual();
+		self.action_targets()
+	}
+
 	/// Queues a one-off toast for `App` to pick up on its next drain —
 	/// see `pending_notice`. A later call before that drain happens simply
 	/// replaces the earlier one; nothing here needs more than the latest.
@@ -311,9 +341,23 @@ impl Tab {
 	/// event loop owns the modal keys and calls `take_pending_delete`;
 	/// another ordinary `d`/`D` can never submit the destructive action.
 	pub fn delete_selected(&mut self, mode: DeleteMode) {
-		self.commit_visual();
+		let visual_targets = self.take_visual_targets();
+		if let Some(targets) = &visual_targets {
+			// Deleting from Visual mode first makes that range the committed
+			// selection. Canceling the confirmation therefore leaves exactly
+			// what the user just selected, matching Yazi's interaction.
+			self.selection.clear();
+			for path in targets {
+				self.selection.insert(path.clone());
+			}
+		}
 		let root = &self.tree.root.path;
-		let targets: Vec<_> = self.action_targets().into_iter().filter(|path| path != root).collect();
+		let root = root.clone();
+		let targets: Vec<_> = visual_targets
+			.unwrap_or_else(|| self.take_action_targets())
+			.into_iter()
+			.filter(|path| path != &root)
+			.collect();
 		if targets.is_empty() {
 			self.pending_delete = None;
 			self.raise(NoticeLevel::Warn, "The current tree root cannot be deleted");
@@ -336,8 +380,7 @@ impl Tab {
 	/// first — mirrors yazi: yanking mid-visual-select acts on the
 	/// highlighted range and leaves visual mode, rather than ignoring it.
 	pub(super) fn take_yank_targets(&mut self) -> Vec<PathBuf> {
-		self.commit_visual();
-		let targets = self.action_targets();
+		let targets = self.take_action_targets();
 		if !targets.is_empty() {
 			self.selection.clear();
 		}
@@ -935,13 +978,11 @@ impl Tab {
 	}
 
 	pub fn take_open_targets(&mut self) -> Vec<PathBuf> {
-		self.commit_visual();
-		self.action_targets()
+		self.take_action_targets()
 	}
 
 	pub fn copy_text(&mut self, kind: CopyKind) -> Vec<u8> {
-		self.commit_visual();
-		let mut paths = self.action_targets();
+		let mut paths = self.take_action_targets();
 		paths.sort();
 		if matches!(kind, CopyKind::DirectoryPath | CopyKind::DirectoryUrl) {
 			let root = &self.tree.root.path;
@@ -1624,13 +1665,14 @@ mod tests {
 		let root = root.canonicalize().unwrap();
 
 		let (mut tab, _rx) = tab(&root).await;
+		tab.selection.insert(root.join("c"));
 		tab.move_cursor(1); // onto "a"
 		tab.enter_visual(false);
 		tab.move_cursor(1); // onto "b" — range is now a..=b, not yet committed
 
 		let mut targets = tab.take_yank_targets();
 		targets.sort();
-		assert_eq!(targets, [root.join("a"), root.join("b")], "yanks the highlighted range, not just the hovered node");
+		assert_eq!(targets, [root.join("a"), root.join("b")], "the current visual range replaces an older selection");
 		assert!(tab.visual.is_none(), "yanking mid-visual-select leaves visual mode");
 		assert!(tab.selection.is_empty(), "and the range converts straight into clipboard markers, same as a committed selection");
 
@@ -1661,6 +1703,38 @@ mod tests {
 		tab.move_cursor(1);
 		assert_eq!(tab.take_open_targets().len(), 2);
 		assert!(tab.visual.is_none());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn delete_in_visual_mode_uses_only_the_current_range() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-delete-visual-replaces-selection");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		for name in ["a", "b", "c"] {
+			fs::write(root.join(name), name.as_bytes()).unwrap();
+		}
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, _rx) = tab(&root).await;
+		tab.selection.insert(root.join("a"));
+		tab.move_cursor(2); // onto "b"
+		tab.enter_visual(false);
+		tab.move_cursor(1); // range is b..=c
+		tab.delete_selected(DeleteMode::Trash);
+
+		let mut targets = tab.pending_delete.as_ref().unwrap().0.clone();
+		targets.sort();
+		assert_eq!(targets, [root.join("b"), root.join("c")]);
+		assert!(tab.visual.is_none());
+		assert!(!tab.selection.contains(&root.join("a")), "the older selection was replaced");
+		assert!(tab.selection.contains(&root.join("b")));
+		assert!(tab.selection.contains(&root.join("c")));
+
+		assert!(tab.take_pending_delete(false).is_none());
+		assert!(tab.selection.contains(&root.join("b")), "canceling keeps the committed visual selection");
+		assert!(tab.selection.contains(&root.join("c")), "canceling keeps the committed visual selection");
+
 		fs::remove_dir_all(root).unwrap();
 	}
 

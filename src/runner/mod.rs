@@ -9,21 +9,25 @@ use crate::{opener::{OpenKind, OpenMode, OpenTarget}, process::{ProcessPurpose, 
 pub struct OpenPlanner;
 
 impl OpenPlanner {
-	pub fn plan(mode: OpenMode, cwd: &Path, targets: &[OpenTarget]) -> io::Result<Vec<ProcessRequest>> {
+	/// The interactive picker's "Open with the default application" choice:
+	/// always dispatches to the OS's own opener, regardless of file kind.
+	pub fn plan_system(cwd: &Path, targets: &[OpenTarget]) -> io::Result<Vec<ProcessRequest>> {
+		open_external(OpenMode::Open, cwd, targets.iter())
+	}
+
+	/// The plain `o` key: every selected target, whatever its kind, becomes
+	/// one blocking `$EDITOR` invocation.
+	pub fn plan_editor(cwd: &Path, targets: &[OpenTarget]) -> io::Result<Vec<ProcessRequest>> {
 		if targets.is_empty() {
 			return Ok(Vec::new());
 		}
-		let mut requests = Vec::new();
-		if mode == OpenMode::Open {
-			let text: Vec<_> = targets.iter().filter(|target| target.kind() == OpenKind::Text).map(|target| &target.path).collect();
-			if !text.is_empty() {
-				requests.extend(open_external(OpenMode::Open, cwd, targets.iter().filter(|target| target.kind() != OpenKind::Text))?);
-				requests.push(ProcessRequest::block(editor(cwd, &text)?, ProcessPurpose::Open, "editor"));
-				return Ok(requests);
-			}
-		}
+		let paths: Vec<_> = targets.iter().map(|target| &target.path).collect();
+		Ok(vec![ProcessRequest::block(editor(cwd, &paths)?, ProcessPurpose::Open, "editor")])
+	}
 
-		open_external(mode, cwd, targets.iter())
+	/// The interactive picker's "Reveal in the file manager" choice.
+	pub fn plan_reveal(cwd: &Path, targets: &[OpenTarget]) -> io::Result<Vec<ProcessRequest>> {
+		open_external(OpenMode::Reveal, cwd, targets.iter())
 	}
 }
 
@@ -113,13 +117,23 @@ mod tests {
 
 	#[test]
 	#[cfg(not(target_os = "windows"))]
-	fn text_targets_become_one_blocking_editor_command() {
+	fn editor_plan_unifies_every_kind_into_one_blocking_command() {
 		let targets = [
 			OpenTarget { path: PathBuf::from("one.txt"), mime: "text/plain".into() },
-			OpenTarget { path: PathBuf::from("two.json"), mime: "application/json".into() },
+			OpenTarget { path: PathBuf::from("two.png"), mime: "image/png".into() },
+			OpenTarget { path: PathBuf::from("dir"), mime: "inode/directory".into() },
 		];
-		let requests = OpenPlanner::plan(OpenMode::Open, Path::new("/tmp"), &targets).unwrap();
+		let requests = OpenPlanner::plan_editor(Path::new("/tmp"), &targets).unwrap();
 		assert_eq!(requests.len(), 1);
 		assert_eq!(requests[0].mode(), crate::process::ProcessMode::Block);
+	}
+
+	#[test]
+	#[cfg(not(target_os = "windows"))]
+	fn system_plan_never_splits_out_an_editor_command() {
+		let targets = [OpenTarget { path: PathBuf::from("one.txt"), mime: "text/plain".into() }];
+		let requests = OpenPlanner::plan_system(Path::new("/tmp"), &targets).unwrap();
+		assert_eq!(requests.len(), 1);
+		assert_ne!(requests[0].mode(), crate::process::ProcessMode::Block);
 	}
 }

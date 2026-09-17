@@ -38,16 +38,12 @@ impl TreeView {
 				let (lo, hi) = visual.range(state.cursor);
 				(lo..=hi).contains(&index).then_some(!visual.unset)
 			});
-			let selected = visual_preview.unwrap_or_else(|| state.selection.contains(&node.path));
-			let marker_style = if selected {
-				Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow))
-			} else if state.clipboard.contains(&node.path) && state.clipboard_cut {
-				Some(Style::new().fg(Color::LightRed).bg(Color::LightRed))
-			} else if state.clipboard.contains(&node.path) {
-				Some(Style::new().fg(Color::LightGreen).bg(Color::LightGreen))
-			} else {
-				None
-			};
+			let marker_style = marker_style(
+				visual_preview,
+				state.selection.contains(&node.path),
+				state.clipboard.contains(&node.path),
+				state.clipboard_cut,
+			);
 			// A load failure is a standing problem with this node, not a
 			// transient toast, so it's pinned to the row itself — checked
 			// ahead of the loading indicator since a collapsed, failed node
@@ -85,6 +81,21 @@ impl TreeView {
 		let selected = state.cursor.checked_sub(row_offset).filter(|index| *index < rows.len());
 		let mut list_state = ListState::default().with_selected(selected);
 		frame.render_stateful_widget(list, area, &mut list_state);
+	}
+}
+
+fn marker_style(visual_preview: Option<bool>, selected: bool, clipboard: bool, clipboard_cut: bool) -> Option<Style> {
+	match visual_preview {
+		// Match the SEL status segment and take precedence over an older
+		// yellow selection marker (or a clipboard marker) on the same row.
+		Some(true) => Some(Style::new().fg(Color::Cyan).bg(Color::Cyan)),
+		// Visual-unset previews the row with no marker, even if it was
+		// selected before entering the range.
+		Some(false) => None,
+		None if selected => Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
+		None if clipboard && clipboard_cut => Some(Style::new().fg(Color::LightRed).bg(Color::LightRed)),
+		None if clipboard => Some(Style::new().fg(Color::LightGreen).bg(Color::LightGreen)),
+		None => None,
 	}
 }
 
@@ -200,7 +211,30 @@ fn truncate(text: String, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::viewport;
+	use ratatui::style::{Color, Style};
+
+	use super::{marker_style, viewport};
+
+	#[test]
+	fn visual_marker_uses_sel_color_and_overrides_older_markers() {
+		let cyan = Some(Style::new().fg(Color::Cyan).bg(Color::Cyan));
+		assert_eq!(marker_style(Some(true), true, true, true), cyan);
+		assert_eq!(marker_style(Some(false), true, true, true), None);
+		assert_eq!(
+			marker_style(None, true, true, true),
+			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
+			"a committed visual selection remains visible over an older cut marker"
+		);
+		assert_eq!(
+			marker_style(None, true, true, false),
+			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow)),
+			"a committed visual selection remains visible over an older copy marker"
+		);
+		assert_eq!(
+			marker_style(None, true, false, false),
+			Some(Style::new().fg(Color::LightYellow).bg(Color::LightYellow))
+		);
+	}
 
 	#[test]
 	fn viewport_keeps_the_cursor_visible_without_formatting_the_whole_tree() {

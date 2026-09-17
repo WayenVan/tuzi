@@ -26,7 +26,7 @@ impl App {
 			}
 			return;
 		}
-		self.enqueue_open(tab, result.and_then(|targets| OpenPlanner::plan(OpenMode::Open, &cwd, &targets)));
+		self.enqueue_open(tab, result.and_then(|targets| OpenPlanner::plan_editor(&cwd, &targets)));
 	}
 
 	pub(super) fn move_open_picker(&mut self, delta: isize) {
@@ -36,7 +36,11 @@ impl App {
 
 	pub(super) fn submit_open_picker(&mut self) {
 		let Some(picker) = self.open_picker.take() else { return };
-		self.enqueue_open(self.active, OpenPlanner::plan(OpenMode::ALL[picker.selected], &picker.cwd, &picker.targets));
+		let result = match OpenMode::ALL[picker.selected] {
+			OpenMode::Open => OpenPlanner::plan_system(&picker.cwd, &picker.targets),
+			OpenMode::Reveal => OpenPlanner::plan_reveal(&picker.cwd, &picker.targets),
+		};
+		self.enqueue_open(self.active, result);
 	}
 
 	fn enqueue_open(&mut self, tab: usize, result: io::Result<Vec<ProcessRequest>>) {

@@ -75,7 +75,7 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('o')], A::Open { interactive: false }, "Open selected files"),
 		Binding::manager(vec![Key::char('O')], A::Open { interactive: true }, "Open selected files interactively"),
 		Binding::manager(vec![Key::char('w')], A::ToggleTasks, "Show task manager"),
-		Binding::manager(vec![Key::char('W')], A::CloseTab, "Close tab"),
+		Binding::manager(vec![Key::new(KeyCode::Char('c'), KeyModifiers::CONTROL)], A::CloseTab, "Close tab"),
 		Binding::manager(vec![Key::char(']')], A::SwitchTab(1), "Next tab"),
 		Binding::manager(vec![Key::char('[')], A::SwitchTab(-1), "Previous tab"),
 		Binding::manager(vec![Key::char('t'), Key::char('t')], A::NewTab, "Create tab"),
