@@ -166,6 +166,59 @@ impl Pubsub {
   `run = "emit my-kind {...}"` 可以直接发布事件，在脚本引擎出现之前先
   提供一定可编程性。
 
+### Event/State 双轨模型（状态恢复的通用抽象）
+
+「新开 tab 要恢复上次的路径和选中文件」这类需求，不该靠订阅方重放历史
+事件来重建状态，而是需要在消息模型里正交切出第二种语义。这不是给
+`Body` 加一个 `TabState` 变体那么简单，而是 Registry 从一开始就要区分
+两种发布方式：
+
+| | Event（事实流） | State（状态视图） |
+|---|---|---|
+| 语义 | "发生了一次什么" | "现在是什么" |
+| 保留 | 不保留，过时即丢 | 按 key 保留**最新一份** |
+| 投递 | 广播给当前在线订阅者 | 订阅时立即补发保留值，之后再收增量 |
+| 类比 | Kafka 的 stream / 日志 | Kafka 的 compacted topic / 数据库表 |
+| tuzi 现有例子 | `cd`/`yank`/`renamed`/`task-done`（P1 已有） | tab 的 `(path, selection)`、当前排序策略、当前主题（P4 待做） |
+| 对应 yazi 概念 | 普通 kind | `@` 前缀 kind + server 端缓存 + 握手重放 |
+
+接口形状：
+
+```rust
+// Event：一次性广播，不保留（P1 已实现的 Registry::deliver 路径）
+registry.publish(Body::Cd { .. });
+
+// State：按 key 覆盖式保留，任何时候可查询当前值（P4 待实现）
+registry.publish_state("tab-state:0", TabState { path, selection });
+let current: Option<TabState> = registry.get_state("tab-state:0");
+```
+
+`publish_state` 内部就是 `HashMap<Key, LatestValue>` 的 upsert；
+`get_state` 就是查表。有没有订阅者不影响这份保留值是否存在——这是它和
+Event 的本质区别，也是「新开 tab 能不能立刻拿到上次状态」的关键：不用
+等下一次事件恰好发生，直接查当前值。
+
+`Command` 在两条路径里的角色不变，只是产生方式不同：
+
+- Event 路径：订阅者收到 Event -> 产生若干小粒度 Command（跟用户按键
+  等价），沿用 P1 已有的 `Registry::deliver -> Vec<Command> ->
+  App::execute()`。
+- State 路径：消费方（tab 初始化逻辑）主动 `get_state` 拿到一份完整
+  快照 -> 产生**一个**"应用快照"的 Command，一次性灌回去，例如：
+
+  ```rust
+  Command::RestoreTab { path: PathBuf, selection: Vec<PathBuf> }
+  ```
+
+  `App::execute` 直接对目标 tab 做批量赋值（cd 到 path，再重建
+  selection），而不是拆成一串 `Cd`/`ToggleSelect` 重放。
+
+跨进程持久化（真正扛得住重启）就是把 `get_state`/`publish_state` 的
+存储后端从纯内存 `HashMap` 换成「内存 + 落盘」，退出时把保留值写入磁盘，
+下次启动前先加载回来——语义完全一致，只是保留值的来源变了。这正是
+`state.rs`（P4）要做的事，现在只是把它的设计明确下来，不再是「等需求
+场景再定」的空白。
+
 ## 实施阶段
 
 1. **P1 内部骨架**（已完成）：`src/dds/{body,registry}.rs` + `Event::Pubsub`
@@ -189,16 +242,25 @@ impl Pubsub {
    custom kind，不依赖 socket。
 3. **P3 跨实例 socket**：新增 `transport.rs`（client 自举为 server）+
    `tuzi emit`/`tuzi sub` 子命令，打通多实例/外部脚本集成。
-4. **P4（可选，按需）**：`@` 静态消息持久化 + 状态重放；未来若要嵌入
-   脚本引擎（Lua/Rhai），只需在 `registry` 里加一种新的 handler 变体，
-   接线不用动。
+4. **P4（可选，按需）**：按上面「Event/State 双轨模型」给 `Registry` 加
+   `publish_state`/`get_state`（内存 `HashMap<Key, LatestValue>`），以及
+   `state.rs` 的磁盘持久化（退出时落盘、启动时加载）。第一个消费场景是
+   tab 状态恢复（路径 + 选中文件），落地为一个新的 `Command::RestoreTab`
+   变体。未来若要嵌入脚本引擎（Lua/Rhai），只需在 `registry` 里加一种
+   新的 handler 变体，接线不用动。
 
 每阶段应可独立验证、独立提交，不必一次性大改完才能用。
 
 ## 尚待确认事项
 
 - `src/actor/` 空存根是否要在本计划里复用或先删除，需与用户确认。
-- 静态 topic（P4）落盘路径与格式尚未设计，等出现具体需求场景再定。
+- State 落盘（P4 `state.rs`）的具体文件格式、路径、key 命名规则
+  （如 `"tab-state:{id}"` 还是更结构化的 key 类型）尚未设计，落地 P4
+  时再定；`publish_state`/`get_state` 的内存版接口形状已经在
+  「Event/State 双轨模型」一节定下来了。
+- `Command::RestoreTab`（或等价变体）的具体字段和「哪些状态值得恢复」
+  （path/selection 之外要不要包含 sort_policy、column_mode、展开的子树）
+  待 P4 实现时按需扩展，不必一次性照搬全部 Tab 字段。
 - `Command::Emit` 的 JSON 参数解析方式（内联 JSON vs. 简化 key=value）
   待 P2 阶段结合 `Command::from_str` 现有语法一起设计。
 
