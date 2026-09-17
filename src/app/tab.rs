@@ -978,6 +978,13 @@ impl Tab {
 		}
 	}
 
+	pub fn on_linked(&mut self, target: PathBuf, result: io::Result<()>) {
+		match result {
+			Ok(()) => self.on_pasted(target),
+			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
+		}
+	}
+
 	fn selected_dir(&self) -> Option<PathBuf> {
 		let (_, node) = self.visible_at(self.cursor)?;
 		node.cha.is_dir.then(|| node.path.clone())
@@ -1165,7 +1172,11 @@ fn complete_directories(base: &Path, value: &str, cursor: usize) -> io::Result<V
 	let mut fuzzy = Vec::new();
 	for entry in std::fs::read_dir(parent)? {
 		let entry = entry?;
-		if !entry.file_type()?.is_dir() {
+		let file_type = entry.file_type()?;
+		// `file_type` won't follow a symlink, so a symlinked directory needs
+		// a second look through `Path::is_dir` (which does) before it's
+		// ruled out — same reasoning as `fs::engine::cha_for`.
+		if !file_type.is_dir() && !(file_type.is_symlink() && entry.path().is_dir()) {
 			continue;
 		}
 		let name = entry.file_name().to_string_lossy().into_owned();
@@ -1789,6 +1800,46 @@ mod tests {
 		assert_eq!(tab.cursor, 0, "starts on the tree's own root");
 
 		assert_eq!(tab.paste_destination(), Some(root.clone()));
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn paste_link_creates_a_relative_symlink_at_the_destination() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-paste-link-relative-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("dst")).unwrap();
+		fs::write(root.join("source.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.fs_scheduler.link(vec![root.join("source.txt")], root.join("dst"), false);
+
+		let Event::Linked { target, result, .. } = rx.recv().await.unwrap() else { panic!("expected a Linked event") };
+		tab.on_linked(target, result);
+
+		assert_eq!(fs::read_link(root.join("dst/source.txt")).unwrap(), PathBuf::from("../source.txt"));
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn paste_link_absolute_stores_the_source_path_unchanged() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-paste-link-absolute-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("dst")).unwrap();
+		fs::write(root.join("source.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.fs_scheduler.link(vec![root.join("source.txt")], root.join("dst"), true);
+
+		let Event::Linked { target, result, .. } = rx.recv().await.unwrap() else { panic!("expected a Linked event") };
+		tab.on_linked(target, result);
+
+		assert_eq!(fs::read_link(root.join("dst/source.txt")).unwrap(), root.join("source.txt"));
 
 		fs::remove_dir_all(root).unwrap();
 	}

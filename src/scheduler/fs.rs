@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{event::Event, fs::Engine};
+use crate::{event::Event, fs::{Engine, create_symlink, symlink_target, unique_dest_avoiding}};
 
 const LISTING_BATCH_SIZE: usize = 512;
 
@@ -101,6 +101,31 @@ impl FsScheduler {
 			.await
 			.unwrap_or_else(|error| Err(std::io::Error::other(error)));
 			let _ = tx.send(Event::Created { tab, base: task_base, value, target, result });
+		});
+	}
+
+	/// Creates one symlink per source, pointing at it directly (not at
+	/// whatever it itself might resolve through) — instant enough that it
+	/// doesn't need the queued/cancelable machinery `TaskManager` gives
+	/// copy/move.
+	pub fn link(&self, sources: Vec<PathBuf>, target_dir: PathBuf, absolute: bool) {
+		let tab = self.tab;
+		let tx = self.tx.clone();
+		let task_target_dir = target_dir.clone();
+		tokio::spawn(async move {
+			let result = tokio::task::spawn_blocking(move || {
+				for source in &sources {
+					let Some(name) = source.file_name() else { continue };
+					let dest = unique_dest_avoiding(&task_target_dir, name, |_| false);
+					let content = symlink_target(&task_target_dir, source, absolute);
+					let is_dir = std::fs::metadata(source).is_ok_and(|meta| meta.is_dir());
+					create_symlink(&content, &dest, is_dir)?;
+				}
+				Ok(())
+			})
+			.await
+			.unwrap_or_else(|error| Err(std::io::Error::other(error)));
+			let _ = tx.send(Event::Linked { tab, target: target_dir, result });
 		});
 	}
 }

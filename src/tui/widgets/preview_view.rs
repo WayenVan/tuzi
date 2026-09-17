@@ -21,7 +21,10 @@ impl PreviewView {
 }
 
 fn directory_lines(node: &Node) -> Vec<Line<'static>> {
-	let kind = if node.cha.is_dir { "directory" } else if node.cha.is_link { "symlink" } else { "file" };
+	// `is_link` takes precedence: a symlinked directory is expandable (so
+	// `is_dir` is true, see `fs::engine::cha_for`), but it should still read
+	// as a symlink here rather than an indistinguishable plain directory.
+	let kind = if node.cha.is_link { "symlink" } else if node.cha.is_dir { "directory" } else { "file" };
 	let mut lines = vec![
 		Line::from(node.path.display().to_string()),
 		Line::from(""),

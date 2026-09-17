@@ -58,6 +58,7 @@ pub enum Action {
 	DeletePermanently,
 	Yank { cut: bool },
 	Paste,
+	PasteLink { absolute: bool },
 	Copy(CopyKind),
 	OpenInput(InputKind),
 	NewTab,

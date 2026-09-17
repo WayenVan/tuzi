@@ -5,7 +5,7 @@ use ratatui::{layout::{Constraint, Direction, Layout}, style::{Color, Modifier, 
 
 use crate::{event::Event, preview::PreviewTarget, status::Segment, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
-use super::App;
+use super::{App, app::MouseState};
 
 impl App {
 	pub(super) fn render(&mut self, term: &mut Raterm) -> io::Result<()> {
@@ -16,19 +16,9 @@ impl App {
 		let which = self.which.clone();
 		let icon_theme = &self.icon_theme;
 		let cwd = self.active_tab().tree.root.path.clone();
-		let labels: Vec<(bool, String)> = self
-			.tabs
-			.iter()
-			.map(|tab| {
-				let name = tab
-					.tree
-					.root
-					.path
-					.file_name()
-					.map_or_else(|| tab.tree.root.path.display().to_string(), |name| name.to_string_lossy().into_owned());
-				(tab.id == self.active, name)
-			})
-			.collect();
+		let labels = self.tab_labels();
+		let preview_percent = self.mouse.preview_percent;
+		let geometry = Cell::new(self.mouse);
 
 		let active = self.active;
 		let tab = self.tabs.iter_mut().find(|tab| tab.id == active).expect("active tab exists");
@@ -79,7 +69,7 @@ impl App {
 			let (tree_area, preview_area) = if preview_visible {
 				let [tree, preview] = Layout::default()
 					.direction(Direction::Horizontal)
-					.constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+					.constraints([Constraint::Percentage(100 - preview_percent), Constraint::Percentage(preview_percent)])
 					.areas(body_area);
 				(tree, Some(preview))
 			} else {
@@ -87,6 +77,7 @@ impl App {
 			};
 			tree_rows.set(tree_area.height as usize);
 			let range = crate::tui::widgets::viewport(visible_len, tab.cursor, scroll, tree_area.height as usize);
+			geometry.set(MouseState { tabs: tab_area, body: body_area, tree: tree_area, preview: preview_area, tree_row_offset: range.start, ..geometry.get() });
 			let rows = tab.visible_range(range.clone());
 
 			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query });
@@ -148,6 +139,7 @@ impl App {
 
 		tab.input = input;
 		self.tree_rows = tree_rows.get();
+		self.mouse = geometry.get();
 		Ok(())
 	}
 }

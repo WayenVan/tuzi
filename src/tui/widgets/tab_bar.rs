@@ -3,6 +3,23 @@ use ratatui::{Frame, layout::Rect, style::{Color, Modifier, Style}, text::{Line,
 pub struct TabBar;
 
 impl TabBar {
+	pub fn hit_test(area: Rect, tabs: &[(bool, String)], x: u16) -> Option<usize> {
+		if tabs.is_empty() || x < area.x || x >= area.right() {
+			return None;
+		}
+		let max = area.width.saturating_sub(4) as usize / tabs.len();
+		let mut column = area.x + Line::from("").width() as u16;
+		for (index, (active, name)) in tabs.iter().enumerate() {
+			let label = truncate(format!(" {} {name} ", index + 1), max);
+			let width = Line::from(label.as_str()).width() as u16 + if *active { 2 } else { 0 };
+			if x >= column && x < column.saturating_add(width) {
+				return Some(index);
+			}
+			column = column.saturating_add(width);
+		}
+		None
+	}
+
 	/// Takes owned labels so the caller can release its shared borrow of all
 	/// tabs before borrowing the active tab mutably for the rest of a frame.
 	pub fn render(frame: &mut Frame, area: Rect, tabs: &[(bool, String)]) {
@@ -56,4 +73,19 @@ fn truncate(text: String, max: usize) -> String {
 	}
 	out.push('…');
 	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn hit_test_tracks_rendered_tab_widths() {
+		let tabs = vec![(true, "one".into()), (false, "two".into()), (false, "three".into())];
+		let area = Rect::new(10, 2, 60, 1);
+		assert_eq!(TabBar::hit_test(area, &tabs, 12), Some(0));
+		assert_eq!(TabBar::hit_test(area, &tabs, 20), Some(1));
+		assert_eq!(TabBar::hit_test(area, &tabs, 28), Some(2));
+		assert_eq!(TabBar::hit_test(area, &tabs, 69), None);
+	}
 }

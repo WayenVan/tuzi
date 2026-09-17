@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, io, path::{Path, PathBuf}};
 
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -31,6 +32,7 @@ pub struct App {
 	pub(super) clipboard: Vec<PathBuf>,
 	pub(super) clipboard_cut: bool,
 	pub(super) tree_rows: usize,
+	pub(super) mouse: MouseState,
 	pub(super) which: Vec<WhichCandidate>,
 	pub(super) icon_theme: IconTheme,
 	pub(super) open: OpenScheduler,
@@ -42,6 +44,26 @@ pub struct App {
 	/// process, …) — global, not tied to whichever tab is active, and
 	/// timeout-driven rather than something the user dismisses.
 	pub(super) notices: Vec<Notice>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MouseState {
+	pub tabs:            Rect,
+	pub body:            Rect,
+	pub tree:            Rect,
+	pub preview:         Option<Rect>,
+	pub tree_row_offset: usize,
+	pub preview_percent: u16,
+	pub resizing:        bool,
+}
+
+impl Default for MouseState {
+	fn default() -> Self {
+		Self {
+			tabs: Rect::default(), body: Rect::default(), tree: Rect::default(), preview: None,
+			tree_row_offset: 0, preview_percent: 40, resizing: false,
+		}
+	}
 }
 
 impl App {
@@ -58,6 +80,7 @@ impl App {
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
+			mouse: MouseState::default(),
 			which: Vec::new(),
 			icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()),
@@ -107,6 +130,7 @@ impl App {
 	fn handle_event(&mut self, event: Event, router: &mut Router) -> bool {
 		match event {
 			Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => self.handle_key(key, router),
+			Event::Term(crossterm::event::Event::Mouse(mouse)) => self.handle_mouse(mouse),
 			Event::Term(crossterm::event::Event::Resize(_, _)) => true,
 			Event::Term(_) => false,
 			event => {
@@ -114,6 +138,90 @@ impl App {
 				true
 			}
 		}
+	}
+
+	fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+		// Like Yazi, overlays own the input layer: do not let a click leak
+		// through to the manager underneath them.
+		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
+			self.mouse.resizing = false;
+			return false;
+		}
+
+		let point = (event.column, event.row);
+		match event.kind {
+			MouseEventKind::Down(MouseButton::Left) => {
+				if let Some(preview) = self.mouse.preview
+					&& event.column == preview.x
+					&& contains(self.mouse.body, point)
+				{
+					self.mouse.resizing = true;
+					return true;
+				}
+				if contains(self.mouse.tabs, point) {
+					let labels = self.tab_labels();
+					if let Some(index) = crate::tui::widgets::TabBar::hit_test(self.mouse.tabs, &labels, event.column) {
+						self.active = self.tabs[index].id;
+						return true;
+					}
+				}
+				self.point_tree_cursor(point)
+			}
+			MouseEventKind::Down(MouseButton::Right) => {
+				if !self.point_tree_cursor(point) {
+					return false;
+				}
+				self.active_tab_mut().toggle_expand_selected();
+				true
+			}
+			MouseEventKind::Up(MouseButton::Left) => {
+				let dirty = self.mouse.resizing;
+				self.mouse.resizing = false;
+				dirty
+			}
+			MouseEventKind::Drag(MouseButton::Left) if self.mouse.resizing => self.resize_preview(event.column),
+			MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+				let step = if matches!(event.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+				if self.mouse.preview.is_some_and(|area| contains(area, point)) {
+					self.active_tab_mut().preview.seek(step);
+					true
+				} else if contains(self.mouse.tree, point) {
+					self.active_tab_mut().move_cursor(step as isize);
+					true
+				} else {
+					false
+				}
+			}
+			_ => false,
+		}
+	}
+
+	fn point_tree_cursor(&mut self, point: (u16, u16)) -> bool {
+		if !contains(self.mouse.tree, point) {
+			return false;
+		}
+		let cursor = self.mouse.tree_row_offset + (point.1 - self.mouse.tree.y) as usize;
+		if cursor >= self.active_tab().visible_len() {
+			return false;
+		}
+		let delta = cursor as isize - self.active_tab().cursor as isize;
+		self.active_tab_mut().move_cursor(delta);
+		true
+	}
+
+	fn resize_preview(&mut self, column: u16) -> bool {
+		if self.mouse.body.width == 0 { return false }
+		let tree = column.saturating_sub(self.mouse.body.x).min(self.mouse.body.width) as u32;
+		let tree_percent = (tree * 100 / self.mouse.body.width as u32).clamp(20, 80) as u16;
+		self.mouse.preview_percent = 100 - tree_percent;
+		true
+	}
+
+	pub(super) fn tab_labels(&self) -> Vec<(bool, String)> {
+		self.tabs.iter().map(|tab| {
+			let name = tab.tree.root.path.file_name().map_or_else(|| tab.tree.root.path.display().to_string(), |name| name.to_string_lossy().into_owned());
+			(tab.id == self.active, name)
+		}).collect()
 	}
 
 	fn handle_key(&mut self, key: crossterm::event::KeyEvent, router: &mut Router) -> bool {
@@ -332,6 +440,21 @@ impl App {
 		}
 	}
 
+	/// Symlinks the clipboard into the active tab instead of copying or
+	/// moving it — near-instant, so unlike `paste` it skips the task queue
+	/// entirely. Never consumes the clipboard: the source is left untouched
+	/// either way, so there's nothing for a cut to finish.
+	pub fn paste_link(&mut self, absolute: bool) {
+		if self.clipboard.is_empty() {
+			return;
+		}
+		let paths = self.clipboard.clone();
+		let Some(target) = self.active_tab().paste_destination() else {
+			return;
+		};
+		self.active_tab_mut().fs_scheduler.link(paths, target, absolute);
+	}
+
 	pub fn copy_to_system_clipboard(&mut self, kind: CopyKind) {
 		let content = self.active_tab_mut().copy_text(kind);
 		if content.is_empty() {
@@ -408,6 +531,10 @@ impl App {
 	}
 }
 
+fn contains(area: Rect, (x, y): (u16, u16)) -> bool {
+	x >= area.x && x < area.right() && y >= area.y && y < area.bottom()
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{fs, path::Path};
@@ -428,6 +555,7 @@ mod tests {
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
+			mouse: MouseState::default(),
 			which: Vec::new(),
 			icon_theme: IconTheme,
 			open: OpenScheduler::new(tx.clone()),
@@ -455,6 +583,66 @@ mod tests {
 				break;
 			}
 		}
+	}
+
+	fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+		MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+	}
+
+	#[tokio::test]
+	async fn mouse_click_and_wheel_move_the_tree_cursor() {
+		let root = std::env::temp_dir().join("tuzi-app-test-mouse-tree");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("a"), b"a").unwrap();
+		fs::write(root.join("b"), b"b").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.mouse.tree = Rect::new(4, 3, 40, 8);
+		app.mouse.tree_row_offset = 0;
+
+		assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 8, 4)));
+		assert_eq!(app.active_tab().cursor, 1);
+		assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 8, 4)));
+		assert_eq!(app.active_tab().cursor, 2);
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn modal_layer_prevents_mouse_clicks_reaching_the_tree() {
+		let root = std::env::temp_dir().join("tuzi-app-test-mouse-modal");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("a"), b"a").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.mouse.tree = Rect::new(0, 3, 40, 8);
+		app.pending_quit = true;
+
+		assert!(!app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 4)));
+		assert_eq!(app.active_tab().cursor, 0);
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn right_click_toggles_a_directory_without_entering_it() {
+		let root = std::env::temp_dir().join("tuzi-app-test-mouse-right-click");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("dir")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.mouse.tree = Rect::new(0, 3, 40, 8);
+		let original_root = app.active_tab().tree.root.path.clone();
+
+		assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 2, 4)));
+		assert_eq!(app.active_tab().tree.root.path, original_root);
+		assert!(app.active_tab().visible_at(1).unwrap().1.expanded);
+		assert!(app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 2, 4)));
+		assert!(!app.active_tab().visible_at(1).unwrap().1.expanded);
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]

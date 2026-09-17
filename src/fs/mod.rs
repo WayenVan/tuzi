@@ -5,7 +5,7 @@ mod sorter;
 
 pub use cha::{Cha, format_size};
 pub use engine::{Engine, LocalEngine};
-pub use ops::{remove, unique_dest_avoiding};
+pub use ops::{create_symlink, remove, symlink_target, unique_dest_avoiding};
 pub(crate) use sorter::compare as compare_for_sort;
 pub use sorter::{SortBy, SortPolicy, sort};
 

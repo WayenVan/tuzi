@@ -7,8 +7,20 @@ use crate::{event::Event, fs::{Cha, FsChange}};
 
 pub struct Watcher {
 	inner:   Box<dyn NotifyWatcher + Send>,
-	watched: Arc<Mutex<HashSet<PathBuf>>>,
+	watched: Arc<Mutex<WatchIndex>>,
 	pending: PendingChanges,
+}
+
+/// `notify` needs the canonical (symlink-resolved) path to actually register
+/// an OS-level watch, and its backends sometimes report that resolved form
+/// back in events too — but the tree indexes nodes by their own, possibly
+/// symlinked, path. This keeps both directions so raw events can be matched
+/// in canonical space while everything handed back to the app (and `unwatch`)
+/// stays in the tree's own path space.
+#[derive(Default)]
+struct WatchIndex {
+	by_canonical: HashMap<PathBuf, PathBuf>,
+	by_original:  HashMap<PathBuf, PathBuf>,
 }
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -37,7 +49,7 @@ struct ChangeSet {
 
 impl Watcher {
 	pub fn new(tab: usize, tx: UnboundedSender<Event>) -> io::Result<Self> {
-		let watched = Arc::new(Mutex::new(HashSet::new()));
+		let watched = Arc::new(Mutex::new(WatchIndex::default()));
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
 		let inner = RecommendedWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime), Config::default()).map_err(io::Error::other)?;
@@ -46,7 +58,7 @@ impl Watcher {
 
 	#[cfg(test)]
 	fn new_polling(tab: usize, tx: UnboundedSender<Event>, interval: std::time::Duration) -> io::Result<Self> {
-		let watched = Arc::new(Mutex::new(HashSet::new()));
+		let watched = Arc::new(Mutex::new(WatchIndex::default()));
 		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
 		let config = Config::default().with_poll_interval(interval).with_compare_contents(true);
@@ -57,20 +69,27 @@ impl Watcher {
 	/// Watches one directory level, non-recursively — nodes watch themselves
 	/// only while expanded, mirroring what's actually visible on screen.
 	pub fn watch(&mut self, path: &Path) -> io::Result<()> {
-		let path = path.canonicalize()?;
-		if self.watched.lock().unwrap().contains(&path) {
+		let canonical = path.canonicalize()?;
+		if self.watched.lock().unwrap().by_canonical.contains_key(&canonical) {
 			return Ok(());
 		}
-		self.inner.watch(&path, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
-		self.watched.lock().unwrap().insert(path);
+		self.inner.watch(&canonical, RecursiveMode::NonRecursive).map_err(io::Error::other)?;
+		let mut watched = self.watched.lock().unwrap();
+		watched.by_canonical.insert(canonical.clone(), path.to_path_buf());
+		watched.by_original.insert(path.to_path_buf(), canonical);
 		Ok(())
 	}
 
+	/// Takes the same (tree-space) path `watch` was given — not re-derived
+	/// from the filesystem, so this still works even if whatever the path
+	/// pointed at has already vanished.
 	pub fn unwatch(&mut self, path: &Path) {
-		let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-		let _ = self.inner.unwatch(&path);
-		self.watched.lock().unwrap().remove(&path);
-		if let Some(change) = self.pending.lock().unwrap().remove(&path)
+		let mut watched = self.watched.lock().unwrap();
+		let Some(canonical) = watched.by_original.remove(path) else { return };
+		watched.by_canonical.remove(&canonical);
+		drop(watched);
+		let _ = self.inner.unwatch(&canonical);
+		if let Some(change) = self.pending.lock().unwrap().remove(path)
 			&& let Some(abort) = change.abort
 		{
 			abort.abort();
@@ -89,12 +108,15 @@ impl Drop for Watcher {
 }
 
 // The backend (FSEvents/inotify/...) doesn't consistently report a changed
-// child's path vs. its watched parent, and may resolve symlinks along the way.
-// Walk upward until reaching a directory registered by this watcher.
+// child's path vs. its watched parent, and may resolve symlinks along the
+// way — so the ancestor walk below matches in canonical space. Everything
+// downstream of that match (the `changed` map, debounce bookkeeping, the
+// event finally sent out) is then translated back to the tree's own path,
+// which is what `Tab` actually indexes its nodes by.
 fn event_handler(
 	tab: usize,
 	tx: UnboundedSender<Event>,
-	matched: Arc<Mutex<HashSet<PathBuf>>>,
+	matched: Arc<Mutex<WatchIndex>>,
 	pending: PendingChanges,
 	runtime: Handle,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
@@ -106,14 +128,15 @@ fn event_handler(
 		let watched = matched.lock().unwrap();
 		let mut changed: HashMap<PathBuf, (HashSet<PathBuf>, bool)> = HashMap::new();
 		for path in event.paths {
-			if let Some(dir) = nearest_watched(&watched, &path) {
-				let entry = changed.entry(dir.clone()).or_default();
-				if path == dir {
+			if let Some(canonical_dir) = nearest_watched(&watched.by_canonical, &path) {
+				let Some(original_dir) = watched.by_canonical.get(&canonical_dir) else { continue };
+				let entry = changed.entry(original_dir.clone()).or_default();
+				if path == canonical_dir {
 					entry.1 = true;
-				} else if let Ok(relative) = path.strip_prefix(&dir)
+				} else if let Ok(relative) = path.strip_prefix(&canonical_dir)
 					&& let Some(component) = relative.components().next()
 				{
-					entry.0.insert(dir.join(component.as_os_str()));
+					entry.0.insert(original_dir.join(component.as_os_str()));
 				}
 			}
 		}
@@ -187,10 +210,10 @@ fn inspect_paths(paths: HashSet<PathBuf>) -> Vec<FsChange> {
 		.collect()
 }
 
-fn nearest_watched(watched: &HashSet<PathBuf>, path: &Path) -> Option<PathBuf> {
+fn nearest_watched(by_canonical: &HashMap<PathBuf, PathBuf>, path: &Path) -> Option<PathBuf> {
 	let mut cur = Some(path);
 	while let Some(p) = cur {
-		if watched.contains(p) {
+		if by_canonical.contains_key(p) {
 			return Some(p.to_path_buf());
 		}
 		cur = p.parent();
@@ -287,5 +310,36 @@ mod tests {
 		}
 
 		fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn changes_through_a_symlinked_directory_are_reported_under_the_link_path() {
+		let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+		let base = std::env::temp_dir().join(format!("tuzi-watcher-symlink-test-{}-{nonce}", std::process::id()));
+		let real = base.join("real");
+		let link = base.join("link");
+		fs::create_dir_all(&real).unwrap();
+		std::os::unix::fs::symlink(&real, &link).unwrap();
+
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let mut watcher = Watcher::new_polling(11, tx, Duration::from_millis(25)).unwrap();
+		// The tree only ever knows about `link` — it never sees `real`, the
+		// canonicalized form `watch` resolves internally to register the OS
+		// watch.
+		watcher.watch(&link).unwrap();
+		fs::write(real.join("new.txt"), b"hi").unwrap();
+
+		let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("channel closed");
+		match event {
+			Event::FilesChanged { tab, parent, changes } => {
+				assert_eq!(tab, 11);
+				assert_eq!(parent, link, "must be tagged with the tree's own path, not the symlink-resolved one");
+				assert!(matches!(changes.as_slice(), [FsChange::Upsert { path, .. }] if path == &link.join("new.txt")));
+			}
+			_ => panic!("unexpected event"),
+		}
+
+		fs::remove_dir_all(&base).unwrap();
 	}
 }

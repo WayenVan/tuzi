@@ -55,6 +55,8 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('y')], A::Yank { cut: false }, "Yank selected files (copy)"),
 		Binding::manager(vec![Key::char('x')], A::Yank { cut: true }, "Yank selected files (cut)"),
 		Binding::manager(vec![Key::char('p')], A::Paste, "Paste"),
+		Binding::manager(vec![Key::char('P'), Key::char('l')], A::PasteLink { absolute: false }, "Paste as a relative symlink"),
+		Binding::manager(vec![Key::char('P'), Key::char('L')], A::PasteLink { absolute: true }, "Paste as an absolute symlink"),
 		Binding::manager(vec![Key::char('c'), Key::char('c')], A::Copy(CopyKind::Path), "Copy file path"),
 		Binding::manager(vec![Key::char('c'), Key::char('C')], A::Copy(CopyKind::Url), "Copy file URL"),
 		Binding::manager(vec![Key::char('c'), Key::char('d')], A::Copy(CopyKind::DirectoryPath), "Copy directory path"),

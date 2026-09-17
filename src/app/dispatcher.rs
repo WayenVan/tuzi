@@ -35,6 +35,7 @@ impl Dispatcher {
 			Action::DeletePermanently => app.active_tab_mut().delete_selected(DeleteMode::Permanent),
 			Action::Yank { cut } => app.yank_selected(cut),
 			Action::Paste => app.paste(),
+			Action::PasteLink { absolute } => app.paste_link(absolute),
 			Action::Copy(kind) => app.copy_to_system_clipboard(kind),
 			Action::OpenInput(InputKind::Rename) => app.active_tab_mut().start_rename(),
 			Action::OpenInput(InputKind::Cd) => app.active_tab_mut().start_cd(),
@@ -95,6 +96,11 @@ impl Dispatcher {
 			} => {
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_created(base, value, target, result);
+				}
+			}
+			Event::Linked { tab, target, result } => {
+				if let Some(t) = app.tab_mut(tab) {
+					t.on_linked(target, result);
 				}
 			}
 			Event::CompletionLoaded { tab, input, revision, result } => {
