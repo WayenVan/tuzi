@@ -76,17 +76,16 @@ jobs:
 
     steps:
       - name: Download all packages
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
 
       - name: Create release and upload packages
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          release-assets/*
-          --verify-tag
-          --generate-notes
-          --title "tuzi ${GITHUB_REF_NAME}"
+          GITHUB_TOKEN: ${{ github.token }}
