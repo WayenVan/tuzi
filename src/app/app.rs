@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, io, path::PathBuf};
+use std::{collections::VecDeque, io, path::{Path, PathBuf}};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
@@ -83,7 +83,15 @@ impl App {
 					None => break,
 				},
 			};
-			if !app.handle_event(event, &mut router) {
+			// A burst of background events (e.g. a filesystem watcher storm
+			// spanning several directories) drains here before the next
+			// render, instead of redrawing once per event.
+			let mut dirty = app.handle_event(event, &mut router);
+			while !app.quit {
+				let Ok(event) = rx.try_recv() else { break };
+				dirty |= app.handle_event(event, &mut router);
+			}
+			if !dirty {
 				continue;
 			}
 			if app.quit {
@@ -337,10 +345,23 @@ impl App {
 		let Some((tab, kind, subject)) = self.tasks.accept(event) else {
 			return;
 		};
+		if matches!(kind, TaskKind::Trash | TaskKind::Delete) {
+			self.forget_clipboard_path(&subject);
+		}
 		let Some(tab) = self.tab_mut(tab) else { return };
 		match kind {
 			TaskKind::Copy | TaskKind::Move => tab.on_pasted(subject),
 			TaskKind::Trash | TaskKind::Delete => tab.on_deleted(vec![subject]),
+		}
+	}
+
+	/// Clipboard markers identify filesystem objects only by path. Forget a
+	/// deleted path and its descendants so a replacement created at the same
+	/// location cannot inherit a stale copy/cut marker.
+	pub(super) fn forget_clipboard_path(&mut self, deleted: &Path) {
+		self.clipboard.retain(|path| path != deleted && !path.starts_with(deleted));
+		if self.clipboard.is_empty() {
+			self.clipboard_cut = false;
 		}
 	}
 
@@ -504,7 +525,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn confirmed_delete_permanently_removes_the_target_as_a_task() {
+	async fn confirmed_delete_clears_clipboard_marker_before_same_path_is_recreated() {
 		let root = std::env::temp_dir().join("tuzi-app-test-delete-permanent");
 		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(&root).unwrap();
@@ -512,6 +533,7 @@ mod tests {
 		let root = root.canonicalize().unwrap();
 
 		let (mut app, mut rx) = app(&root).await;
+		app.clipboard = vec![root.join("leaf.txt")];
 		app.active_tab_mut().move_cursor(1); // onto "leaf.txt"
 		app.active_tab_mut().delete_selected(DeleteMode::Permanent);
 		assert!(app.active_tab().pending_delete.is_some(), "arms the confirmation without deleting yet");
@@ -522,6 +544,9 @@ mod tests {
 		pump(&mut app, &mut rx).await;
 
 		assert!(!root.join("leaf.txt").exists());
+		assert!(app.clipboard.is_empty(), "deleting the copied object clears its marker");
+		fs::write(root.join("leaf.txt"), b"replacement").unwrap();
+		assert!(app.clipboard.is_empty(), "a new object at the same path does not inherit the old marker");
 		fs::remove_dir_all(&root).unwrap();
 	}
 

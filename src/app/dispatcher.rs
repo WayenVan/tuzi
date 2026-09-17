@@ -1,6 +1,7 @@
 use crate::{
 	action::{Action, CursorTarget, DeleteMode, InputKind},
 	event::Event,
+	fs::FsChange,
 };
 
 use super::App;
@@ -21,6 +22,8 @@ impl Dispatcher {
 			Action::CdTrash => app.active_tab_mut().cd_trash(),
 			Action::CdHome => app.active_tab_mut().cd_home(),
 			Action::CdConfig => app.active_tab_mut().cd_config(),
+			Action::CdDownloads => app.active_tab_mut().cd_downloads(),
+			Action::CdDesktop => app.active_tab_mut().cd_desktop(),
 			Action::HistoryBack => app.active_tab_mut().history_back(),
 			Action::HistoryForward => app.active_tab_mut().history_forward(),
 			Action::Expand => app.active_tab_mut().expand_selected(),
@@ -63,6 +66,11 @@ impl Dispatcher {
 				}
 			}
 			Event::FilesChanged { tab, parent, changes } => {
+				for change in &changes {
+					if let FsChange::Delete { path } = change {
+						app.forget_clipboard_path(path);
+					}
+				}
 				if let Some(t) = app.tab_mut(tab) {
 					t.on_files_changed(parent, changes);
 				}

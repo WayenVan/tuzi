@@ -8,6 +8,10 @@
   A tree-style <a href="https://github.com/sxyazi/yazi">Yazi</a> for the terminal.
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" width="960" alt="tuzi demo">
+</p>
+
 ## Install
 
 Download the macOS or Linux archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` somewhere on your `PATH`.
@@ -53,6 +57,7 @@ tuzi --version
 | `.` | Toggle hidden files |
 | `z` | Jump with `fzf` |
 | `g~` / `gc` | Go to home / config directory |
+| `gd` / `gD` | Go to Downloads / Desktop |
 | `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |
 | `w` | Show task manager |
 | `Ctrl-p` | Toggle preview |

@@ -39,6 +39,8 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('g'), Key::char('t')], A::CdTrash, "Go to the trash"),
 		Binding::manager(vec![Key::char('g'), Key::char('~')], A::CdHome, "Go to home directory"),
 		Binding::manager(vec![Key::char('g'), Key::char('c')], A::CdConfig, "Go to config directory"),
+		Binding::manager(vec![Key::char('g'), Key::char('d')], A::CdDownloads, "Go to Downloads"),
+		Binding::manager(vec![Key::char('g'), Key::char('D')], A::CdDesktop, "Go to Desktop"),
 		Binding::manager(vec![Key::char('G')], A::MoveTo(CursorTarget::Bottom), "Move to bottom"),
 		Binding::manager(vec![Key::char('l')], A::Expand, "Expand"),
 		Binding::manager(vec![Key::plain(KeyCode::Right)], A::Expand, "Expand"),

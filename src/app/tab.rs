@@ -416,12 +416,19 @@ impl Tab {
 	}
 
 	pub fn start_create(&mut self) {
+		let base = self
+			.visible_at(self.cursor)
+			.map(|(_, node)| (node.path.clone(), node.cha.is_dir && node.expanded))
+			.map(|(path, create_inside)| {
+				if create_inside {
+					path.clone()
+				} else {
+					self.tree.parent_of(&path).unwrap_or_else(|| self.tree.root.path.clone())
+				}
+			})
+			.unwrap_or_else(|| self.tree.root.path.clone());
 		self.input_seq += 1;
-		self.input = Some(InputSession::new(
-			self.input_seq,
-			InputPurpose::Create { base: self.tree.root.path.clone() },
-			"",
-		));
+		self.input = Some(InputSession::new(self.input_seq, InputPurpose::Create { base }, ""));
 	}
 
 	pub fn start_find(&mut self, previous: bool) {
@@ -701,6 +708,20 @@ impl Tab {
 
 	pub fn cd_config(&mut self) {
 		match home_dir().map(|home| home.join(".config")).and_then(|path| self.cd(path)) {
+			Ok(()) => {}
+			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
+		}
+	}
+
+	pub fn cd_downloads(&mut self) {
+		match home_dir().map(|home| home.join("Downloads")).and_then(|path| self.cd(path)) {
+			Ok(()) => {}
+			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
+		}
+	}
+
+	pub fn cd_desktop(&mut self) {
+		match home_dir().map(|home| home.join("Desktop")).and_then(|path| self.cd(path)) {
 			Ok(()) => {}
 			Err(error) => self.raise(NoticeLevel::Error, error.to_string()),
 		}
@@ -1890,6 +1911,78 @@ mod tests {
 
 		assert!(root.join("note.txt").is_file());
 		assert_eq!(tab.visible()[tab.cursor].1.path, root.join("note.txt"));
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn create_beside_a_hovered_file_and_reveals_it() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-beside-file");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("parent")).unwrap();
+		fs::write(root.join("parent/existing.txt"), b"existing").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("parent"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("parent/existing.txt"));
+		tab.start_create();
+		set_input_value(&mut tab, "sibling.txt");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+
+		let target = root.join("parent/sibling.txt");
+		assert!(target.is_file());
+		assert_eq!(tab.visible()[tab.cursor].1.path, target);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn create_beside_a_collapsed_directory_and_reveals_it() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-beside-collapsed-directory");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("parent/closed")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("parent"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("parent/closed"));
+		tab.start_create();
+		set_input_value(&mut tab, "sibling.txt");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+
+		let target = root.join("parent/sibling.txt");
+		assert!(target.is_file());
+		assert_eq!(tab.visible()[tab.cursor].1.path, target);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn create_inside_an_expanded_directory_and_reveals_it() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-create-inside-expanded-directory");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("open")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("open"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+		tab.start_create();
+		set_input_value(&mut tab, "child.txt");
+		tab.handle_input_key(key(KeyCode::Enter));
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+
+		let target = root.join("open/child.txt");
+		assert!(target.is_file());
+		assert_eq!(tab.visible()[tab.cursor].1.path, target);
 		fs::remove_dir_all(root).unwrap();
 	}
 

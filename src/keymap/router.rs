@@ -171,6 +171,12 @@ mod tests {
 
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('c')), Route::Actions(vec![Action::CdConfig]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('d')), Route::Actions(vec![Action::CdDownloads]));
+
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('D')), Route::Actions(vec![Action::CdDesktop]));
 	}
 
 	#[test]

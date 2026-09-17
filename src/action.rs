@@ -45,6 +45,8 @@ pub enum Action {
 	CdTrash,
 	CdHome,
 	CdConfig,
+	CdDownloads,
+	CdDesktop,
 	HistoryBack,
 	HistoryForward,
 	Expand,

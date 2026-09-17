@@ -13,14 +13,20 @@ pub struct Watcher {
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_CHANGE_BATCH: usize = 1000;
+/// Caps how long a directory under nonstop churn (e.g. a log file being
+/// appended to faster than `CHANGE_DEBOUNCE` apart) can be starved of an
+/// update — the sliding debounce below would otherwise keep resetting
+/// forever.
+const MAX_CHANGE_WAIT: Duration = Duration::from_secs(1);
 
 type PendingChanges = Arc<Mutex<HashMap<PathBuf, PendingChange>>>;
 
 struct PendingChange {
-	deadline: Instant,
-	paths:    HashSet<PathBuf>,
-	refresh:  bool,
-	abort:    Option<AbortHandle>,
+	first_seen: Instant,
+	deadline:   Instant,
+	paths:      HashSet<PathBuf>,
+	refresh:    bool,
+	abort:      Option<AbortHandle>,
 }
 
 struct ChangeSet {
@@ -113,7 +119,7 @@ fn event_handler(
 		}
 		drop(watched);
 		for (parent, (paths, refresh)) in changed {
-			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, CHANGE_DEBOUNCE);
+			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, CHANGE_DEBOUNCE, MAX_CHANGE_WAIT);
 		}
 	}
 }
@@ -125,16 +131,19 @@ fn debounce_changes(
 	runtime: &Handle,
 	change_set: ChangeSet,
 	delay: Duration,
+	max_wait: Duration,
 ) {
 	let ChangeSet { parent, paths, refresh } = change_set;
-	let deadline = Instant::now() + delay;
+	let now = Instant::now();
+	let deadline = now + delay;
 	if let Some(change) = pending.lock().unwrap().get_mut(&parent) {
 		change.paths.extend(paths);
 		change.refresh |= refresh;
-		change.deadline = if change.paths.len() >= MAX_CHANGE_BATCH { Instant::now() } else { deadline };
+		let capped = change.first_seen + max_wait;
+		change.deadline = if change.paths.len() >= MAX_CHANGE_BATCH { now } else { deadline.min(capped) };
 		return;
 	}
-	pending.lock().unwrap().insert(parent.clone(), PendingChange { deadline, paths, refresh, abort: None });
+	pending.lock().unwrap().insert(parent.clone(), PendingChange { first_seen: now, deadline, paths, refresh, abort: None });
 	let task_parent = parent.clone();
 	let task_pending = pending.clone();
 	let handle = runtime.spawn(async move {
@@ -213,12 +222,46 @@ mod tests {
 				&runtime,
 				ChangeSet { parent: parent.clone(), paths: HashSet::from([path.clone()]), refresh: false },
 				Duration::from_millis(20),
+				Duration::from_secs(1),
 			);
 		}
 
 		let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
 		assert!(matches!(event, Event::FilesChanged { tab: 3, parent: ref changed, changes } if changed == &parent && matches!(changes.as_slice(), [FsChange::Delete { path: deleted }] if deleted == &path)));
 		assert!(tokio::time::timeout(Duration::from_millis(60), rx.recv()).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn nonstop_churn_still_flushes_once_max_wait_elapses() {
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let pending = Arc::new(Mutex::new(HashMap::new()));
+		let parent = PathBuf::from("hot-directory");
+		let path = parent.join("hot-file");
+
+		// Keeps resetting the idle deadline every 35ms, well inside the
+		// 60ms idle window, so the debounce alone would never fire.
+		let (churn_tx, churn_pending, churn_parent, churn_path) = (tx.clone(), pending.clone(), parent.clone(), path.clone());
+		tokio::spawn(async move {
+			let runtime = Handle::current();
+			loop {
+				debounce_changes(
+					9,
+					churn_tx.clone(),
+					churn_pending.clone(),
+					&runtime,
+					ChangeSet { parent: churn_parent.clone(), paths: HashSet::from([churn_path.clone()]), refresh: false },
+					Duration::from_millis(60),
+					Duration::from_millis(120),
+				);
+				tokio::time::sleep(Duration::from_millis(35)).await;
+			}
+		});
+
+		// `max_wait` (120ms) must force a flush well inside this timeout,
+		// even though the churner above never lets the idle debounce go
+		// quiet for the whole run.
+		let event = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await.expect("max_wait did not force a flush").unwrap();
+		assert!(matches!(event, Event::FilesChanged { tab: 9, .. }));
 	}
 
 	#[tokio::test]
