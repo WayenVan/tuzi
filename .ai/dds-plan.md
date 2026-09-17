@@ -177,7 +177,7 @@ impl Pubsub {
 |---|---|---|
 | 语义 | "发生了一次什么" | "现在是什么" |
 | 保留 | 不保留，过时即丢 | 按 key 保留**最新一份** |
-| 投递 | 广播给当前在线订阅者 | 订阅时立即补发保留值，之后再收增量 |
+| 投递 | 推模型：广播给当前在线订阅者 | 拉模型：消费方随时主动 `get_state` 查询，没有"订阅时补发"的推送机制 |
 | 类比 | Kafka 的 stream / 日志 | Kafka 的 compacted topic / 数据库表 |
 | tuzi 现有例子 | `cd`/`yank`/`renamed`/`task-done`（P1 已有） | tab 的 `(path, selection)`、当前排序策略、当前主题（P4 待做） |
 | 对应 yazi 概念 | 普通 kind | `@` 前缀 kind + server 端缓存 + 握手重放 |
@@ -197,6 +197,26 @@ let current: Option<TabState> = registry.get_state("tab-state:0");
 `get_state` 就是查表。有没有订阅者不影响这份保留值是否存在——这是它和
 Event 的本质区别，也是「新开 tab 能不能立刻拿到上次状态」的关键：不用
 等下一次事件恰好发生，直接查当前值。
+
+**`publish_state`/`get_state` 不经过 `Event::Pubsub`/主循环，是对
+`Registry` 的直接同步调用。** 这一点和 Event 路径不同，要分清楚为什么：
+Event 路径（`publish` -> `Event::Pubsub` -> `tx.send` -> 下一轮
+`dispatch_event` -> `deliver` -> `Vec<Command>` -> `app.execute()`）必须
+绕回主循环，是因为它最终要执行 `Command`，需要和其它所有触碰 `App`
+状态的操作（按键、后台事件）保持同一个串行顺序。而 State 只是写一份
+`HashMap` 缓存，不产生 `Command`、不触碰 `App` 的其它字段，没有需要
+排队的理由，直接在调用点同步执行即可：
+
+```rust
+// 发布者决定调哪个方法——不是先包成同一种消息，dispatch 时再按 kind 分叉
+app.pubsub.publish(Body::Cd { .. });                          // Event：仍经 tx.send(Event::Pubsub(..))
+app.pubsub.publish_state("tab-state:0", TabState { .. });     // State：直接同步写，不经过 channel
+```
+
+（这是本设计和最初讨论时的一处分歧：曾经设想过「一条 `Event::Pubsub`
+消息里带 kind，`dispatch_event` 内部再判断是 Event 还是 State」，类比
+yazi 的 `@` 前缀。放弃这个方案，因为 State 写入没有 Command 那样的执行
+顺序约束，硬塞进 channel 只是多绕一圈，没有必要。）
 
 `Command` 在两条路径里的角色不变，只是产生方式不同：
 
