@@ -4,6 +4,23 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-17
+
+### Added
+
+- Symlink targets are shown directly in the tree, with dangling links highlighted as broken.
+- Commands to collapse the current subtree or all subtrees and to center the current row.
+- A `Space` command prefix for fuzzy jumping and relative or absolute symlink paste.
+
+### Changed
+
+- Tree refresh and sorting preserve cursor position and symlink metadata more reliably.
+- Status, permission, cursor-row, and focus styling have improved contrast and consistency.
+
+### Fixed
+
+- Cursor-row highlighting no longer clashes with explicit colors used by links, loading states, errors, and search matches.
+
 ## [0.2.0] - 2026-09-17
 
 ### Added
@@ -29,5 +46,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.3.0]: https://github.com/WayenVan/tuzi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WayenVan/tuzi/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/WayenVan/tuzi/releases/tag/v0.1.0
