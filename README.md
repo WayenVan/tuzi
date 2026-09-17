@@ -10,7 +10,7 @@
 
 ## Install
 
-Download the archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` (or `tuzi.exe` on Windows) somewhere on your `PATH`.
+Download the macOS or Linux archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` somewhere on your `PATH`.
 
 To build from source, install a recent Rust toolchain, clone the repository, and run:
 

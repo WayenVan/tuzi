@@ -22,8 +22,6 @@ jobs:
             target: x86_64-apple-darwin
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Check out source
@@ -41,8 +39,7 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package Unix binary
-        if: runner.os != 'Windows'
+      - name: Package binary
         shell: bash
         run: |
           package="tuzi-${GITHUB_REF_NAME}-${{ matrix.target }}"
@@ -53,25 +50,12 @@ jobs:
           cd dist
           shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256"
 
-      - name: Package Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $package = "tuzi-$env:GITHUB_REF_NAME-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/tuzi.exe" "dist/$package/"
-          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md "dist/$package/"
-          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
-          $hash = (Get-FileHash "dist/$package.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $package.zip" | Set-Content -NoNewline "dist/$package.zip.sha256"
-
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: tuzi-${{ matrix.target }}
           path: |
             dist/*.tar.gz
-            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
