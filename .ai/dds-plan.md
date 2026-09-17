@@ -320,37 +320,60 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      偶尔几次 emit/sub"这个实际使用模式不值得），5 个进程同时冷启动在
      75 次试验里 0 失败，这才是这套机制真正要扛住的场景。
    - **P3 没做的事**：交互式 `App` 还没接入 `Client`——正在跑的 TUI 收不
-     到别的实例或 `tuzi emit` 发来的消息（见「尚待确认事项」）；`Body`
-     没有 `Bye` 变体，靠连接断开（EOF）让 server 清理 peer 表，没做
-     yazi 那样的优雅下线握手；没有 `@` 静态消息持久化（已明确不做，
-     见「会话状态跨重启」一节）。
-4. **P4 会话状态跨重启**：按上面「会话状态跨重启：交给外部程序」一节
+     到别的实例或 `tuzi emit` 发来的消息（P4 补上）；`Body` 没有 `Bye`
+     变体，靠连接断开（EOF）让 server 清理 peer 表，没做 yazi 那样的
+     优雅下线握手；没有 `@` 静态消息持久化（已明确不做，见「会话状态
+     跨重启」一节）。
+4. **P4 App 接入 DDS 主循环 + `Command::SetState`**：不再是预先搭脚手架
+   ——现在有明确的真实需求驱动：广播 App 当前 state，并允许其它客户端
+   发"设置 state"的消息来改这个 App 的状态。结论：**这个需求靠现有的
+   `Command` 机制就能优雅实现，不需要引入 Event/State 双轨模型**——
+   "收到消息 -> 翻译成 Command -> `App::execute()`"跟按键触发完全是
+   同一条路，"广播 state"也就是普通的一次性 `publish`，都不需要
+   "保留最新值可查询"这个语义。具体：
+   - `App` 新增字段持有一个常驻 `dds::Client`：`App::serve` 构造
+     `App` 之后 `Client::connect(socket_path, abilities)` 一次，贯穿
+     整个运行期（不再是 `tuzi emit`/`tuzi sub` 那种一次性连接）。
+   - ability 策略：先用通配符 `dds::WILDCARD_ABILITY`（`"*"`），照单全收
+     交给本地 `Registry.deliver` 过滤——没人订阅的 kind 就是空操作，
+     简单；等真出现性能/噪音问题，再收紧成"只声明 `Registry` 里已注册
+     的 kind 集合"。
+   - 后台任务把 `Client` 收到的 `Payload` 转成 `Event::Pubsub(body)`
+     灌回 `tx`，直接复用 P1 已有的 `Dispatcher::dispatch_event ->
+     Registry.deliver -> Command -> App::execute()`，不需要新写分发
+     逻辑。
+   - `App::publish` 同时对外广播（不再只 `tx.send` 本地）——本地事件
+     （`cd`/`yank`/`emit` 等）从此也对外可见，这是"广播 state"这个
+     需求成立的前提。
+   - 新增 `Command::SetState { path: Option<PathBuf>, selection:
+     Vec<PathBuf> }`（字段跟下面 P5 的 `--state`/`RestoreState` 保持
+     一致——出现第二个"批量应用一份状态快照"的场景时，就值得让两者共用
+     同一个 apply 函数）。
+   - 注册一个内建订阅者（`registry.sub("core", "set-state", handler)`），
+     把 `Body::Custom { kind: "set-state", data }` 翻译成
+     `Command::SetState`。
+   - "广播 state"的具体触发点（每次 cd/yank 都广播，还是只在显式请求
+     时才广播）留到实现时定，见「尚待确认事项」。
+5. **P5 会话状态跨重启**：按上面「会话状态跨重启：交给外部程序」一节
    实施——`Cli::Run` 加 `state: Option<RestoreState>` 字段和
    `--state <JSON>` 解析；`RestoreState { selection: Vec<PathBuf> }`
-   应用到初始 tab 的 `selection`；`App::serve` 的 `quit` 分支退出前用
-   一次性 DDS 连接广播 `Body::Custom { kind: "exit-state", data: {...} }`
-   （加超时，避免 socket 异常时卡住退出）。**不需要**
+   应用到初始 tab 的 `selection`（跟 P4 的 `Command::SetState` 共用同一
+   个 apply 函数）；`App::serve` 的 `quit` 分支退出前广播
+   `Body::Custom { kind: "exit-state", data: {...} }`——P4 落地后 `App`
+   已经持有常驻 `Client`，这里直接复用它 `publish` 一次 + `flush`，
+   不用再像最初设想的那样单独开一次一次性连接。**不需要**
    `publish_state`/`get_state`、不需要磁盘持久化、不需要
-   `Command::RestoreTab`——应用注入状态直接在 tab 初始化时做，不用
-   走 `Command`/`Event` 那一整套（没有"运行时响应消息"这个场景，纯粹
-   是启动参数）。
+   `Command::RestoreTab`（并入 P4 的 `Command::SetState`）。
 
 每阶段应可独立验证、独立提交，不必一次性大改完才能用。
 
 ## 尚待确认事项
 
-- **交互式 `App` 还没加入 DDS socket**：`Registry`（进程内订阅）和
-  `dds::Client`（P3 的 socket 客户端）目前互不相通。要让正在运行的
-  TUI 真正参与跨实例总线，需要：(a) `App::serve` 启动时 `Client::connect`
-  一次，(b) 后台读到的 `Payload` 转成 `Event::Pubsub(body)` 灌回
-  `tx`（复用现有本地投递路径，不用新写分发逻辑），(c) 决定 `App` 的
-  `abilities` 怎么来——目前 `Registry` 没有区分"只本地"和"也接受远程"
-  的订阅（yazi 的 `sub`/`sub_remote` 区分），如果照搬现状，`abilities`
-  只能是"当前 Registry 里已注册的所有 kind"或者干脆留空（等于什么都不
-  接收远程）。没有做这一步是因为目前没有真实的订阅者会用到它——跟 P1
-  的 `sub`/`unsub` 一样，等真的有一个要跨实例响应的场景（比如「emit
-  'refresh' 时让所有开着的 tuzi 都刷新当前目录」）时再接，不要为了接
-  而接。
+- P4 的具体广播触发点：`App::publish` 已经统一对外广播之后，是不是
+  所有内部事件（`cd`/`yank`/`renamed`/`task-done`）都无条件对外广播，
+  还是只有显式的 `Command::Emit`/`SetState` 相关的才广播？全量广播最
+  简单，但意味着"这个人在哪个目录、选中了什么"默认就是对外可见的——
+  要不要留一个配置项关掉，等实现时定。
 - `src/actor/` 空存根是否要在本计划里复用或先删除，需与用户确认。
 - `--state` 目前只设计了 `selection` 一个字段；要不要扩展到
   `sort_policy`/`column_mode`/展开的子树等，等外部程序真的需要时再加，
