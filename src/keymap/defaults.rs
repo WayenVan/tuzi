@@ -76,6 +76,7 @@ pub fn bindings() -> Vec<Binding> {
 		Binding::manager(vec![Key::char('f')], A::OpenInput(InputKind::Filter), "Filter files"),
 		Binding::manager(vec![Key::char('.')], A::ToggleHidden, "Toggle hidden files"),
 		Binding::manager(vec![Key::char('z')], A::Fzf, "Jump with fzf"),
+		Binding::manager(vec![Key::char('Z')], A::Zoxide, "Jump with zoxide"),
 		Binding::manager(vec![Key::char('o')], A::Open { interactive: false }, "Open selected files"),
 		Binding::manager(vec![Key::char('O')], A::Open { interactive: true }, "Open selected files interactively"),
 		Binding::manager(vec![Key::char('w')], A::ToggleTasks, "Show task manager"),

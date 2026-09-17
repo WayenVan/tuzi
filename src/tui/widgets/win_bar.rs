@@ -4,10 +4,17 @@ use ratatui::{Frame, layout::Rect, style::{Color, Style}, text::{Line, Span}, wi
 
 pub struct WinBar;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardBadge {
+	Copy(usize),
+	Cut(usize),
+}
+
 pub struct WinBarState<'a> {
 	pub path:   &'a Path,
 	pub finder: Option<&'a str>,
 	pub filter: Option<&'a str>,
+	pub badge:  Option<ClipboardBadge>,
 }
 
 impl WinBar {
@@ -16,12 +23,26 @@ impl WinBar {
 	pub fn render(frame: &mut Frame, area: Rect, state: WinBarState<'_>) {
 		let path = pretty_path(state.path, home_dir().as_deref());
 		let suffix = flags(state.finder, state.filter);
-		let (path, suffix) = fit(&path, &suffix, area.width as usize);
+		let badge = state.badge.map(badge_line);
+		let badge_width = badge.as_ref().map_or(0, Line::width);
+		let left_width = (area.width as usize).saturating_sub(badge_width);
+		let (path, suffix) = fit(&path, &suffix, left_width);
 		frame.render_widget(Paragraph::new(Line::from(vec![
 			Span::styled(path, Style::new().fg(Color::Cyan)),
 			Span::styled(suffix, Style::new().fg(Color::Cyan)),
 		])), area);
+		if let Some(line) = badge {
+			frame.render_widget(Paragraph::new(line.right_aligned()), area);
+		}
 	}
+}
+
+fn badge_line(badge: ClipboardBadge) -> Line<'static> {
+	let (count, background) = match badge {
+		ClipboardBadge::Copy(count) => (count, Color::Green),
+		ClipboardBadge::Cut(count) => (count, Color::Red),
+	};
+	Line::from(vec![Span::styled(format!(" {count} "), Style::new().fg(Color::Black).bg(background)), Span::raw(" ")])
 }
 
 fn flags(finder: Option<&str>, filter: Option<&str>) -> String {
@@ -86,6 +107,17 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn clipboard_badges_match_yazi_copy_and_cut_colors() {
+		let copied = badge_line(ClipboardBadge::Copy(3));
+		assert_eq!(copied.to_string(), " 3  ");
+		assert_eq!(copied.spans[0].style, Style::new().fg(Color::Black).bg(Color::Green));
+
+		let cut = badge_line(ClipboardBadge::Cut(12));
+		assert_eq!(cut.to_string(), " 12  ");
+		assert_eq!(cut.spans[0].style, Style::new().fg(Color::Black).bg(Color::Red));
+	}
+
+	#[test]
 	fn abbreviates_home_and_its_descendants_only() {
 		let home = Path::new("/home/alice");
 		assert_eq!(pretty_path(home, Some(home)), "~");
@@ -105,5 +137,12 @@ mod tests {
 	#[test]
 	fn narrow_width_keeps_the_status_suffix() {
 		assert_eq!(fit("~/projects/tuzi", " (filter: rs)", 20), ("…s/tuzi".into(), " (filter: rs)".into()));
+	}
+
+	#[test]
+	fn badge_width_is_reserved_before_the_path_is_fitted() {
+		let available = 20usize.saturating_sub(badge_line(ClipboardBadge::Copy(3)).width());
+		let (path, suffix) = fit("~/projects/tuzi", "", available);
+		assert!(display_width(&path) + display_width(&suffix) <= available);
 	}
 }

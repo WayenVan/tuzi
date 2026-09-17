@@ -13,6 +13,12 @@ pub enum ProcessMode {
 pub enum ProcessPurpose {
 	Open,
 	Fzf { tab: usize, cwd: PathBuf, had_selection: bool },
+	/// `zoxide query -i`: routes the picked directory back to whichever tab
+	/// asked for it.
+	Zoxide { tab: usize },
+	/// `zoxide add`: fire-and-forget, nothing to route back — it always
+	/// completes as `ProcessOutput::Detached`.
+	ZoxideAdd,
 }
 
 pub struct ProcessRequest {

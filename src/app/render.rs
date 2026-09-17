@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::{layout::{Constraint, Direction, Layout}, style::{Color, Modifier, Style}};
 
-use crate::{event::Event, preview::PreviewTarget, status::Segment, tui::{Raterm, widgets::{CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
+use crate::{event::Event, preview::PreviewTarget, status::Segment, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::{App, app::MouseState};
 
@@ -18,6 +18,8 @@ impl App {
 		let cwd = self.active_tab().tree.root.path.clone();
 		let labels = self.tab_labels();
 		let preview_percent = self.mouse.preview_percent;
+		let terminal_focused = self.terminal_focused;
+		let clipboard_badge = (!self.clipboard.is_empty()).then(|| if self.clipboard_cut { ClipboardBadge::Cut(self.clipboard.len()) } else { ClipboardBadge::Copy(self.clipboard.len()) });
 		let geometry = Cell::new(self.mouse);
 
 		let active = self.active;
@@ -80,7 +82,7 @@ impl App {
 			geometry.set(MouseState { tabs: tab_area, body: body_area, tree: tree_area, preview: preview_area, tree_row_offset: range.start, ..geometry.get() });
 			let rows = tab.visible_range(range.clone());
 
-			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query });
+			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query, badge: clipboard_badge });
 			TabBar::render(frame, tab_area, &labels);
 			TreeView::render(
 				frame,
@@ -89,6 +91,7 @@ impl App {
 				range.start,
 				TreeViewState {
 					cursor: tab.cursor,
+					focused: terminal_focused,
 					selection: &tab.selection,
 					visual: tab.visual,
 					clipboard: &self.clipboard,

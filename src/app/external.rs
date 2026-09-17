@@ -73,6 +73,22 @@ impl App {
 		self.processes.push_back(request);
 	}
 
+	pub(super) fn start_zoxide(&mut self) {
+		let tab = self.active_tab().id;
+		let mut command = Command::new("zoxide");
+		command.args(["query", "-i"]);
+		self.processes.push_back(ProcessRequest::block_capture(command, ProcessPurpose::Zoxide { tab }, "zoxide"));
+	}
+
+	/// Records a tab's actual `cd` into `zoxide`'s frecency database — an
+	/// orphan, fire-and-forget process that never reports back, the same
+	/// way a shell's `zoxide` hook runs `zoxide add` on every `cd`.
+	pub(super) fn record_visit(&mut self, path: PathBuf) {
+		let mut command = Command::new("zoxide");
+		command.arg("add").arg(path);
+		self.processes.push_back(ProcessRequest::orphan(command, ProcessPurpose::ZoxideAdd, "zoxide add"));
+	}
+
 	pub(super) fn on_process_completion(&mut self, completion: ProcessCompletion) {
 		let ProcessCompletion { purpose, label, result } = completion;
 		let output = match result {
@@ -95,6 +111,23 @@ impl App {
 				self.apply_fzf_output(tab, &cwd, had_selection, &stdout);
 			}
 			(ProcessPurpose::Fzf { .. }, ProcessOutput::Detached) => {},
+			(ProcessPurpose::Zoxide { tab }, ProcessOutput::Completed { stdout, .. }) => {
+				self.apply_zoxide_output(tab, &stdout);
+			}
+			(ProcessPurpose::Zoxide { .. } | ProcessPurpose::ZoxideAdd, ProcessOutput::Detached) => {},
+			(ProcessPurpose::ZoxideAdd, ProcessOutput::Completed { .. }) => {},
+		}
+	}
+
+	/// `zoxide query -i` reports at most one already-absolute directory
+	/// (empty stdout means the picker was canceled), so this skips the
+	/// relative-path resolution and multi-select handling `apply_fzf_output`
+	/// needs.
+	pub(super) fn apply_zoxide_output(&mut self, tab_id: usize, stdout: &[u8]) {
+		let Some(line) = String::from_utf8_lossy(stdout).lines().next().map(str::to_owned) else { return };
+		let Some(tab) = self.tab_mut(tab_id) else { return };
+		if let Err(error) = tab.cd(PathBuf::from(line)) {
+			tab.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 

@@ -22,5 +22,5 @@ pub use tab_bar::TabBar;
 pub use toast::Toast;
 pub use tree_view::{TreeView, TreeViewState};
 pub(crate) use tree_view::viewport;
-pub use win_bar::{WinBar, WinBarState};
+pub use win_bar::{ClipboardBadge, WinBar, WinBarState};
 pub use which_popup::WhichPopup;

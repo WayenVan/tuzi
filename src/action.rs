@@ -71,6 +71,7 @@ pub enum Action {
 	SeekPreview(i16),
 	RepeatFind { opposite: bool },
 	Fzf,
+	Zoxide,
 	Open { interactive: bool },
 	ToggleTasks,
 }

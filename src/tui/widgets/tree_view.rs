@@ -6,6 +6,7 @@ pub struct TreeView;
 
 pub struct TreeViewState<'a> {
 	pub cursor:        usize,
+	pub focused:       bool,
 	pub selection:     &'a Selection,
 	pub visual:        Option<Visual>,
 	pub clipboard:     &'a [std::path::PathBuf],
@@ -27,7 +28,7 @@ impl TreeView {
 			let index = row_offset + visible_index;
 			let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 			let mut icon = state.icon_theme.icon_for(node);
-			if index == state.cursor {
+			if index == state.cursor && state.focused {
 				icon.style = Style::new();
 			}
 			// A pending visual range previews the outcome of committing it
@@ -77,10 +78,20 @@ impl TreeView {
 			ListItem::new(line)
 		});
 
-		let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+		let list = List::new(items).highlight_style(cursor_style(state.focused));
 		let selected = state.cursor.checked_sub(row_offset).filter(|index| *index < rows.len());
 		let mut list_state = ListState::default().with_selected(selected);
 		frame.render_stateful_widget(list, area, &mut list_state);
+	}
+}
+
+fn cursor_style(focused: bool) -> Style {
+	if focused {
+		Style::new().add_modifier(Modifier::REVERSED)
+	} else {
+		// A concrete color for now; keeping it in this one style boundary
+		// makes it straightforward to source from the theme config later.
+		Style::new().bg(Color::Rgb(0x31, 0x32, 0x44))
 	}
 }
 
@@ -211,9 +222,19 @@ fn truncate(text: String, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-	use ratatui::style::{Color, Style};
+	use ratatui::style::{Color, Modifier, Style};
 
-	use super::{marker_style, viewport};
+	use super::{cursor_style, marker_style, viewport};
+
+	#[test]
+	fn unfocused_cursor_mutes_only_the_background() {
+		let focused = cursor_style(true);
+		let unfocused = cursor_style(false);
+		assert!(focused.add_modifier.contains(Modifier::REVERSED));
+		assert_eq!(unfocused.bg, Some(Color::Rgb(0x31, 0x32, 0x44)));
+		assert!(!unfocused.add_modifier.contains(Modifier::REVERSED));
+		assert!(!unfocused.add_modifier.contains(Modifier::DIM), "text must retain its original brightness");
+	}
 
 	#[test]
 	fn visual_marker_uses_sel_color_and_overrides_older_markers() {

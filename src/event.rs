@@ -17,5 +17,9 @@ pub enum Event {
 	CompletionLoaded { tab: usize, input: u64, revision: u64, result: io::Result<Vec<String>> },
 	PreviewLoaded { tab: usize, ticket: u64, key: PreviewKey, result: Result<PreviewData, String> },
 	OpenResolved { tab: usize, cwd: PathBuf, interactive: bool, result: io::Result<Vec<OpenTarget>> },
+	/// A tab actually changed its root directory (not just expanded a
+	/// subtree in place) — recorded into `zoxide`'s frecency database the
+	/// same way a shell's `cd` hook would.
+	Visited(PathBuf),
 	Task(TaskEvent),
 }

@@ -643,6 +643,7 @@ impl Tab {
 			return Ok(());
 		}
 		let mut replacement = Self::open(self.id, path, self.tx.clone())?;
+		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
 		replacement.input_seq = self.input_seq;
 		replacement.sort_policy = self.sort_policy;
 		replacement.column_mode = self.column_mode;
@@ -1036,11 +1037,13 @@ impl Tab {
 			.join(&b'\n')
 	}
 
-	/// A directory is an explicit destination, including an empty directory
-	/// and the tree root. A file instead means "beside this file".
+	/// An *expanded* directory is an explicit destination, including an
+	/// empty one and the tree root (always expanded on open). A collapsed
+	/// directory is just another row — same as a file, it means "beside
+	/// this", not "into this" — matching `collapse_selected`/`start_create`.
 	fn paste_target(&self) -> Option<PathBuf> {
 		let (_, node) = self.visible_at(self.cursor)?;
-		if node.cha.is_dir { Some(node.path.clone()) } else { self.tree.parent_of(&node.path) }
+		if node.cha.is_dir && node.expanded { Some(node.path.clone()) } else { self.tree.parent_of(&node.path) }
 	}
 
 	fn refresh_parents(&mut self, paths: &[PathBuf]) {
@@ -1771,7 +1774,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn paste_destination_enters_directories_and_uses_a_files_parent() {
+	async fn paste_destination_enters_an_expanded_directory_but_not_a_collapsed_one() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-paste-into");
 		fs::create_dir_all(root.join("dst/sub")).unwrap();
 		fs::write(root.join("source.txt"), b"hi").unwrap();
@@ -1781,12 +1784,37 @@ mod tests {
 		tab.move_cursor(1); // dst
 		tab.expand_selected();
 		pump(&mut tab, &mut rx).await; // dst.children = [sub]
-		tab.move_cursor(1); // onto "dst/sub", itself a directory
 
-		assert_eq!(tab.paste_destination(), Some(root.join("dst/sub")));
-		tab.move_cursor(1); // source.txt
-		assert_eq!(tab.paste_destination(), Some(root.clone()));
+		tab.move_cursor(1); // onto "dst/sub" — a directory, but never itself expanded
+		assert_eq!(tab.paste_destination(), Some(root.join("dst")), "a collapsed directory is just another row to paste beside, not into");
+
+		tab.move_cursor(-1); // back onto "dst", which is expanded
+		assert_eq!(tab.paste_destination(), Some(root.join("dst")), "an expanded directory is a valid paste-into target");
+
+		tab.move_cursor(2); // past "dst/sub", onto "source.txt"
+		assert_eq!(tab.paste_destination(), Some(root.clone()), "a file always pastes beside itself");
 		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn cd_reports_the_new_root_as_visited() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-cd-visited");
+		let target = root.join("target");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&target).unwrap();
+		let root = root.canonicalize().unwrap();
+		let target = target.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.cd(target.clone()).unwrap();
+
+		// Sent synchronously inside `cd_inner`, before the replacement tab's
+		// own (spawned) initial listing gets a chance to run — so it's
+		// always the first thing to arrive, ahead of any `Loaded` events.
+		let event = rx.recv().await.unwrap();
+		assert!(matches!(event, Event::Visited(path) if path == target), "cd must be recorded for zoxide the same way a shell's cd hook would");
+
+		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]

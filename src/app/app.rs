@@ -32,6 +32,7 @@ pub struct App {
 	pub(super) clipboard: Vec<PathBuf>,
 	pub(super) clipboard_cut: bool,
 	pub(super) tree_rows: usize,
+	pub(super) terminal_focused: bool,
 	pub(super) mouse: MouseState,
 	pub(super) which: Vec<WhichCandidate>,
 	pub(super) icon_theme: IconTheme,
@@ -80,6 +81,7 @@ impl App {
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
+			terminal_focused: true,
 			mouse: MouseState::default(),
 			which: Vec::new(),
 			icon_theme: IconTheme,
@@ -131,6 +133,8 @@ impl App {
 		match event {
 			Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => self.handle_key(key, router),
 			Event::Term(crossterm::event::Event::Mouse(mouse)) => self.handle_mouse(mouse),
+			Event::Term(crossterm::event::Event::FocusGained) => self.set_terminal_focus(true),
+			Event::Term(crossterm::event::Event::FocusLost) => self.set_terminal_focus(false),
 			Event::Term(crossterm::event::Event::Resize(_, _)) => true,
 			Event::Term(_) => false,
 			event => {
@@ -138,6 +142,12 @@ impl App {
 				true
 			}
 		}
+	}
+
+	fn set_terminal_focus(&mut self, focused: bool) -> bool {
+		let changed = self.terminal_focused != focused;
+		self.terminal_focused = focused;
+		changed
 	}
 
 	fn handle_mouse(&mut self, event: MouseEvent) -> bool {
@@ -555,6 +565,7 @@ mod tests {
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
+			terminal_focused: true,
 			mouse: MouseState::default(),
 			which: Vec::new(),
 			icon_theme: IconTheme,
@@ -587,6 +598,25 @@ mod tests {
 
 	fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
 		MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+	}
+
+	#[tokio::test]
+	async fn terminal_focus_events_redraw_only_when_focus_changes() {
+		let root = std::env::temp_dir().join("tuzi-app-test-terminal-focus");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let mut router = Router::default();
+
+		assert!(app.terminal_focused);
+		assert!(app.handle_event(Event::Term(crossterm::event::Event::FocusLost), &mut router));
+		assert!(!app.terminal_focused);
+		assert!(!app.handle_event(Event::Term(crossterm::event::Event::FocusLost), &mut router));
+		assert!(app.handle_event(Event::Term(crossterm::event::Event::FocusGained), &mut router));
+		assert!(app.terminal_focused);
+
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	#[tokio::test]
@@ -670,14 +700,13 @@ mod tests {
 
 		app.active_tab_mut().move_cursor(-2); // back onto "dst"
 		app.active_tab_mut().expand_selected();
-		pump(&mut app, &mut rx).await; // dst.children = [sub]
-		app.active_tab_mut().move_cursor(1); // onto "dst/sub", itself a directory
+		pump(&mut app, &mut rx).await; // dst.children = [sub]; cursor stays on "dst" itself, now expanded
 
 		app.paste();
 		pump(&mut app, &mut rx).await;
 
-		assert!(!root.join("dst/leaf.txt").exists());
-		assert!(root.join("dst/sub/leaf.txt").exists());
+		assert!(root.join("dst/leaf.txt").exists());
+		assert!(!root.join("dst/sub/leaf.txt").exists());
 		assert_eq!(
 			app.clipboard,
 			vec![root.join("src/leaf.txt")],
@@ -700,13 +729,12 @@ mod tests {
 		app.clipboard_cut = true;
 		app.active_tab_mut().move_cursor(1); // dst
 		app.active_tab_mut().expand_selected();
-		pump(&mut app, &mut rx).await; // dst.children = [sub]
-		app.active_tab_mut().move_cursor(1); // onto "dst/sub"
+		pump(&mut app, &mut rx).await; // dst.children = [sub]; cursor stays on "dst" itself, now expanded
 		app.paste();
 		pump(&mut app, &mut rx).await;
 
 		assert!(!root.join("source.txt").exists());
-		assert!(root.join("dst/sub/source.txt").exists());
+		assert!(root.join("dst/source.txt").exists());
 		assert!(app.clipboard.is_empty());
 		assert!(!app.clipboard_cut);
 		fs::remove_dir_all(root).unwrap();
@@ -854,13 +882,12 @@ mod tests {
 
 		app.active_tab_mut().move_cursor(1); // onto "dst" in the new tab
 		app.active_tab_mut().expand_selected();
-		pump(&mut app, &mut rx).await; // dst.children = [sub]
-		app.active_tab_mut().move_cursor(1); // onto "dst/sub"
+		pump(&mut app, &mut rx).await; // dst.children = [sub]; cursor stays on "dst" itself, now expanded
 		app.paste();
 		pump(&mut app, &mut rx).await;
 
 		assert!(
-			root.join("dst/sub/leaf.txt").exists(),
+			root.join("dst/leaf.txt").exists(),
 			"pasting in a different tab than the one that yanked should still work"
 		);
 
@@ -998,6 +1025,38 @@ mod tests {
 
 		app.apply_fzf_output(0, &root, false, b"a\n");
 		assert_eq!(app.active_tab().tree.root.path, root.join("a"));
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn zoxide_output_changes_the_requesting_tabs_root() {
+		let root = std::env::temp_dir().join("tuzi-app-test-zoxide");
+		let target = root.join("elsewhere");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&target).unwrap();
+		let root = root.canonicalize().unwrap();
+		let target = target.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		let mut stdout = target.to_string_lossy().into_owned().into_bytes();
+		stdout.push(b'\n');
+		app.apply_zoxide_output(0, &stdout);
+
+		assert_eq!(app.active_tab().tree.root.path, target);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn empty_zoxide_output_leaves_the_root_alone() {
+		let root = std::env::temp_dir().join("tuzi-app-test-zoxide-cancel");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, _rx) = app(&root).await;
+		app.apply_zoxide_output(0, b""); // an empty picker result means the user canceled
+
+		assert_eq!(app.active_tab().tree.root.path, root);
 		fs::remove_dir_all(&root).unwrap();
 	}
 

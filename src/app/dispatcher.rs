@@ -52,6 +52,7 @@ impl Dispatcher {
 			Action::SeekPreview(units) => app.active_tab_mut().preview.seek(units),
 			Action::RepeatFind { opposite } => app.active_tab_mut().repeat_find(opposite),
 			Action::Fzf => app.start_fzf(),
+			Action::Zoxide => app.start_zoxide(),
 			Action::Open { interactive } => app.open_selected(interactive),
 			Action::ToggleTasks => app.tasks.visible = !app.tasks.visible,
 		}
@@ -114,6 +115,7 @@ impl Dispatcher {
 				}
 			}
 			Event::OpenResolved { tab, cwd, interactive, result } => app.on_open_resolved(tab, cwd, interactive, result),
+			Event::Visited(path) => app.record_visit(path),
 			Event::Task(event) => app.on_task_event(event),
 			Event::Term(_) => {}
 		}
