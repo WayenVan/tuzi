@@ -1,8 +1,8 @@
 # Changelog
 
-All notable changes to tuzi are documented in this file.
+All notable changes to Tuzi are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.2.0] - Unreleased
 
@@ -11,14 +11,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Mouse support for selecting tree rows, scrolling the tree and preview, switching tabs, toggling directories with right-click, and resizing the preview pane.
 - Relative and absolute symbolic-link paste commands.
 - Zoxide integration for interactive directory jumping and visit tracking.
-- Terminal focus detection with a lower-contrast cursor-row background when tuzi is unfocused.
+- Terminal focus detection with a lower-contrast cursor-row background when Tuzi is unfocused.
 - A Yazi-style clipboard counter in the top-right corner, with distinct copy and cut colors.
 - Support for expanding symlinked directories and tracking filesystem changes through them.
 
 ### Changed
 
 - Pasting into a directory now requires that directory to be expanded, matching file creation behavior; collapsed directories target their parent.
-- Preview pane width can be adjusted with the mouse and is retained while tuzi is running.
+- Preview pane width can be adjusted with the mouse and is retained while Tuzi is running.
 - Mouse input is isolated from modal dialogs and prompts so clicks do not leak into the tree underneath.
 
 ### Fixed

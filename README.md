@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/tuzi-icon.png" width="180" alt="tuzi icon">
+  <img src="assets/tuzi-icon.png" width="180" alt="Tuzi icon">
 </p>
 
-<h1 align="center">tuzi</h1>
+<h1 align="center">Tuzi</h1>
 
 <p align="center">
   A tree-style <a href="https://github.com/sxyazi/yazi">Yazi</a> for the terminal.
@@ -16,10 +16,10 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" width="960" alt="tuzi demo">
+  <img src="assets/demo.gif" width="960" alt="Tuzi demo">
 </p>
 
-## Why tuzi?
+## Why Tuzi?
 
 I love Yazi, but some of my work calls for a more convenient tree-shaped view, especially inside Neovim. After spending hours looking for something that fit, I finally decided to sell my soul to Codex and Claude and build exactly what I wanted.
 
@@ -76,17 +76,17 @@ tuzi --version
 | `[` / `]` | Previous / next tab |
 | `q` | Quit |
 
-Prefix keys such as `g`, `c`, `m`, and `,` show their available commands inside tuzi.
+Prefix keys such as `g`, `c`, `m`, and `,` show their available commands inside Tuzi.
 
 ## Roadmap
 
-1. **User configuration** — configurable keybindings, themes, and behavior without rebuilding tuzi.
+1. **User configuration** — configurable keybindings, themes, and behavior without rebuilding Tuzi.
 2. **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
 
 ## Acknowledgements
 
-tuzi would not exist without [Yazi](https://github.com/sxyazi/yazi). Most of its interaction design, keybindings, asynchronous architecture, task system, and implementation approach were learned from or adapted from Yazi. Sincere thanks to Yazi and all of its contributors for their outstanding work.
+Tuzi would not exist without [Yazi](https://github.com/sxyazi/yazi). Most of its interaction design, keybindings, asynchronous architecture, task system, and implementation approach were learned from or adapted from Yazi. Sincere thanks to Yazi and all of its contributors for their outstanding work.
 
 ## License
 
-tuzi is distributed under the [MIT License](LICENSE). Yazi's original copyright and MIT notice are preserved in [Third-Party Notices](THIRD_PARTY_NOTICES.md).
+Tuzi is distributed under the [MIT License](LICENSE). Yazi's original copyright and MIT notice are preserved in [Third-Party Notices](THIRD_PARTY_NOTICES.md).
