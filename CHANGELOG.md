@@ -4,6 +4,25 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-18
+
+### Added
+
+- User-overridable configuration, keymaps, themes, icons, openers, previews, and file-operation policies.
+- A local DDS event bus with publish, subscribe, direct messaging, peer discovery, and reconnect support.
+- The `tu` companion CLI for DDS inspection, scripted events, managed Tuzi launches, and JSON Lines editor control.
+- Runtime configuration overlays and atomic restoration of complete multi-tab sessions, including roots, cursors, selections, and expanded directories.
+- Authenticated launch handshakes for Neovim and other controlling hosts.
+
+### Changed
+
+- Built-in actions now share a public command model used by keymaps, prompts, and external integrations.
+- The README now highlights current features, integration protocols, and the focused Neovim and tree-workflow roadmap.
+
+### Fixed
+
+- Batch deletion no longer collapses the tree when an entry disappears during an in-progress directory scan.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added
@@ -46,6 +65,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.4.0]: https://github.com/WayenVan/tuzi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/WayenVan/tuzi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WayenVan/tuzi/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/WayenVan/tuzi/releases/tag/v0.1.0
