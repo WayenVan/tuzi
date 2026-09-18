@@ -25,21 +25,21 @@ pub struct LocalEngine;
 
 impl Engine for LocalEngine {
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<(PathBuf, Cha)>> {
-		fs::read_dir(path)?
-			.map(|entry| {
-				let entry = entry?;
-				let cha = cha_for(&entry)?;
-				Ok((entry.path(), cha))
-			})
-			.collect()
+		let mut entries = Vec::new();
+		for entry in fs::read_dir(path)? {
+			let Some(entry) = ignore_disappeared(entry)? else { continue };
+			let Some(cha) = ignore_disappeared(cha_for(&entry))? else { continue };
+			entries.push((entry.path(), cha));
+		}
+		Ok(entries)
 	}
 
 	fn read_dir_batches(&self, path: &Path, first_batch_size: usize, batch_size: usize, emit: &mut dyn FnMut(Vec<(PathBuf, Cha)>) -> bool) -> io::Result<()> {
 		let mut limit = first_batch_size;
 		let mut batch = Vec::with_capacity(limit);
 		for entry in fs::read_dir(path)? {
-			let entry = entry?;
-			let cha = cha_for(&entry)?;
+			let Some(entry) = ignore_disappeared(entry)? else { continue };
+			let Some(cha) = ignore_disappeared(cha_for(&entry))? else { continue };
 			batch.push((entry.path(), cha));
 			if batch.len() == limit {
 				if !emit(std::mem::take(&mut batch)) {
@@ -53,6 +53,17 @@ impl Engine for LocalEngine {
 			emit(batch);
 		}
 		Ok(())
+	}
+}
+
+/// A directory entry may disappear between `read_dir` yielding it and us
+/// reading its metadata, especially while a batch delete is in progress.
+/// That is not a failure of the directory listing itself.
+fn ignore_disappeared<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+	match result {
+		Ok(value) => Ok(Some(value)),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+		Err(error) => Err(error),
 	}
 }
 
@@ -71,6 +82,18 @@ mod tests {
 	use std::fs;
 
 	use super::*;
+
+	#[test]
+	fn ignores_entries_that_disappear_during_a_listing() {
+		let disappeared = io::Error::new(io::ErrorKind::NotFound, "entry disappeared");
+		assert_eq!(ignore_disappeared::<()>(Err(disappeared)).unwrap(), None);
+	}
+
+	#[test]
+	fn preserves_real_entry_errors_during_a_listing() {
+		let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+		assert_eq!(ignore_disappeared::<()>(Err(denied)).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+	}
 
 	#[test]
 	fn reads_one_level_without_recursing() {
