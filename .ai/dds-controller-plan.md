@@ -13,9 +13,9 @@ Tuzi 之间的链路。第一版不管理 Neovim window/session，不负责 spaw
 1. Controller 连接 DDS，在 stdout 输出 `controller-ready` 与自身 peer ID。
 2. 调用方通过 stdin 注册一次性 launch token。
 3. 调用方用 controller peer ID 与 token 启动 Tuzi。
-4. Controller 只接受已注册 token 对应的定点 `Ready`，记录
+4. Controller 只接受已注册 token 对应的定点 `Attach`，记录
    `token -> Tuzi peer ID`。
-5. 未注册、重复或已经消费的 token 对应的 Ready 被忽略。
+5. 未注册、重复或已经消费的 token 对应的 Attach 被忽略。
 
 ## JSON Lines
 
@@ -44,9 +44,9 @@ stdout 只写 JSON Lines 并逐行 flush。语法错误写结构化 error 响应
 
 ## 消息过滤
 
-Controller 在 Hi 中声明配置的 abilities，因此 server 可能把非受控 Tuzi
+Controller 在 Join 中声明配置的 abilities，因此 server 可能把非受控 Tuzi
 的同 kind 广播也转发给它。Controller 必须再检查 `Payload.sender` 是否存在
-于 controlled 映射，只有受控 peer 的消息才能写到 stdout。Ready 是定点
+于 controlled 映射，只有受控 peer 的消息才能写到 stdout。Attach 是定点
 消息，不依赖 ability。
 
 默认 abilities：`hover,cd,yank,renamed,task-done`。第一版通过启动参数
@@ -54,13 +54,13 @@ Controller 在 Hi 中声明配置的 abilities，因此 server 可能把非受�
 
 ## 定点发送
 
-token 只用于启动握手。Ready 后调用方使用 `peer_id` 定点寻址；`set-state`
+token 只用于启动握手。Attach 后调用方使用 `peer_id` 定点寻址；`set-state`
 通过 `publish_to` 发送受控状态，`publish` 仅作为自定义 kind 的逃生口。
 Controller 在发送前验证该 peer 属于 controlled 集合。
 
 ## 下线
 
-Controller 从 `Hey` 维护在线 peer 集合。受控 peer 首次缺席时只标记 missing；
+Controller 从 `Sync` 维护在线 peer 集合。受控 peer 首次缺席时只标记 missing；
 若 500ms 内重新出现，视为 server 换主并取消标记。超过 grace period 仍缺席
 时，删除 `token -> peer ID` 与 missing 记录，并输出一次：
 
@@ -72,7 +72,7 @@ Controller 从 `Hey` 维护在线 peer 集合。受控 peer 首次缺席时只�
 
 ## 后续而非当前范围
 
-- 动态修改 abilities 并重新发送 Hi。
+- 动态修改 abilities 并重新发送 Join。
 - 请求 ACK、超时与可靠重试。
 - Controller 代替 Neovim spawn 或终止 Tuzi。
 

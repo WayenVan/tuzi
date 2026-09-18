@@ -134,7 +134,7 @@ impl Dispatcher {
 			Event::Task(event) => app.on_task_event(event),
 			Event::DdsPublish(body) => app.publish(body),
 			Event::DdsDeliver(body) => {
-				if let Body::Hey { peers } = &body {
+				if let Body::Sync { peers } = &body {
 					app.update_controller_peers(peers);
 				}
 				for command in app.pubsub.deliver(&body) {

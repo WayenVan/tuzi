@@ -22,7 +22,7 @@ impl Registry {
 		Self::default()
 	}
 
-	/// The kinds this process can actually handle, used as the DDS `Hi`
+	/// The kinds this process can actually handle, used as the DDS `Join`
 	/// ability snapshot when the App connects. Sorting keeps handshakes and
 	/// tests deterministic despite `HashMap` iteration order.
 	pub fn abilities(&self) -> Vec<String> {

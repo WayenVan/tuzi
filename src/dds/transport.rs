@@ -40,7 +40,7 @@ pub const WILDCARD_ABILITY: &str = "*";
 impl Client {
 	/// Connects to `socket_path`, bootstrapping a `Server` there first if
 	/// nothing answers. `abilities` are the kinds this client wants
-	/// forwarded from other peers — announced immediately via `Hi`.
+	/// forwarded from other peers — announced immediately via `Join`.
 	pub async fn connect(socket_path: &Path, abilities: Vec<String>) -> io::Result<(Self, mpsc::UnboundedReceiver<Payload>)> {
 		let id = new_peer_id();
 		let connection = connect_or_bootstrap(socket_path).await?;
@@ -53,7 +53,7 @@ impl Client {
 	}
 
 	/// This connection's routing identity. Controllers use their own ID as
-	/// the parent address; a Ready payload's sender identifies the child.
+	/// the parent address; an Attach payload's sender identifies the child.
 	pub fn id(&self) -> PeerId {
 		self.id
 	}
@@ -96,7 +96,7 @@ async fn supervise(
 	loop {
 		let (read_half, mut write_half) = connection.stream.into_split();
 		let mut lines = BufReader::new(read_half).lines();
-		if write_payload(&mut write_half, &Payload::broadcast(id, Body::Hi { abilities: abilities.clone() })).await.is_err() {
+		if write_payload(&mut write_half, &Payload::broadcast(id, Body::Join { abilities: abilities.clone() })).await.is_err() {
 			connection = reconnect(&socket_path, connection.server.take()).await;
 			continue;
 		}
@@ -287,15 +287,15 @@ async fn handle_connection(stream: UnixStream, peers: PeerTable) {
 				let Ok(Some(line)) = line else { break };
 				let Ok(payload) = serde_json::from_str::<Payload>(&line) else { continue };
 				match &payload.body {
-					Body::Hi { abilities } if connected.is_none() => {
-						if !route_hi(&peers, payload.sender, abilities, line_tx.clone()).await {
+					Body::Join { abilities } if connected.is_none() => {
+						if !route_join(&peers, payload.sender, abilities, line_tx.clone()).await {
 							// Never let a new connection replace an existing peer's
 							// routing identity. Closing it forces the claimant to retry.
 							break;
 						}
 						connected = Some(payload.sender);
 					}
-					Body::Hi { .. } => break,
+					Body::Join { .. } => break,
 					_ if connected == Some(payload.sender) => route(&peers, &payload, &line).await,
 					_ => break,
 				}
@@ -315,7 +315,7 @@ async fn handle_connection(stream: UnixStream, peers: PeerTable) {
 	}
 }
 
-async fn route_hi(peers: &PeerTable, sender: PeerId, abilities: &[String], outbox: mpsc::UnboundedSender<String>) -> bool {
+async fn route_join(peers: &PeerTable, sender: PeerId, abilities: &[String], outbox: mpsc::UnboundedSender<String>) -> bool {
 	let mut table = peers.lock().await;
 	if table.contains_key(&sender) {
 		return false;
@@ -326,10 +326,10 @@ async fn route_hi(peers: &PeerTable, sender: PeerId, abilities: &[String], outbo
 }
 
 fn broadcast_hey(table: &HashMap<PeerId, Peer>) {
-	let hey = Payload::broadcast(0, Body::Hey {
+	let sync = Payload::broadcast(0, Body::Sync {
 		peers: table.iter().map(|(&id, peer)| PeerInfo { id, abilities: peer.abilities.iter().cloned().collect() }).collect(),
 	});
-	let Ok(line) = serde_json::to_string(&hey) else { return };
+	let Ok(line) = serde_json::to_string(&sync) else { return };
 	for peer in table.values() {
 		let _ = peer.outbox.send(line.clone());
 	}
@@ -366,13 +366,13 @@ mod tests {
 		std::env::temp_dir().join(format!("tuzi-dds-test-{}-{n}", std::process::id())).join("dds.sock")
 	}
 
-	/// Consumes `Hey` broadcasts on `inbox` until one lists at least `want`
+	/// Consumes `Sync` broadcasts on `inbox` until one lists at least `want`
 	/// peers — the deterministic way to know the server has finished
 	/// registering everyone this test connected before publishing.
 	async fn wait_for_peer_count(inbox: &mut mpsc::UnboundedReceiver<Payload>, want: usize) {
 		loop {
-			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Hey").expect("channel closed");
-			if let Body::Hey { peers } = payload.body
+			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Sync").expect("channel closed");
+			if let Body::Sync { peers } = payload.body
 				&& peers.len() >= want
 			{
 				return;
@@ -382,8 +382,8 @@ mod tests {
 
 	async fn wait_for_exact_peer_count(inbox: &mut mpsc::UnboundedReceiver<Payload>, want: usize) {
 		loop {
-			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Hey").expect("channel closed");
-			if let Body::Hey { peers } = payload.body
+			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Sync").expect("channel closed");
+			if let Body::Sync { peers } = payload.body
 				&& peers.len() == want
 			{
 				return;
@@ -391,19 +391,19 @@ mod tests {
 		}
 	}
 
-	/// Every connected peer gets its own copy of every handshake `Hey`, not
+	/// Every connected peer gets its own copy of every handshake `Sync`, not
 	/// just the one waited on in `wait_for_peer_count` — skip those to get
 	/// at the payload a test actually cares about.
 	async fn recv(inbox: &mut mpsc::UnboundedReceiver<Payload>) -> Payload {
 		loop {
 			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for a payload").expect("channel closed");
-			if !matches!(payload.body, Body::Hey { .. } | Body::Hi { .. }) {
+			if !matches!(payload.body, Body::Sync { .. } | Body::Join { .. }) {
 				return payload;
 			}
 		}
 	}
 
-	/// Same handshake-noise caveat as `recv`: a stale, never-drained `Hey`
+	/// Same handshake-noise caveat as `recv`: a stale, never-drained `Sync`
 	/// sitting ahead in the channel isn't the "no payload" this is meant
 	/// to assert.
 	async fn recv_nothing(inbox: &mut mpsc::UnboundedReceiver<Payload>) {
@@ -411,7 +411,7 @@ mod tests {
 			match timeout(Duration::from_millis(200), inbox.recv()).await {
 				Err(_) => return,
 				Ok(None) => return,
-				Ok(Some(payload)) if matches!(payload.body, Body::Hey { .. } | Body::Hi { .. }) => continue,
+				Ok(Some(payload)) if matches!(payload.body, Body::Sync { .. } | Body::Join { .. }) => continue,
 				Ok(Some(_)) => panic!("expected no payload, but one arrived"),
 			}
 		}
@@ -458,8 +458,8 @@ mod tests {
 		let (original_tx, _original_rx) = mpsc::unbounded_channel();
 		let (claimant_tx, _claimant_rx) = mpsc::unbounded_channel();
 
-		assert!(route_hi(&peers, 42, &["first".into()], original_tx).await);
-		assert!(!route_hi(&peers, 42, &["second".into()], claimant_tx).await);
+		assert!(route_join(&peers, 42, &["first".into()], original_tx).await);
+		assert!(!route_join(&peers, 42, &["second".into()], claimant_tx).await);
 
 		let table = peers.lock().await;
 		let peer = table.get(&42).unwrap();

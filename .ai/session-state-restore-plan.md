@@ -193,7 +193,7 @@ cursor 和 selection。现有带 tab ID/ticket 的异步事件继续用于拒绝
 - controller 成功提交只返回 `{ "ok": true, "status": "queued" }`；
 - 现有 `set-state` 不改名、不改变协议和行为。
 
-Token 只授权初始握手。DDS server 将 sender 绑定到完成 `Hi` 的连接，子 Tuzi 再
+Token 只授权初始握手。DDS server 将 sender 绑定到完成 `Join` 的连接，子 Tuzi 再
 验证 sender 等于其 parent。Controller 的前置检查只用于尽早发现误操作，不能
 替代接收方鉴权。
 

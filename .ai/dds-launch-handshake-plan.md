@@ -33,12 +33,12 @@
 新增内建消息：
 
 ```rust
-Body::Ready {
+Body::Attach {
     token: String,
 }
 ```
 
-它的 kind 为 `"ready"`，并加入 `BUILTIN_KINDS`，防止 Custom 消息冒充。
+它的 kind 为 `"attach"`，并加入 `BUILTIN_KINDS`，防止 Custom 消息冒充。
 
 不在 Body 内重复携带 Tuzi peer ID。完整 DDS envelope 已经包含权威来源：
 
@@ -47,7 +47,7 @@ Body::Ready {
   "receiver": 701,
   "sender": 902,
   "body": {
-    "Ready": {
+    "Attach": {
       "token": "random-launch-token"
     }
   }
@@ -56,10 +56,10 @@ Body::Ready {
 
 - `receiver`：启动者/控制器的 peer ID。
 - `sender`：新 Tuzi 的 peer ID，控制器应保存这个值。
-- `token`：把 Ready 与某一次 spawn 关联起来；同一控制器并发启动多个 Tuzi
+- `token`：把 Attach 与某一次 spawn 关联起来；同一控制器并发启动多个 Tuzi
   时不能只凭消息到达顺序匹配。
 
-Ready 必须使用 `publish_to(parent, ...)` 定点发送，不加入 `[dds].broadcast`
+Attach 必须使用 `publish_to(parent, ...)` 定点发送，不加入 `[dds].broadcast`
 白名单，也不经过 App 的隐式广播路径。
 
 ### 为什么不使用固定 peer ID
@@ -123,18 +123,18 @@ pub struct ServeOptions {
 Controller                         Tuzi                         DDS server
     |                               |                               |
     | connect(); obtain parent ID   |                               |
-    |<---------- Hey ---------------|-------------------------------|
+    |<---------- Sync ---------------|-------------------------------|
     |                               |                               |
     | spawn Tuzi(parent, token) ---->|                               |
-    |                               | connect + Hi ---------------->|
-    |                               | publish_to(parent, Ready) ---->|
-    |<----- Payload(sender=Tuzi ID, Ready{token}) ------------------|
+    |                               | connect + Join ---------------->|
+    |                               | publish_to(parent, Attach) ---->|
+    |<----- Payload(sender=Tuzi ID, Attach{token}) ------------------|
     | verify token; store sender     |                               |
     | publish_to(Tuzi ID, ...) ----->|                               |
 ```
 
 控制器必须先完成自己的 DDS 连接并获得 parent ID，再 spawn Tuzi。因为 DDS
-目前是 best-effort 且不缓存消息，如果 parent 尚未在线，Ready 会丢失。
+目前是 best-effort 且不缓存消息，如果 parent 尚未在线，Attach 会丢失。
 
 ## Tuzi 侧行为
 
@@ -145,12 +145,12 @@ Controller                         Tuzi                         DDS server
    - `[dds].enabled = false` 是配置冲突，启动失败并给出明确错误；
    - DDS 连接失败时启动失败，不进入 TUI；
    - 连接成功后立即调用
-     `client.publish_to(parent, Body::Ready { token })`；
-   - Ready 入队后再开始终端 UI。无需 `flush`，App 会长期持有 Client；
-     supervisor 总是先写 Hi，再写 outbox，因此 server 会先注册该 peer。
-5. socket 断线重连时不重发 Ready：当前 Client ID 在 supervisor 生命周期内
+     `client.publish_to(parent, Body::Attach { token })`；
+   - Attach 入队后再开始终端 UI。无需 `flush`，App 会长期持有 Client；
+     supervisor 总是先写 Join，再写 outbox，因此 server 会先注册该 peer。
+5. socket 断线重连时不重发 Attach：当前 Client ID 在 supervisor 生命周期内
    不变，控制器保存的地址仍有效。未来若改为 server 分配 ID，则必须同时
-   增加 connection-generation 通知和 Ready 重发。
+   增加 connection-generation 通知和 Attach 重发。
 
 ## 控制器侧约定
 
@@ -161,21 +161,21 @@ Controller                         Tuzi                         DDS server
 3. 通过环境变量传 parent ID 与 token 并启动 Tuzi。
 4. 持续读取 inbox，只接受同时满足下列条件的响应：
    - `payload.receiver == controller.id()`；
-   - body 为 `Ready`；
+   - body 为 `Attach`；
    - token 与该次 spawn 完全相同。
 5. 将 `payload.sender` 与插件自己的窗口/buffer/session 对象绑定。
 6. 设置超时（建议 3～5 秒）；子进程提前退出时立即报告 stderr/退出状态，
    不要只等待超时。
 
 同一个 parent 可以管理多个 Tuzi，每个 launch token 对应一个 pending spawn。
-peer 从 Hey 表消失时，控制器应清除对应绑定。
+peer 从 Sync 表消失时，控制器应清除对应绑定。
 
 ## `tu dds` 的辅助能力
 
 本功能不要求 `tu dds` 代替真正的控制器，但应便于人工验证：
 
 - `tu dds peers` 已能显示 parent peer ID。
-- `tu dds sub` 不适合接收定点 Ready 后立即退出，因为订阅命令自身才是
+- `tu dds sub` 不适合接收定点 Attach 后立即退出，因为订阅命令自身才是
   parent，必须先知道并保持它的 ID。
 - 后续可增加专用测试命令：
 
@@ -183,25 +183,25 @@ peer 从 Hey 表消失时，控制器应清除对应绑定。
 tu dds spawn [--timeout 5s] -- <tuzi arguments...>
 ```
 
-它连接 DDS、生成 token、注入环境变量、spawn Tuzi，收到 Ready 后打印
+它连接 DDS、生成 token、注入环境变量、spawn Tuzi，收到 Attach 后打印
 Tuzi peer ID。该命令属于便利增强，不阻塞核心握手实现。
 
 ## 错误与安全边界
 
-- parent 在 Ready 发出前退出：server 会静默丢弃定点消息；Tuzi 本身仍可
-  运行。第一版不把 Ready 当成“控制器必须确认”的租约。
+- parent 在 Attach 发出前退出：server 会静默丢弃定点消息；Tuzi 本身仍可
+  运行。第一版不把 Attach 当成“控制器必须确认”的租约。
 - 恶意同用户进程理论上可连接同一 socket 并伪造协议。现有 0600 socket
   权限只隔离其他系统用户；本计划不宣称同用户进程间身份认证。
 - token 不写日志、不进入 Notice；错误信息只能说明 token 无效，不能回显
   完整 token。
 - 如果未来需要“控制器退出则 Tuzi 自动退出”，应另行设计 parent lease/
-  heartbeat，不能把一次性 Ready 握手误当生命周期绑定。
+  heartbeat，不能把一次性 Attach 握手误当生命周期绑定。
 
 ## 实施步骤
 
 ### P1：协议与参数（已完成）
 
-1. 在 `dds::Body` 增加 `Ready { token }`，更新 kind 和保留名测试。
+1. 在 `dds::Body` 增加 `Attach { token }`，更新 kind 和保留名测试。
 2. 新增 `DdsLaunch` 的构造/校验逻辑。
 3. 扩展 `tuzi` 参数与环境变量解析；补齐 help。
 4. 单元测试覆盖成对约束、非零 parent、空/超长 token、CLI 优先级。
@@ -209,13 +209,13 @@ Tuzi peer ID。该命令属于便利增强，不阻塞核心握手实现。
 ### P2：App 启动握手（已完成）
 
 1. 将 `Option<DdsLaunch>` 传入 App 启动路径。
-2. 在 DDS connect 成功后定点发布 Ready。
+2. 在 DDS connect 成功后定点发布 Attach。
 3. 控制器模式下将 disabled/connect failure 改为硬错误；普通启动保持降级。
 4. 端到端测试连接 controller、启动 App 初始化路径并验证：
-   - Ready 只到 parent；
+   - Attach 只到 parent；
    - `Payload.sender == app.dds_client.id()`；
    - token 原样匹配；
-   - 其他 wildcard observer 不收到定点 Ready。
+   - 其他 wildcard observer 不收到定点 Attach。
 
 ### P3：文档与人工验证（部分完成）
 
@@ -227,7 +227,7 @@ Tuzi peer ID。该命令属于便利增强，不阻塞核心握手实现。
 ### P4：`tu dds spawn`（已完成）
 
 已实现测试/脚本便利命令：它使用系统安全随机源生成 128-bit token，注入
-环境变量并并发等待 Ready 或子进程退出。支持 `--timeout` 和 `--json`；超时
+环境变量并并发等待 Attach 或子进程退出。支持 `--timeout` 和 `--json`；超时
 时终止未完成关联的子进程。握手成功后 wrapper 必须继续等待 Tuzi 退出，
 不能立刻返回：否则 shell 会收回前台终端，仍运行的 TUI 将失去正确的 job
 control。peer ID 在 TUI 恢复终端后打印；运行中可从另一个终端用 `peers`

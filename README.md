@@ -23,6 +23,18 @@
 
 I love Yazi, but some of my work calls for a more convenient tree-shaped view, especially inside Neovim. After spending hours looking for something that fit, I finally decided to sell my soul to Codex and Claude and build exactly what I wanted.
 
+## Features
+
+- **Filesystem navigation and tooling** — Browse lazy directory trees, jump
+  with fzf or zoxide, search and filter files, manage visual selections, and
+  copy, move, rename, trash, or link files without leaving the TUI.
+- **Built for editor integration** — Launch and control Tuzi from Neovim or
+  other hosts through its authenticated DDS and JSON Lines controller.
+- **Atomic session restoration** — Restore tabs, roots, cursors, selections,
+  and expanded directories from startup configuration or a running controller.
+- **Configurable workflows** — Customize keymaps, themes, icons, openers,
+  file-operation policies, previews, and process-local runtime settings.
+
 ## Install
 
 Download the macOS or Linux archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` and its companion command `tu` somewhere on your `PATH`.
@@ -71,7 +83,7 @@ launch Tuzi with a fresh token and the controller's peer ID:
 TUZI_DDS_PARENT=701 TUZI_DDS_TOKEN=random-launch-token tuzi /project
 ```
 
-Tuzi replies directly with a `ready` payload. Its `sender` field is the new
+Tuzi replies directly with an `attach` payload. Its `sender` field is the new
 Tuzi peer ID. The two variables must be provided together; managed startup
 fails instead of silently disabling DDS. `--dds-parent` and `--dds-token` are
 also available for manual debugging, but environment variables avoid exposing
@@ -103,7 +115,7 @@ registered:
 ```
 
 The editor then starts Tuzi with `TUZI_DDS_PARENT=701` and the same
-`TUZI_DDS_TOKEN`. After the Ready handshake, the controller reports and tracks
+`TUZI_DDS_TOKEN`. After the Attach handshake, the controller reports and tracks
 that peer:
 
 ```text
@@ -125,7 +137,7 @@ The default abilities are `hover,cd,yank,renamed,task-done`; override them with
 `--abilities`. Stdout contains JSON Lines only, while stdin EOF shuts the
 controller down.
 
-When a controlled peer disappears from `Hey`, the controller waits 500ms for
+When a controlled peer disappears from `Sync`, the controller waits 500ms for
 server failover/reconnection. If it remains absent, the mapping is removed and
 the controller emits:
 

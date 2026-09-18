@@ -24,7 +24,7 @@ dispatch）做了裁剪。
 - 本地投递也必须绕回主事件循环的 `accept_payload` actor 再回调订阅者，
   不在 publish 调用点直接执行，从而与其余状态变更共享同一条序列化路径。
 - 传输层是本机 Unix Domain Socket；第一个连接失败的实例自举为 server，
-  其余实例都是 client；`hi`/`hey` 握手同步各实例的订阅能力，未声明兴趣
+  其余实例都是 client；`join`/`sync` 握手同步各实例的订阅能力，未声明兴趣
   的 kind 不会离开发布者所在进程。
 - `@` 前缀的 kind 是「静态/持久」消息，由 server 缓存并在握手时重放给
   新加入的实例，磁盘落盘保证跨重启存活。
@@ -72,7 +72,7 @@ dispatch）做了裁剪。
 ```text
 src/dds/
   mod.rs        // 对外入口：re-export BUILTIN_KINDS/Body/Registry/Client   [P1+P3 已实现]
-  body.rs       // Body 枚举：Hi/Hey/Cd/Yank/Renamed/TaskDone/Custom        [P1+P2+P3 已实现]
+  body.rs       // Body 枚举：Join/Sync/Cd/Yank/Renamed/TaskDone/Custom        [P1+P2+P3 已实现]
   registry.rs   // Registry：kind -> {subscriber -> handler}，App 的字段    [P1 已实现]
   payload.rs    // Payload{receiver,sender,body} envelope + 序列化          [P3 已实现]
   transport.rs  // Unix Socket Client/Server（首个实例自举为 server）       [P3 已实现]
@@ -97,8 +97,8 @@ P1/P2 都是单实例场景，`REMOTE`（转发给其他实例的订阅）要等
 
 ```rust
 pub enum Body {
-    Hi { abilities: Vec<String> },                    // [P3 已实现]
-    Hey { peers: Vec<PeerInfo> },                     // [P3 已实现]
+    Join { abilities: Vec<String> },                    // [P3 已实现]
+    Sync { peers: Vec<PeerInfo> },                     // [P3 已实现]
     Bye,                                               // [待实现，可选]
     Cd { path: PathBuf },
     Hover { path: Option<PathBuf> },                  // [已实现]
@@ -109,7 +109,7 @@ pub enum Body {
 }
 ```
 
-P1+P2 目前实际实现的 `src/dds/body.rs`（没有 `Hi`/`Hey`/`Bye`/`Hover`，
+P1+P2 目前实际实现的 `src/dds/body.rs`（没有 `Join`/`Sync`/`Bye`/`Hover`，
 其余字段一致）：
 
 ```rust
@@ -160,7 +160,7 @@ impl Registry {
 这里没有 yazi 式的 `sub_remote`/统一 `Pubsub` 门面：`Registry` 仍只负责
 进程内 `Body -> Command`，`dds::Client` 只负责 socket 生命周期和传输。
 P4 已把两者在 App 边界接通：建立 Client 前完成内建 Registry 注册，再用
-`Registry::abilities()` 的 kind 快照发送 `Hi`；socket inbox 回灌
+`Registry::abilities()` 的 kind 快照发送 `Join`；socket inbox 回灌
 `Event::DdsDeliver` 后仍由 Registry 决定如何处理。当前生产订阅只有
 `set-state`，所以 TUI 声明 `["set-state"]`；通配符 `"*"` 只给
 `tuzi sub` 这种调试流量探针使用。
@@ -177,7 +177,7 @@ P4 已把两者在 App 边界接通：建立 Client 前完成内建 Registry 注
   enum 表示（`{"Cd":{"path":"..."}}` 这种外部打标签形式），比 yazi 的
   逗号分隔混合格式更简单，两端都是 Rust，不需要跨语言兼容，仍保持纯
   文本可 `nc`/`cat` 调试。
-- 握手：`Hi`（携带本实例声明的 kind 集合）-> server 记录 -> 广播 `Hey`
+- 握手：`Join`（携带本实例声明的 kind 集合）-> server 记录 -> 广播 `Sync`
   （全量 peer 表）。
 - 转发过滤：`receiver==0` 只广播给声明了对应 ability 的 peer（或声明了
   通配符 `"*"`，见下）；否则定点转发。
@@ -196,7 +196,7 @@ P4 已把两者在 App 边界接通：建立 Client 前完成内建 Registry 注
   物，没有做 yazi 那样的 `--local-events`/`--remote-events` 过滤参数
   （用不上：`tu dds sub` 本身就是唯一目的是看流量的调试用途，不像 yazi
   那样要跟正常运行的 TUI 共享同一个二进制的参数体系）。
-- `tu dds peers` 等待一次 `Hey` 并打印 peer id 与 abilities；`sub`/`peers`
+- `tu dds peers` 等待一次 `Sync` 并打印 peer id 与 abilities；`sub`/`peers`
   都支持 `--json`。每个 clap 子命令的 `--help` 内置可直接复制的示例。
 - 旧的 `tuzi emit` / `tuzi sub` 暂时保留为兼容入口；新的 DDS 命令不再与
   `[PATH]` 位置参数争用。旧入口仍存在
@@ -309,10 +309,10 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      发送端并等 supervisor 把已入队的消息真正落到 socket 上再返回）。
    - `Server`（`transport.rs` 内部私有，外部拿不到句柄）：`try_bind` +
      `serve`（accept 循环，每个连接一对读写 task + 一份 `PeerTable`）。
-     `Hi` -> 记录 ability -> 广播 `Hey`；`receiver==0` 按 ability 过滤
+     `Join` -> 记录 ability -> 广播 `Sync`；`receiver==0` 按 ability 过滤
      广播（含通配符 `dds::WILDCARD_ABILITY = "*"`，`tuzi sub` 用它收
      全部消息）；`receiver!=0` 定点转发；连接断开时移出 peer 表并立即向
-     剩余 Peer 广播新版 `Hey`，避免各 Client 持有过期的 Peer 列表。
+     剩余 Peer 广播新版 `Sync`，避免各 Client 持有过期的 Peer 列表。
    - `tuzi emit <kind> [json]` / `tuzi sub`：`src/main.rs` 新增 `Cli`
      变体，`parse_args` 在进入原有的位置参数解析前先看第一个参数是不是
      字面量 `emit`/`sub`。
@@ -343,14 +343,14 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      写失败后立即进行第一次重连/选主。只有连续失败才按
      `20ms -> 50ms -> 100ms -> 250ms -> 500ms` 退避并封顶，避免长故障
      期间忙循环。
-   - 每次成功连接都重新发送 `Hi`，确保新 Server 恢复该 Peer 的 abilities；
-     已收到的 `Hey` 继续通过 inbox 交给上层。
+   - 每次成功连接都重新发送 `Join`，确保新 Server 恢复该 Peer 的 abilities；
+     已收到的 `Sync` 继续通过 inbox 交给上层。
    - 写失败时只重试当前尚未确认写入的消息一次；DDS 仍是 best-effort，
      不引入 ACK、磁盘队列或 exactly-once 语义。
    - 保持 `Registry` 与传输层完全独立：Registry 只做进程内
      `Body -> Vec<Command>`，不参与连接、选主和重连。
    - 已新增确定性测试：启动 Server-owner 与两个 Peer，终止 owner 后验证
-     幸存 Peer 能重新选出 Server、重发 `Hi`，并继续相互收发。
+     幸存 Peer 能重新选出 Server、重发 `Join`，并继续相互收发。
 
 5. **P4b App 接入 DDS 主循环 + `Command::SetState`**（已完成）：P4a
    通过后再让 TUI
@@ -362,9 +362,9 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      `App` 之后 `Client::connect(socket_path, abilities)` 一次，贯穿
      整个运行期（不再是 `tuzi emit`/`tuzi sub` 那种一次性连接）。
    - [已完成] ability 策略：`Registry::abilities()` 返回去重、排序后的已
-     注册 kind，App 用该启动时快照发送 `Hi`。当前值为 `["set-state"]`；
+     注册 kind，App 用该启动时快照发送 `Join`。当前值为 `["set-state"]`；
      `tuzi sub` 仍用 `"*"` 接收全部流量。运行期动态 sub/unsub 尚无生产
-     用例；未来若加入，需要在注册表变化后重新发送 `Hi`。
+     用例；未来若加入，需要在注册表变化后重新发送 `Join`。
    - [已完成] 后台任务把 `Client` 收到的 `Payload` 转成 `Event::DdsDeliver(body)`
      灌回 `tx`，直接复用 P1 已有的 `Dispatcher::dispatch_event ->
      Registry.deliver -> Command -> App::execute()`，不需要新写分发

@@ -71,12 +71,12 @@ enum DdsCommand {
 		json: bool,
 	},
 
-	/// Launch Tuzi and print the DDS peer ID established by its Ready handshake.
+	/// Launch Tuzi and print the DDS peer ID established by its Attach handshake.
 	#[command(
 		after_long_help = "Examples:\n  tu dds spawn\n  tu dds spawn -- /project\n  tu dds spawn --timeout 10 -- --config-dir /tmp/tuzi-test /project\n  tu dds spawn --json -- /project"
 	)]
 	Spawn {
-		/// Seconds to wait for Tuzi's Ready handshake.
+		/// Seconds to wait for Tuzi's Attach handshake.
 		#[arg(long, default_value_t = 5, value_name = "SECONDS")]
 		timeout: u64,
 		/// Print the resulting peer and process IDs as JSON.
@@ -196,7 +196,7 @@ impl ControllerState {
 		Ok(())
 	}
 
-	fn accept_ready(&mut self, token: &str, peer_id: u64) -> bool {
+	fn accept_attach(&mut self, token: &str, peer_id: u64) -> bool {
 		if !self.pending.remove(token) {
 			return false;
 		}
@@ -383,19 +383,19 @@ async fn handle_controller_payload(
 	controller_id: u64,
 	payload: Payload,
 ) -> io::Result<()> {
-	if let Body::Hey { peers } = &payload.body {
+	if let Body::Sync { peers } = &payload.body {
 		state.observe_peers(peers, Instant::now());
 		return Ok(());
 	}
 	if payload.receiver == controller_id
-		&& let Body::Ready { token } = &payload.body
+		&& let Body::Attach { token } = &payload.body
 	{
-		if state.accept_ready(token, payload.sender) {
+		if state.accept_attach(token, payload.sender) {
 			return write_json_line(output, &serde_json::json!({ "event": "tuzi-ready", "token": token, "peer_id": payload.sender })).await;
 		}
 		return Ok(());
 	}
-	if state.controls(payload.sender) && !matches!(payload.body, Body::Hey { .. } | Body::Hi { .. }) {
+	if state.controls(payload.sender) && !matches!(payload.body, Body::Sync { .. } | Body::Join { .. }) {
 		write_json_line(output, &serde_json::json!({
 			"event": "message",
 			"peer_id": payload.sender,
@@ -433,9 +433,9 @@ async fn spawn_tuzi(socket: &std::path::Path, timeout: Duration, json: bool, arg
 
 	let wait_ready = async {
 		loop {
-			let payload = inbox.recv().await.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "DDS connection closed before Tuzi became ready"))?;
+			let payload = inbox.recv().await.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "DDS connection closed before Tuzi attached"))?;
 			if payload.receiver == controller.id()
-				&& let Body::Ready { token: received } = payload.body
+				&& let Body::Attach { token: received } = payload.body
 				&& received == token
 			{
 				return Ok::<u64, io::Error>(payload.sender);
@@ -514,7 +514,7 @@ async fn subscribe(socket: &std::path::Path, mut kinds: Vec<String>, json: bool)
 async fn peers(socket: &std::path::Path, json: bool) -> io::Result<()> {
 	let (_client, mut inbox) = dds::Client::connect(socket, Vec::new()).await?;
 	while let Some(payload) = inbox.recv().await {
-		if let Body::Hey { peers } = payload.body {
+		if let Body::Sync { peers } = payload.body {
 			print_peers(&peers, json)?;
 			return Ok(());
 		}
@@ -576,13 +576,13 @@ mod tests {
 	#[test]
 	fn controller_only_accepts_registered_ready_tokens() {
 		let mut state = ControllerState::default();
-		assert!(!state.accept_ready("unknown", 10));
+		assert!(!state.accept_attach("unknown", 10));
 		state.register("known".into()).unwrap();
-		assert!(state.accept_ready("known", 11));
+		assert!(state.accept_attach("known", 11));
 		assert_eq!(state.peer("known"), Some(11));
 		assert!(state.controls(11));
 		assert!(!state.controls(10));
-		assert!(!state.accept_ready("known", 12));
+		assert!(!state.accept_attach("known", 12));
 	}
 
 	#[test]
@@ -590,7 +590,7 @@ mod tests {
 		let start = Instant::now();
 		let mut state = ControllerState::default();
 		state.register("known".into()).unwrap();
-		assert!(state.accept_ready("known", 11));
+		assert!(state.accept_attach("known", 11));
 
 		state.observe_peers(&[], start);
 		assert!(state.take_departed(start + PEER_LEFT_GRACE - Duration::from_millis(1)).is_empty());
@@ -627,8 +627,8 @@ mod tests {
 		let mut state = ControllerState::default();
 		state.register("second".into()).unwrap();
 		state.register("first".into()).unwrap();
-		assert!(state.accept_ready("second", 22));
-		assert!(state.accept_ready("first", 11));
+		assert!(state.accept_attach("second", 22));
+		assert!(state.accept_attach("first", 11));
 		state.observe_peers(&[
 			dds::PeerInfo { id: 22, abilities: vec!["set-state".into()] },
 			dds::PeerInfo { id: 11, abilities: vec!["set-state".into()] },
@@ -651,7 +651,7 @@ mod tests {
 	fn controller_validates_control_ownership_online_state_and_ability() {
 		let mut state = ControllerState::default();
 		state.register("known".into()).unwrap();
-		assert!(state.accept_ready("known", 11));
+		assert!(state.accept_attach("known", 11));
 		assert_eq!(state.validate_target(12, "set-state"), Err("peer_id is not controlled"));
 		assert_eq!(state.validate_target(11, "set-state"), Err("peer is offline"));
 		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["hover".into()] }], Instant::now());
@@ -671,22 +671,22 @@ mod tests {
 		let (child, mut child_inbox) = dds::Client::connect(&socket, Vec::new()).await.unwrap();
 		loop {
 			let payload = tokio::time::timeout(Duration::from_secs(2), child_inbox.recv()).await.unwrap().unwrap();
-			if matches!(payload.body, Body::Hey { ref peers } if peers.len() >= 2) {
+			if matches!(payload.body, Body::Sync { ref peers } if peers.len() >= 2) {
 				break;
 			}
 		}
 
 		let mut state = ControllerState::default();
 		state.register("launch".into()).unwrap();
-		child.publish_to(controller.id(), Body::Ready { token: "launch".into() });
+		child.publish_to(controller.id(), Body::Attach { token: "launch".into() });
 		let ready = loop {
 			let payload = tokio::time::timeout(Duration::from_secs(2), inbox.recv()).await.unwrap().unwrap();
-			if matches!(payload.body, Body::Ready { .. }) {
+			if matches!(payload.body, Body::Attach { .. }) {
 				break payload;
 			}
 		};
-		let Body::Ready { token } = ready.body else { unreachable!() };
-		assert!(state.accept_ready(&token, ready.sender));
+		let Body::Attach { token } = ready.body else { unreachable!() };
+		assert!(state.accept_attach(&token, ready.sender));
 		assert!(state.controls(child.id()));
 
 		child.publish(Body::Hover { path: Some("/tmp/file".into()) });

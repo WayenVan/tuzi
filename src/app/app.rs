@@ -166,7 +166,7 @@ impl App {
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::new(keymap);
 		if let Some(launch) = dds_launch {
-			app.announce_ready(&launch);
+			app.announce_attach(&launch);
 		}
 
 		app.render(terminal.terminal())?;
@@ -254,10 +254,10 @@ impl App {
 		Ok(())
 	}
 
-	fn announce_ready(&self, launch: &dds::DdsLaunch) {
+	fn announce_attach(&self, launch: &dds::DdsLaunch) {
 		self.dds_client.as_ref().expect("controlled launch requires a DDS client").publish_to(
 			launch.parent,
-			Body::Ready { token: launch.token.clone() },
+			Body::Attach { token: launch.token.clone() },
 		);
 	}
 
@@ -1741,21 +1741,21 @@ mod tests {
 		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
 		let app_id = app.dds_client.as_ref().unwrap().id();
 
-		app.announce_ready(&dds::DdsLaunch::new(parent.id(), "launch-token".into()).unwrap());
+		app.announce_attach(&dds::DdsLaunch::new(parent.id(), "launch-token".into()).unwrap());
 		let ready = loop {
 			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
-			if matches!(payload.body, Body::Ready { .. }) {
+			if matches!(payload.body, Body::Attach { .. }) {
 				break payload;
 			}
 		};
 		assert_eq!(ready.sender, app_id);
 		assert_eq!(ready.receiver, parent.id());
-		assert_eq!(ready.body, Body::Ready { token: "launch-token".into() });
+		assert_eq!(ready.body, Body::Attach { token: "launch-token".into() });
 
 		loop {
 			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
 				Err(_) | Ok(None) => break,
-				Ok(Some(payload)) if matches!(payload.body, Body::Hey { .. }) => continue,
+				Ok(Some(payload)) if matches!(payload.body, Body::Sync { .. }) => continue,
 				Ok(Some(payload)) => panic!("observer unexpectedly received direct message: {:?}", payload.body),
 			}
 		}
@@ -1790,7 +1790,7 @@ mod tests {
 		loop {
 			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
 				Err(_) | Ok(None) => break,
-				Ok(Some(payload)) if matches!(payload.body, Body::Hey { .. }) => continue,
+				Ok(Some(payload)) if matches!(payload.body, Body::Sync { .. }) => continue,
 				Ok(Some(payload)) => panic!("observer unexpectedly received parent open: {:?}", payload.body),
 			}
 		}
@@ -1896,7 +1896,7 @@ mod tests {
 
 		loop {
 			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), remote_inbox.recv()).await.unwrap().unwrap();
-			if let Body::Hey { peers } = payload.body
+			if let Body::Sync { peers } = payload.body
 				&& peers.len() >= 2
 			{
 				let abilities = &peers.iter().find(|peer| peer.id == app_peer).unwrap().abilities;

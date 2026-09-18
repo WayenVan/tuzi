@@ -8,16 +8,16 @@ line with this envelope:
 ```
 
 `receiver: 0` means broadcast. A non-zero receiver is one peer ID. The server
-binds `sender` to the connection that completed the `Hi` handshake and rejects
+binds `sender` to the connection that completed the `Join` handshake and rejects
 messages that claim another sender ID.
 
 ## Supported kinds
 
 | Kind | Direction | Route | Ability | Purpose |
 |---|---|---|---|---|
-| `hi` | client → server | handshake | no | declare peer ID and abilities |
-| `hey` | server → all clients | broadcast | no | publish the current peer table |
-| `ready` | Tuzi → parent | direct | no | complete a token-authorized launch |
+| `join` | client → server | handshake | no | declare peer ID and abilities |
+| `sync` | server → all clients | broadcast | no | publish the current peer table |
+| `attach` | Tuzi → parent | direct | no | complete a token-authorized launch |
 | `open` | Tuzi → parent | direct | no | ask the host to open paths |
 | `set-state` | parent → Tuzi | direct | `set-state` | update the active tab |
 | `restore-state` | parent → Tuzi | direct | `restore-state` | replace the complete session atomically |
@@ -36,23 +36,23 @@ the final receiver-side check.
 ## Handshake messages
 
 ```json
-{"Hi":{"abilities":["restore-state","set-state"]}}
+{"Join":{"abilities":["restore-state","set-state"]}}
 ```
 
-`Hi` must be the first message on a connection. A second `Hi`, a duplicate peer
+`Join` must be the first message on a connection. A second `Join`, a duplicate peer
 ID, or a later message with a different sender ID closes that connection.
 
 ```json
-{"Hey":{"peers":[{"id":701,"abilities":["hover","cd"]},{"id":902,"abilities":["restore-state","set-state"]}]}}
+{"Sync":{"peers":[{"id":701,"abilities":["hover","cd"]},{"id":902,"abilities":["restore-state","set-state"]}]}}
 ```
 
-`Hey` is emitted whenever the connected peer table changes.
+`Sync` is emitted whenever the connected peer table changes.
 
 ```json
-{"Ready":{"token":"random-launch-token"}}
+{"Attach":{"token":"random-launch-token"}}
 ```
 
-`Ready` is sent directly to the configured parent. The enclosing sender is the
+`Attach` is sent directly to the configured parent. The enclosing sender is the
 new Tuzi peer ID. The controller accepts it only when the token was registered.
 
 ## Control messages
@@ -111,7 +111,7 @@ receive them.
 
 Custom `data` may be any JSON value. Explicit `emit`/`pub` commands bypass the
 implicit broadcast allowlist but still require DDS to be enabled. The built-in
-names `hi`, `hey`, `ready`, `open`, `cd`, `hover`, `yank`, `renamed`, and
+names `join`, `sync`, `attach`, `open`, `cd`, `hover`, `yank`, `renamed`, and
 `task-done` are reserved. Controller additionally reserves `set-state` and
 `restore-state` for their typed operations.
 
@@ -119,7 +119,7 @@ names `hi`, `hey`, `ready`, `open`, `cd`, `hover`, `yank`, `renamed`, and
 
 - Socket and runtime directory access are restricted to the current OS user.
 - The server binds sender identity to one established connection.
-- The launch token authorizes only `Ready`; it is not a runtime address.
+- The launch token authorizes only `Attach`; it is not a runtime address.
 - Runtime control uses one peer ID at a time.
 - Controlled Tuzi verifies that directed control came from its saved parent
   and that it declared the requested state-operation ability.

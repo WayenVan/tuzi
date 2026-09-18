@@ -258,6 +258,6 @@ should keep a `request_id -> callback` map and apply a timeout to each request.
 The launch token authorizes only the initial handshake. Runtime operations use
 one `peer_id` at a time. Tuzi accepts `set-state` and `restore-state` from its
 saved parent peer only, and the DDS server binds every sender ID to the
-connection that completed the `Hi` handshake so another client cannot spoof
+connection that completed the `Join` handshake so another client cannot spoof
 the parent ID. Tuzi also checks that a directed control operation is supported
 and that its JSON schema is valid; rejected messages produce a local warning.

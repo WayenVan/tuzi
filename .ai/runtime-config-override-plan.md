@@ -37,4 +37,4 @@ DDS 的 parent peer ID 与 launch token 是握手身份，不属于配置，继�
 如果最终配置为 `parent`，但启动时完全没有 DdsLaunch（parent/token），配置
 校验失败并终止启动。如果启动时声明了 parent，但它随后下线，Tuzi 保持
 运行；执行 open 时显示 `controller unavailable`，不发送到不存在的 peer，
-也不在本地意外打开。parent 重新出现在 Hey 后恢复可用。
+也不在本地意外打开。parent 重新出现在 Sync 后恢复可用。
