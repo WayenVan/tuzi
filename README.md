@@ -445,8 +445,10 @@ Prefix keys such as `Space`, `g`, `c`, `m`, and `,` show their available command
 
 ## Roadmap
 
-- [x] **User configuration** — configurable keybindings, themes, and behavior without rebuilding Tuzi.
-- [x] **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
+- **Neovim integration** — an official plugin with editor synchronization,
+  flexible layouts, and workspace session restoration.
+- **Deeper tree workflows** — Git and diagnostics, bookmarks and workspace
+  roots, ignore rules, batch rename, and contextual actions.
 
 ## Acknowledgements
 
