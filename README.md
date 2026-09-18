@@ -92,7 +92,8 @@ behind. Use `tu dds peers` from another terminal to inspect the live ID.
 
 `tu dds controller` is the long-running JSON Lines bridge intended for editor
 plugins. See the concise [controller protocol guide](docs/controller-protocol.md)
-for integration details. It only accepts a Tuzi after its launch token has been
+and [DDS message reference](docs/dds-protocol.md) for integration details. It
+only accepts a Tuzi after its launch token has been
 registered:
 
 ```text
@@ -111,6 +112,10 @@ that peer:
 → {"request_id":2,"op":"set-state","peer_id":902,"state":{"path":"/project","selection":["README.md"]}}
 ← {"request_id":2,"ok":true,"status":"queued"}
 ```
+
+Use `restore-state` when the host needs to replace the complete tab session,
+including cursor positions and expanded directories. The replacement is built
+off-screen and becomes visible only after every tab has restored successfully.
 
 Only messages whose sender is a successfully controlled Tuzi are emitted.
 The token authorizes the initial handshake; runtime commands address one
@@ -195,9 +200,12 @@ Use `tuzi --config-dir DIR` to select another configuration directory, or
 `tuzi --no-config` to run with the built-in defaults. `TUZI_CONFIG_HOME` can
 also set the configuration directory globally.
 
-`--runtime-config` and `--runtime-config-file` apply JSON configuration to one
-Tuzi process without editing its files. They may be repeated and are applied
-in command-line order:
+`--runtime-config` and `--runtime-config-file` apply JSON configuration and
+optional session state to one Tuzi process without editing its files. They may
+be repeated and are applied
+in command-line order. Configuration and keymap values retain their overlay
+behavior; the last document containing `state` supplies the complete startup
+session:
 
 ```sh
 tuzi --runtime-config '{
@@ -209,6 +217,27 @@ tuzi --runtime-config '{
 
 tuzi --runtime-config-file /tmp/tuzi-session.json /project
 ```
+
+For example, `/tmp/tuzi-session.json` may contain:
+
+```json
+{
+  "state": {
+    "version": 1,
+    "active_tab": 0,
+    "tabs": [{
+      "cwd": "/project",
+      "cursor": "/project/README.md",
+      "selection": [],
+      "expanded": ["/project/src"]
+    }]
+  }
+}
+```
+
+Session paths must be absolute. Startup waits for the lazy directory listings
+to finish before entering the TUI; an invalid snapshot or a restore failure
+terminates startup with an error.
 
 `dds.open = "auto"` sends ordinary opens to an available controlling parent
 and otherwise uses the local opener. `local` always uses the local opener;

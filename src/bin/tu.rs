@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tuzi::dds::{self, Body, Payload, PeerInfo, WILDCARD_ABILITY};
+use tuzi::session_state::SessionState;
 
 #[derive(Parser)]
 #[command(name = "tu", version, about = "Companion command-line tools for Tuzi")]
@@ -152,6 +153,7 @@ enum ControllerRequest {
 	List { request_id: u64 },
 	Detach { request_id: u64, peer_id: u64 },
 	SetState { request_id: u64, peer_id: u64, state: ControllerStatePatch },
+	RestoreState { request_id: u64, peer_id: u64, state: SessionState },
 	Publish {
 		request_id: u64,
 		peer_id: u64,
@@ -346,8 +348,18 @@ async fn handle_controller_request(
 			});
 			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
 		}
+		ControllerRequest::RestoreState { request_id, peer_id, state: snapshot } => {
+			if let Err(error) = state.validate_target(peer_id, "restore-state") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			client.publish_to(peer_id, Body::Custom {
+				kind: "restore-state".into(),
+				data: serde_json::to_value(snapshot).expect("SessionState must serialize"),
+			});
+			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
+		}
 		ControllerRequest::Publish { request_id, peer_id, kind, data } => {
-			if kind.is_empty() || kind == "set-state" || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
+			if kind.is_empty() || matches!(kind.as_str(), "set-state" | "restore-state") || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
 				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "kind is empty or reserved" })).await;
 			}
 			if let Err(error) = state.validate_target(peer_id, &kind) {
@@ -605,6 +617,7 @@ mod tests {
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":10,"op":"cancel-register","token":"known"}"#).unwrap(), ControllerRequest::CancelRegister { request_id: 10, .. }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":11,"op":"detach","peer_id":42}"#).unwrap(), ControllerRequest::Detach { request_id: 11, peer_id: 42 }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":12,"op":"set-state","peer_id":42,"state":{"path":"/tmp","selection":[]}}"#).unwrap(), ControllerRequest::SetState { request_id: 12, peer_id: 42, .. }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":14,"op":"restore-state","peer_id":42,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/tmp","cursor":null,"selection":[],"expanded":[]}]}}"#).unwrap(), ControllerRequest::RestoreState { request_id: 14, peer_id: 42, .. }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":13,"op":"publish","peer_id":42,"kind":"event","data":null}"#).unwrap(), ControllerRequest::Publish { request_id: 13, peer_id: 42, .. }));
 		assert!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":10,"op":"publish","token":"known","kind":"event"}"#).is_err());
 	}
@@ -645,6 +658,9 @@ mod tests {
 		assert_eq!(state.validate_target(11, "set-state"), Err("peer does not support this operation"));
 		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["set-state".into()] }], Instant::now());
 		assert_eq!(state.validate_target(11, "set-state"), Ok(()));
+		assert_eq!(state.validate_target(11, "restore-state"), Err("peer does not support this operation"));
+		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["restore-state".into()] }], Instant::now());
+		assert_eq!(state.validate_target(11, "restore-state"), Ok(()));
 	}
 
 	#[tokio::test]

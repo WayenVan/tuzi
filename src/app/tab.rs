@@ -96,6 +96,11 @@ enum ListingOutcome {
 	Full(Vec<(PathBuf, Cha)>),
 }
 
+pub(super) enum ListingCompletion {
+	Loaded,
+	Failed(String),
+}
+
 impl PendingListing {
 	/// Resolves a `done` listing for `ticket` against whatever pending
 	/// record (if any) was tracking it. `None` means a newer request has
@@ -282,6 +287,31 @@ impl Tab {
 		if needs_fetch {
 			self.fs_scheduler.refresh(path);
 		}
+	}
+
+	/// Expands an exact path while a staged session is being built. Unlike
+	/// the cursor-oriented command, absence from the loaded tree is an error.
+	pub(super) fn restore_expand(&mut self, path: &Path) -> Result<bool, String> {
+		let Some(node) = self.tree.root.find(path) else {
+			return Err(format!("expanded path disappeared while restoring: {}", path.display()));
+		};
+		if !node.cha.is_dir {
+			return Err(format!("expanded path is no longer a directory: {}", path.display()));
+		}
+		let needs_fetch = self.tree.mark_expanded(path).expect("restore path was just found");
+		self.sync_projection(path);
+		self.watcher.watch_async(path.to_owned());
+		if needs_fetch {
+			self.fs_scheduler.refresh(path.to_owned());
+		}
+		Ok(needs_fetch)
+	}
+
+	pub(super) fn restore_cursor(&mut self, path: &Path) -> bool {
+		let Some(position) = self.visible_position(path) else { return false };
+		self.cursor = position;
+		self.preview.target_changed();
+		true
 	}
 
 	pub fn toggle_expand_selected(&mut self) {
@@ -987,14 +1017,22 @@ impl Tab {
 	/// A background listing message arrived — either one more batch, or the
 	/// final word on whether the whole listing succeeded. Just dispatches;
 	/// `on_listing_batch` and `on_listing_done` each own one concern.
-	pub fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>, done: bool) {
+	pub(super) fn on_loaded(&mut self, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>, done: bool) -> Option<ListingCompletion> {
 		if !self.fs_scheduler.accept(&path, ticket, done) {
-			return;
+			return None;
 		}
 		if done {
+			let failure = result.as_ref().err().map(ToString::to_string);
 			self.on_listing_done(path, ticket, result);
+			Some(match failure {
+				Some(error) => ListingCompletion::Failed(error),
+				None => ListingCompletion::Loaded,
+			})
 		} else if let Ok(entries) = result {
 			self.on_listing_batch(path, ticket, entries);
+			None
+		} else {
+			None
 		}
 	}
 
@@ -1365,7 +1403,7 @@ mod tests {
 		match event {
 			Event::Changed { path, .. } => tab.on_changed(path),
 			Event::FilesChanged { parent, changes, .. } => tab.on_files_changed(parent, changes),
-			Event::Loaded { path, ticket, result, done, .. } => tab.on_loaded(path, ticket, result, done),
+			Event::Loaded { path, ticket, result, done, .. } => { tab.on_loaded(path, ticket, result, done); }
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			// No App/Registry exists in these single-tab tests; DDS publication
 			// from `cd`/rename is a no-op here.
@@ -2116,6 +2154,7 @@ mod tests {
 	#[tokio::test]
 	async fn create_input_makes_a_file_and_reveals_it() {
 		let root = std::env::temp_dir().join("tuzi-tab-test-create-file");
+		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(&root).unwrap();
 		let root = root.canonicalize().unwrap();
 

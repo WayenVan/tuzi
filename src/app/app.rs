@@ -21,7 +21,10 @@ use crate::{
 	tui::TerminalSession,
 };
 
-use super::{Dispatcher, Tab};
+use super::{
+	restore::{SessionRestoreStep, StagedSession},
+	Dispatcher, Tab,
+};
 
 pub struct App {
 	pub(super) config: Arc<Config>,
@@ -33,6 +36,14 @@ pub struct App {
 	/// copy was mid-write on, so this asks first instead of just doing it.
 	pub(super) pending_quit: bool,
 	next_tab_id: usize,
+	/// A replacement session being built off-screen. Its tab IDs are drawn
+	/// from the same monotonic sequence as visible tabs, but it is not
+	/// rendered or reachable by user commands until the atomic commit.
+	pub(super) staged_session: Option<StagedSession>,
+	/// Set when the most recent asynchronous restore failed. Startup reads
+	/// this to turn the same executor failure into a process error; runtime
+	/// restores additionally surface it as a warning toast.
+	pub(super) restore_error: Option<String>,
 	/// The yanked files, shared by every tab: yank in one, paste in another.
 	pub(super) clipboard: Vec<PathBuf>,
 	pub(super) clipboard_cut: bool,
@@ -93,9 +104,11 @@ impl Default for MouseState {
 }
 
 impl App {
-	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
+	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme, state: Option<crate::session_state::SessionState>, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let config = Arc::new(config);
+		let state = state.map(crate::session_state::validate_and_normalize).transpose()
+			.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid startup session state: {error}")))?;
 		let pubsub = Self::new_registry();
 		if dds_launch.is_some() && !config.dds.enabled {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "controlled launch requires DDS, but dds.enabled is false"));
@@ -109,7 +122,8 @@ impl App {
 			false => (None, None),
 		};
 
-		let first = Tab::open_configured(0, path, tx.clone(), config.clone())?;
+		let initial_path = state.as_ref().map_or(path, |state| state.tabs[0].cwd.clone());
+		let first = Tab::open_configured(0, initial_path, tx.clone(), config.clone())?;
 		let controller = dds_launch.clone().map(|launch| ControllerLink { launch, online: true });
 		let mut app = Self {
 			config: config.clone(),
@@ -118,6 +132,8 @@ impl App {
 			quit: false,
 			pending_quit: false,
 			next_tab_id: 1,
+			staged_session: None,
+			restore_error: None,
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
@@ -142,6 +158,10 @@ impl App {
 				format!("DDS unavailable; continuing with local events only: {error}"),
 				std::time::Duration::from_secs(5),
 			));
+		}
+		if let Some(state) = state {
+			app.begin_normalized_restore(state)?;
+			app.finish_startup_restore(&mut rx).await?;
 		}
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::new(keymap);
@@ -207,7 +227,7 @@ impl App {
 
 	fn validate_dds_message(parent: Option<dds::PeerId>, self_id: dds::PeerId, supported: &HashSet<String>, payload: &dds::Payload) -> Result<(), String> {
 		let Some(parent) = parent else { return Ok(()) };
-		let is_control = payload.receiver == self_id || payload.body.kind() == "set-state";
+		let is_control = payload.receiver == self_id || matches!(payload.body.kind(), "set-state" | "restore-state");
 		if !is_control { return Ok(()) }
 		if payload.sender != parent {
 			return Err(format!("rejected DDS control message from unauthorized peer {}", payload.sender));
@@ -222,6 +242,14 @@ impl App {
 			};
 			serde_json::from_value::<IncomingState>(data.clone())
 				.map_err(|error| format!("rejected invalid DDS set-state content: {error}"))?;
+		} else if kind == "restore-state" {
+			let Body::Custom { data, .. } = &payload.body else {
+				return Err("rejected malformed DDS restore-state message".into());
+			};
+			let state = serde_json::from_value::<crate::session_state::SessionState>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS restore-state content: {error}"))?;
+			crate::session_state::validate_and_normalize(state)
+				.map_err(|error| format!("rejected invalid DDS restore-state content: {error}"))?;
 		}
 		Ok(())
 	}
@@ -247,6 +275,15 @@ impl App {
 				let Body::Custom { data, .. } = body else { return Vec::new() };
 				let Ok(state) = serde_json::from_value::<IncomingState>(data.clone()) else { return Vec::new() };
 				vec![crate::command::Command::SetState { path: state.path, selection: state.selection }]
+			}),
+		);
+		registry.sub(
+			"core",
+			"restore-state",
+			Box::new(|body| {
+				let Body::Custom { data, .. } = body else { return Vec::new() };
+				let Ok(state) = serde_json::from_value::<crate::session_state::SessionState>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::RestoreState(state)]
 			}),
 		);
 		registry
@@ -492,6 +529,66 @@ impl App {
 		self.tabs.iter_mut().find(|t| t.id == id)
 	}
 
+	pub(super) fn staged_tab_mut(&mut self, id: usize) -> Option<&mut Tab> {
+		self.staged_session.as_mut()?.tab_mut(id)
+	}
+
+	pub(super) fn is_staged_tab(&self, id: usize) -> bool {
+		self.staged_session.as_ref().is_some_and(|session| session.contains(id))
+	}
+
+	/// Starts building a complete replacement session without touching the
+	/// visible tabs. Validation happens before the previous staged attempt is
+	/// superseded, and allocated IDs are never reused after a failed attempt.
+	pub(super) fn begin_restore(&mut self, state: crate::session_state::SessionState) -> Result<(), String> {
+		let state = crate::session_state::validate_and_normalize(state)?;
+		self.begin_normalized_restore(state).map_err(|error| error.to_string())
+	}
+
+	fn begin_normalized_restore(&mut self, state: crate::session_state::SessionState) -> io::Result<()> {
+		let first_id = self.next_tab_id;
+		self.next_tab_id = self.next_tab_id.checked_add(state.tabs.len())
+			.ok_or_else(|| io::Error::other("tab ID space exhausted"))?;
+		let staged = StagedSession::open(first_id, state, self.tx.clone(), self.config.clone())
+			.map_err(io::Error::other)?;
+		self.restore_error = None;
+		self.staged_session = Some(staged);
+		Ok(())
+	}
+
+	async fn finish_startup_restore(&mut self, rx: &mut mpsc::UnboundedReceiver<Event>) -> io::Result<()> {
+		while self.staged_session.is_some() {
+			let event = rx.recv().await.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "event channel closed during startup session restore"))?;
+			Dispatcher::dispatch_event(self, event);
+		}
+		match self.restore_error.take() {
+			Some(error) => Err(io::Error::other(format!("startup session restore failed: {error}"))),
+			None => Ok(()),
+		}
+	}
+
+	pub(super) fn on_staged_loaded(&mut self, tab: usize, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, crate::fs::Cha)>>, done: bool) {
+		let step = self.staged_session.as_mut().expect("staged tab must belong to a staged session")
+			.on_loaded(tab, path, ticket, result, done);
+		match step {
+			SessionRestoreStep::Pending => {}
+			SessionRestoreStep::Complete => {
+				let (tabs, active) = self.staged_session.take().unwrap().into_tabs();
+				self.tabs = tabs;
+				self.active = active;
+			}
+			SessionRestoreStep::Failed(error) => {
+				self.staged_session = None;
+				self.restore_error = Some(error.clone());
+				self.notices.push(Notice::new(
+					NoticeLevel::Warn,
+					format!("Cannot restore session: {error}"),
+					std::time::Duration::from_secs(8),
+				));
+			}
+		}
+	}
+
 	/// Opens a new tab rooted at wherever the active one currently is,
 	/// yazi-style (`tt`), and switches to it.
 	pub fn new_tab(&mut self) {
@@ -605,6 +702,16 @@ impl App {
 			return;
 		}
 		self.active_tab_mut().set_selection(selection);
+	}
+
+	pub(super) fn restore_state(&mut self, state: crate::session_state::SessionState) {
+		if let Err(error) = self.begin_restore(state) {
+			self.notices.push(Notice::new(
+				NoticeLevel::Warn,
+				format!("Cannot restore session: {error}"),
+				std::time::Duration::from_secs(8),
+			));
+		}
 	}
 
 	pub fn request_delete(&mut self, mode: DeleteMode) {
@@ -743,7 +850,12 @@ mod tests {
 	use std::{fs, path::Path};
 	use crossterm::event::KeyEvent;
 
-	use crate::{command::Command, column_mode::ColumnMode, config::DdsOpen};
+	use crate::{
+		command::Command,
+		column_mode::ColumnMode,
+		config::DdsOpen,
+		session_state::{SESSION_STATE_VERSION, SessionState, TabState},
+	};
 
 	use super::*;
 
@@ -757,6 +869,8 @@ mod tests {
 			quit: false,
 			pending_quit: false,
 			next_tab_id: 1,
+			staged_session: None,
+			restore_error: None,
 			clipboard: Vec::new(),
 			clipboard_cut: false,
 			tree_rows: 0,
@@ -798,6 +912,118 @@ mod tests {
 				break;
 			}
 		}
+	}
+
+	async fn pump_restore(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>) {
+		while app.staged_session.is_some() {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+				.expect("restore timed out").expect("restore event channel closed");
+			Dispatcher::dispatch_event(app, event);
+		}
+	}
+
+	fn session(active_tab: usize, tabs: Vec<TabState>) -> SessionState {
+		SessionState { version: SESSION_STATE_VERSION, active_tab, tabs }
+	}
+
+	#[tokio::test]
+	async fn staged_session_replaces_all_tabs_atomically_and_preserves_order_and_active_tab() {
+		let old = std::env::temp_dir().join("tuzi-app-test-restore-old");
+		let first = std::env::temp_dir().join("tuzi-app-test-restore-first");
+		let second = std::env::temp_dir().join("tuzi-app-test-restore-second");
+		for path in [&old, &first, &second] { let _ = fs::remove_dir_all(path); fs::create_dir_all(path).unwrap(); }
+		fs::create_dir_all(first.join("src/deep")).unwrap();
+		fs::write(first.join("src/deep/cursor"), "").unwrap();
+		fs::write(second.join("selected"), "").unwrap();
+		let (mut app, mut rx) = app(&old).await;
+		let old_id = app.active;
+		app.begin_restore(session(1, vec![
+			TabState {
+				cwd: first.clone(), cursor: Some(first.join("src/deep/cursor")), selection: Vec::new(), expanded: Vec::new(),
+			},
+			TabState {
+				cwd: second.clone(), cursor: None, selection: vec![second.join("selected")], expanded: Vec::new(),
+			},
+		])).unwrap();
+		assert_eq!(app.tabs.len(), 1, "old session stays visible while staging");
+		assert_eq!(app.active, old_id);
+		pump_restore(&mut app, &mut rx).await;
+		assert_eq!(app.tabs.len(), 2);
+		assert_eq!(app.tabs[0].tree.root.path, first.canonicalize().unwrap());
+		assert_eq!(app.tabs[1].tree.root.path, second.canonicalize().unwrap());
+		assert_eq!(app.active, app.tabs[1].id);
+		assert_eq!(app.tabs[0].visible_at(app.tabs[0].cursor).unwrap().1.path, first.canonicalize().unwrap().join("src/deep/cursor"));
+		assert!(app.tabs[1].selection.contains(&second.canonicalize().unwrap().join("selected")));
+		for path in [old, first, second] { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[tokio::test]
+	async fn one_staged_tab_failure_rolls_back_the_entire_session() {
+		let old = std::env::temp_dir().join("tuzi-app-test-restore-rollback-old");
+		let replacement = std::env::temp_dir().join("tuzi-app-test-restore-rollback-new");
+		for path in [&old, &replacement] { let _ = fs::remove_dir_all(path); fs::create_dir_all(path).unwrap(); }
+		let (mut app, _rx) = app(&old).await;
+		let old_root = app.active_tab().tree.root.path.clone();
+		let staged_id = app.next_tab_id;
+		app.begin_restore(session(0, vec![TabState {
+			cwd: replacement.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new(),
+		}])).unwrap();
+		Dispatcher::dispatch_event(&mut app, Event::Loaded {
+			tab: staged_id,
+			path: replacement.canonicalize().unwrap(),
+			ticket: 0,
+			result: Err(io::Error::new(io::ErrorKind::PermissionDenied, "synthetic failure")),
+			done: true,
+		});
+		assert!(app.staged_session.is_none());
+		assert_eq!(app.tabs.len(), 1);
+		assert_eq!(app.active_tab().tree.root.path, old_root);
+		assert!(app.notices.iter().any(|notice| notice.message.contains("synthetic failure")));
+		for path in [old, replacement] { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[tokio::test]
+	async fn stale_listing_from_a_failed_restore_cannot_touch_a_new_attempt() {
+		let old = std::env::temp_dir().join("tuzi-app-test-restore-stale-old");
+		let failed = std::env::temp_dir().join("tuzi-app-test-restore-stale-failed");
+		let replacement = std::env::temp_dir().join("tuzi-app-test-restore-stale-new");
+		for path in [&old, &failed, &replacement] { let _ = fs::remove_dir_all(path); fs::create_dir_all(path).unwrap(); }
+		let (mut app, mut rx) = app(&old).await;
+		let failed_id = app.next_tab_id;
+		app.begin_restore(session(0, vec![TabState { cwd: failed.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new() }])).unwrap();
+		Dispatcher::dispatch_event(&mut app, Event::Loaded {
+			tab: failed_id, path: failed.canonicalize().unwrap(), ticket: 0,
+			result: Err(io::Error::other("failed attempt")), done: true,
+		});
+		let replacement_id = app.next_tab_id;
+		app.begin_restore(session(0, vec![TabState { cwd: replacement.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new() }])).unwrap();
+		assert_ne!(failed_id, replacement_id);
+		Dispatcher::dispatch_event(&mut app, Event::Loaded {
+			tab: failed_id, path: failed.canonicalize().unwrap(), ticket: 0, result: Ok(Vec::new()), done: true,
+		});
+		assert!(app.staged_session.is_some(), "stale event must not finish or cancel the new attempt");
+		pump_restore(&mut app, &mut rx).await;
+		assert_eq!(app.active_tab().tree.root.path, replacement.canonicalize().unwrap());
+		for path in [old, failed, replacement] { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[tokio::test]
+	async fn startup_restore_returns_an_error_instead_of_entering_the_tui_on_failure() {
+		let old = std::env::temp_dir().join("tuzi-app-test-startup-restore-old");
+		let replacement = std::env::temp_dir().join("tuzi-app-test-startup-restore-new");
+		for path in [&old, &replacement] { let _ = fs::remove_dir_all(path); fs::create_dir_all(path).unwrap(); }
+		let (mut app, mut rx) = app(&old).await;
+		let staged_id = app.next_tab_id;
+		app.begin_restore(session(0, vec![TabState {
+			cwd: replacement.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new(),
+		}])).unwrap();
+		app.tx.send(Event::Loaded {
+			tab: staged_id, path: replacement.canonicalize().unwrap(), ticket: 0,
+			result: Err(io::Error::other("startup failure")), done: true,
+		}).unwrap();
+		let error = app.finish_startup_restore(&mut rx).await.unwrap_err();
+		assert!(error.to_string().contains("startup failure"));
+		for path in [old, replacement] { fs::remove_dir_all(path).unwrap(); }
 	}
 
 	fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -1606,6 +1832,54 @@ mod tests {
 		assert!(App::validate_dds_message(Some(41), 7, &supported, &broadcast).is_ok(), "ordinary subscribed broadcasts are not parent control messages");
 	}
 
+	#[test]
+	fn controlled_tuzi_fully_validates_restore_state_from_its_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-restore-state-auth");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir(&root).unwrap();
+		let supported = HashSet::from(["restore-state".into()]);
+		let payload = |sender, data| dds::Payload {
+			receiver: 7,
+			sender,
+			body: Body::Custom { kind: "restore-state".into(), data },
+		};
+		let valid = serde_json::json!({
+			"version": 1, "active_tab": 0,
+			"tabs": [{ "cwd": root.clone(), "cursor": null, "selection": [], "expanded": [] }]
+		});
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, valid.clone())).is_ok());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(42, valid)).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, serde_json::json!({
+			"version": 1, "active_tab": 0, "tabs": []
+		}))).is_err());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn restore_state_registry_message_starts_the_atomic_executor() {
+		let old = std::env::temp_dir().join("tuzi-app-test-dds-restore-old");
+		let replacement = std::env::temp_dir().join("tuzi-app-test-dds-restore-new");
+		for path in [&old, &replacement] { let _ = fs::remove_dir_all(path); fs::create_dir(path).unwrap(); }
+		let (mut app, mut rx) = app(&old).await;
+		let body = Body::Custom {
+			kind: "restore-state".into(),
+			data: serde_json::json!({
+				"version": 1, "active_tab": 0,
+				"tabs": [{ "cwd": replacement.clone(), "cursor": null, "selection": [], "expanded": [] }]
+			}),
+		};
+		for command in app.pubsub.deliver(&body) { app.execute(command); }
+		assert!(app.staged_session.is_some());
+		pump_restore(&mut app, &mut rx).await;
+		assert_eq!(app.active_tab().tree.root.path, replacement.canonicalize().unwrap());
+		for path in [old, replacement] { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[test]
+	fn app_advertises_both_state_operations() {
+		assert_eq!(App::new_registry().abilities(), ["restore-state", "set-state"]);
+	}
+
 	#[tokio::test]
 	async fn the_app_peer_sends_and_receives_dds_messages_through_the_event_loop() {
 		let root = std::env::temp_dir().join("tuzi-app-test-dds-peer");
@@ -1626,7 +1900,7 @@ mod tests {
 				&& peers.len() >= 2
 			{
 				let abilities = &peers.iter().find(|peer| peer.id == app_peer).unwrap().abilities;
-				assert_eq!(abilities, &["set-state"], "the App advertises its Registry snapshot instead of '*'");
+				assert_eq!(abilities, &["restore-state", "set-state"], "the App advertises its Registry snapshot instead of '*'");
 				break;
 			}
 		}

@@ -2,7 +2,7 @@ use std::{ffi::OsString, io, path::PathBuf, process::ExitCode};
 
 use tuzi::{
 	app,
-	config::{Config, LoadOptions, RuntimeConfigSource},
+	config::{Config, LoadOptions, RuntimeConfigSource, load_runtime_state},
 	dds,
 	keymap::Keymap,
 	theme::Theme,
@@ -20,8 +20,8 @@ Arguments:
 Options:
       --config-dir <DIR>  Use a custom configuration directory
       --no-config         Ignore all user configuration
-      --runtime-config <JSON>       Apply process-local config/keymap JSON (repeatable)
-      --runtime-config-file <FILE>  Apply process-local config/keymap JSON file (repeatable)
+      --runtime-config <JSON>       Apply process-local config/keymap/state JSON (repeatable)
+      --runtime-config-file <FILE>  Apply process-local config/keymap/state JSON file (repeatable)
       --dds-parent <ID>   DDS controller peer for a managed launch
       --dds-token <TOKEN> Correlation token paired with --dds-parent
   -h, --help     Print help
@@ -162,16 +162,16 @@ async fn main() -> ExitCode {
 			println!("tuzi {}", env!("CARGO_PKG_VERSION"));
 			ExitCode::SUCCESS
 		}
-		Ok(Cli::Run { path, config, dds_launch }) => match Config::load(&config).and_then(|behavior| Keymap::load(&config).and_then(|keymap| Theme::load(&config).map(|theme| (behavior, keymap, theme)))) {
+		Ok(Cli::Run { path, config, dds_launch }) => match Config::load(&config).and_then(|behavior| Keymap::load(&config).and_then(|keymap| Theme::load(&config).and_then(|theme| load_runtime_state(&config).map(|state| (behavior, keymap, theme, state))))) {
 			Err(error) => {
 				eprintln!("tuzi: {error}");
 				ExitCode::FAILURE
 			},
-			Ok((config, _, _)) if config.dds.open == tuzi::config::DdsOpen::Parent && dds_launch.is_none() => {
+			Ok((config, _, _, _)) if config.dds.open == tuzi::config::DdsOpen::Parent && dds_launch.is_none() => {
 				eprintln!("tuzi: dds.open=parent requires a controlled DDS launch");
 				ExitCode::FAILURE
 			}
-			Ok((config, keymap, theme)) => match app::App::serve(path, config, keymap, theme, dds_launch).await {
+			Ok((config, keymap, theme, state)) => match app::App::serve(path, config, keymap, theme, state, dds_launch).await {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("tuzi: {error}");

@@ -17,6 +17,7 @@ mod preview;
 mod process;
 mod runner;
 mod scheduler;
+pub mod session_state;
 mod status;
 mod tasks;
 pub mod theme;

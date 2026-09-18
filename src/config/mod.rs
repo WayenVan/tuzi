@@ -190,12 +190,26 @@ pub(crate) fn runtime_documents(options: &LoadOptions) -> Result<Vec<(String, se
 		let document = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
 			.map_err(|error| format!("invalid {origin}: {error}"))?;
 		for key in document.keys() {
-			if !matches!(key.as_str(), "config" | "keymap") {
+			if !matches!(key.as_str(), "config" | "keymap" | "state") {
 				return Err(format!("invalid {origin}: unknown top-level key '{key}'"));
 			}
 		}
 		Ok((origin, document))
 	}).collect()
+}
+
+/// Reads the last session snapshot present in the ordered runtime documents.
+/// Config and keymap keep their overlay behavior; state is a whole value and
+/// therefore replaces any earlier state document.
+pub fn load_runtime_state(options: &LoadOptions) -> Result<Option<crate::session_state::SessionState>, String> {
+	let mut state = None;
+	for (origin, document) in runtime_documents(options)? {
+		if let Some(value) = document.get("state") {
+			state = Some(serde_json::from_value(value.clone())
+				.map_err(|error| format!("invalid {origin} state: {error}"))?);
+		}
+	}
+	Ok(state)
 }
 
 /// Shared file discovery for all configuration documents. Keymap and theme
@@ -517,6 +531,33 @@ mod tests {
 		let config = Config::load(&options).unwrap();
 		assert_eq!(config.dds.open, DdsOpen::Local, "later documents win");
 		assert_eq!(config.dds.broadcast, ["hover"]);
+	}
+
+	#[test]
+	fn runtime_state_uses_the_last_document_that_contains_state() {
+		let options = LoadOptions {
+			no_config: true,
+			runtime_config: vec![
+				RuntimeConfigSource::Inline(r#"{"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/first","cursor":null,"selection":[],"expanded":[]}]}}"#.into()),
+				RuntimeConfigSource::Inline(r#"{"config":{}}"#.into()),
+				RuntimeConfigSource::Inline(r#"{"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/last","cursor":null,"selection":[],"expanded":[]}]}}"#.into()),
+			],
+			..Default::default()
+		};
+		let state = load_runtime_state(&options).unwrap().unwrap();
+		assert_eq!(state.tabs[0].cwd, PathBuf::from("/last"));
+	}
+
+	#[test]
+	fn runtime_state_rejects_unknown_snapshot_fields() {
+		let options = LoadOptions {
+			no_config: true,
+			runtime_config: vec![RuntimeConfigSource::Inline(
+				r#"{"state":{"version":1,"active_tab":0,"tabs":[],"extra":true}}"#.into(),
+			)],
+			..Default::default()
+		};
+		assert!(load_runtime_state(&options).is_err());
 	}
 
 	#[test]

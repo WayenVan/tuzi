@@ -60,6 +60,7 @@ impl App {
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
 			Command::SetState { path, selection } => self.set_state(path, selection),
+			Command::RestoreState(state) => self.restore_state(state),
 			Command::Emit { kind, data } => self.emit(Body::Custom { kind, data }),
 		}
 		self.drain_tab_notices();
@@ -71,7 +72,9 @@ impl Dispatcher {
 		match event {
 			Event::Redraw => {}
 			Event::Changed { tab, path } => {
-				if let Some(t) = app.tab_mut(tab) {
+				if let Some(t) = app.staged_tab_mut(tab) {
+					t.on_changed(path);
+				} else if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
 				}
 			}
@@ -81,7 +84,9 @@ impl Dispatcher {
 						app.forget_clipboard_path(path);
 					}
 				}
-				if let Some(t) = app.tab_mut(tab) {
+				if let Some(t) = app.staged_tab_mut(tab) {
+					t.on_files_changed(parent, changes);
+				} else if let Some(t) = app.tab_mut(tab) {
 					t.on_files_changed(parent, changes);
 				}
 			}
@@ -92,7 +97,9 @@ impl Dispatcher {
 				result,
 				done,
 			} => {
-				if let Some(t) = app.tab_mut(tab) {
+				if app.is_staged_tab(tab) {
+					app.on_staged_loaded(tab, path, ticket, result, done);
+				} else if let Some(t) = app.tab_mut(tab) {
 					t.on_loaded(path, ticket, result, done);
 				}
 			}

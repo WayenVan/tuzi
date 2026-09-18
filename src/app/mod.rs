@@ -4,6 +4,7 @@ mod external;
 mod input;
 mod path_history;
 mod render;
+mod restore;
 mod tab;
 mod visible_projection;
 
