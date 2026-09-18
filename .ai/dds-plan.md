@@ -164,7 +164,9 @@ impl Registry {
 `Command`），`Client` 只服务 `tuzi emit`/`tuzi sub` 这两个不跑 TUI 的
 独立 CLI 调用。交互式的 `App` 目前不持有 `Client`，也就是说**正在运行
 的 TUI 还没有接入 socket，收不到别的实例/`tuzi emit` 发来的消息**——
-这是刻意搁置的集成工作，见下面「尚待确认事项」。
+这是 P4 要补上的集成工作（见下面「实施阶段」），ability 策略已定为
+方案 A：`App` 用通配符 `dds::WILDCARD_ABILITY` 声明，照单全收交给本地
+`Registry.deliver` 按 kind 过滤。
 
 ### 跨实例传输（P3 已实现，见下面「实施阶段」的细节）
 
