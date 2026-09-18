@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::tasks::TaskKind;
+use crate::session_state::SessionState;
 
 use super::PeerId;
 
@@ -24,6 +25,16 @@ pub enum Body {
 	/// Requests that the controlling parent open these paths in its host.
 	/// This message is point-to-point and is never an implicit broadcast.
 	Open { paths: Vec<PathBuf> },
+	/// A parent requests a restorable snapshot from one controlled Tuzi.
+	GetState { query_id: u64 },
+	/// Requests the live tab IDs and roots without constructing a session snapshot.
+	GetTabs { query_id: u64 },
+	/// Successful and failed replies are point-to-point to the parent.
+	State { query_id: u64, state: SessionState },
+	StateError { query_id: u64, error: String },
+	Tabs { query_id: u64, active_tab_id: usize, tabs: Vec<TabInfo> },
+	/// Restorable snapshot sent to the controlling parent during a graceful exit.
+	SessionEnd { state: SessionState },
 	Cd { path: PathBuf },
 	Hover { path: Option<PathBuf> },
 	Yank { paths: Vec<PathBuf>, cut: bool },
@@ -37,7 +48,13 @@ pub enum Body {
 
 /// Built-in kind names, reserved so `emit` can't be used to spoof one of
 /// them.
-pub const BUILTIN_KINDS: &[&str] = &["join", "sync", "attach", "open", "cd", "hover", "yank", "renamed", "task-done"];
+pub const BUILTIN_KINDS: &[&str] = &["join", "sync", "attach", "open", "get-state", "get-tabs", "state", "state-error", "tabs", "session-end", "cd", "hover", "yank", "renamed", "task-done"];
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TabInfo {
+	pub id: usize,
+	pub cwd: PathBuf,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -52,6 +69,12 @@ impl Body {
 			Body::Sync { .. } => "sync",
 			Body::Attach { .. } => "attach",
 			Body::Open { .. } => "open",
+			Body::GetState { .. } => "get-state",
+			Body::GetTabs { .. } => "get-tabs",
+			Body::State { .. } => "state",
+			Body::StateError { .. } => "state-error",
+			Body::Tabs { .. } => "tabs",
+			Body::SessionEnd { .. } => "session-end",
 			Body::Cd { .. } => "cd",
 			Body::Hover { .. } => "hover",
 			Body::Yank { .. } => "yank",
@@ -74,6 +97,8 @@ mod tests {
 		assert_eq!(Body::Join { abilities: Vec::new() }.kind(), "join");
 		assert_eq!(Body::Sync { peers: Vec::new() }.kind(), "sync");
 		assert_eq!(Body::Attach { token: String::new() }.kind(), "attach");
+		assert_eq!(serde_json::to_value(Body::GetState { query_id: 9 }).unwrap(), serde_json::json!({ "GetState": { "query_id": 9 } }));
+		assert_eq!(Body::StateError { query_id: 9, error: "gone".into() }.kind(), "state-error");
 		assert!(!BUILTIN_KINDS.iter().any(|kind| matches!(*kind, "hi" | "hey" | "ready")));
 	}
 }

@@ -51,7 +51,8 @@ poll_interval_ms = 1000
 enabled = true
 # auto: parent when controlled, otherwise local; local/parent force a route.
 open = "auto"
-# Implicit App events are private by default. Add any of:
+# Implicit App events go to a subscribed controlling parent, if present.
+# Add kinds here only to broadcast them publicly to other DDS peers:
 # "cd", "hover", "yank", "renamed", "task-done".
 broadcast = []
 

@@ -72,15 +72,28 @@ pub struct App {
 pub(super) struct ControllerLink {
 	pub launch: dds::DdsLaunch,
 	pub online: bool,
+	pub abilities: HashSet<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IncomingState {
+struct IncomingTabUpdate {
 	#[serde(default)]
 	path:      Option<PathBuf>,
 	#[serde(default)]
 	selection: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingReveal {
+	path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingSwitchTab {
+	tab_id: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,7 +137,7 @@ impl App {
 
 		let initial_path = state.as_ref().map_or(path, |state| state.tabs[0].cwd.clone());
 		let first = Tab::open_configured(0, initial_path, tx.clone(), config.clone())?;
-		let controller = dds_launch.clone().map(|launch| ControllerLink { launch, online: true });
+		let controller = dds_launch.clone().map(|launch| ControllerLink { launch, online: true, abilities: HashSet::new() });
 		let mut app = Self {
 			config: config.clone(),
 			tabs: vec![first],
@@ -200,6 +213,16 @@ impl App {
 			app.render(terminal.terminal())?;
 		}
 
+		// Give the parent the final restorable view before the DDS client exits.
+		if let (Some(controller), Some(client)) = (&app.controller, app.dds_client.take()) {
+			if controller.online {
+				if let Ok(state) = app.snapshot_state() {
+					client.publish_to(controller.launch.parent, Body::SessionEnd { state });
+				}
+			}
+			let _ = tokio::time::timeout(std::time::Duration::from_millis(500), client.flush()).await;
+		}
+
 		Ok(())
 	}
 
@@ -227,7 +250,7 @@ impl App {
 
 	fn validate_dds_message(parent: Option<dds::PeerId>, self_id: dds::PeerId, supported: &HashSet<String>, payload: &dds::Payload) -> Result<(), String> {
 		let Some(parent) = parent else { return Ok(()) };
-		let is_control = payload.receiver == self_id || matches!(payload.body.kind(), "set-state" | "restore-state");
+		let is_control = payload.receiver == self_id || matches!(payload.body.kind(), "update-tab" | "switch-tab" | "restore-state" | "reveal" | "get-state" | "get-tabs");
 		if !is_control { return Ok(()) }
 		if payload.sender != parent {
 			return Err(format!("rejected DDS control message from unauthorized peer {}", payload.sender));
@@ -236,12 +259,30 @@ impl App {
 		if !supported.contains(kind) && !supported.contains(dds::WILDCARD_ABILITY) {
 			return Err(format!("rejected unsupported DDS control operation '{kind}'"));
 		}
-		if kind == "set-state" {
+		if matches!(kind, "update-tab" | "switch-tab" | "restore-state" | "reveal" | "get-state" | "get-tabs") && payload.receiver != self_id {
+			return Err(format!("rejected broadcast DDS {kind} request"));
+		}
+		if kind == "update-tab" {
 			let Body::Custom { data, .. } = &payload.body else {
-				return Err("rejected malformed DDS set-state message".into());
+				return Err("rejected malformed DDS update-tab message".into());
 			};
-			serde_json::from_value::<IncomingState>(data.clone())
-				.map_err(|error| format!("rejected invalid DDS set-state content: {error}"))?;
+			serde_json::from_value::<IncomingTabUpdate>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS update-tab content: {error}"))?;
+		} else if kind == "switch-tab" {
+			let Body::Custom { data, .. } = &payload.body else {
+				return Err("rejected malformed DDS switch-tab message".into());
+			};
+			serde_json::from_value::<IncomingSwitchTab>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS switch-tab content: {error}"))?;
+		} else if kind == "reveal" {
+			let Body::Custom { data, .. } = &payload.body else {
+				return Err("rejected malformed DDS reveal message".into());
+			};
+			let reveal = serde_json::from_value::<IncomingReveal>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS reveal content: {error}"))?;
+			if !reveal.path.is_absolute() {
+				return Err("rejected invalid DDS reveal content: path must be absolute".into());
+			}
 		} else if kind == "restore-state" {
 			let Body::Custom { data, .. } = &payload.body else {
 				return Err("rejected malformed DDS restore-state message".into());
@@ -263,18 +304,54 @@ impl App {
 
 	pub(super) fn update_controller_peers(&mut self, peers: &[dds::PeerInfo]) {
 		let Some(controller) = &mut self.controller else { return };
-		controller.online = peers.iter().any(|peer| peer.id == controller.launch.parent);
+		let parent = peers.iter().find(|peer| peer.id == controller.launch.parent);
+		controller.online = parent.is_some();
+		controller.abilities = parent.map_or_else(HashSet::new, |peer| peer.abilities.iter().cloned().collect());
 	}
 
 	fn new_registry() -> dds::Registry {
 		let mut registry = dds::Registry::new();
 		registry.sub(
 			"core",
-			"set-state",
+			"get-state",
+			Box::new(|body| {
+				let Body::GetState { query_id } = body else { return Vec::new() };
+				vec![crate::command::Command::GetState { query_id: *query_id }]
+			}),
+		);
+		registry.sub(
+			"core",
+			"get-tabs",
+			Box::new(|body| {
+				let Body::GetTabs { query_id } = body else { return Vec::new() };
+				vec![crate::command::Command::GetTabs { query_id: *query_id }]
+			}),
+		);
+		registry.sub(
+			"core",
+			"update-tab",
 			Box::new(|body| {
 				let Body::Custom { data, .. } = body else { return Vec::new() };
-				let Ok(state) = serde_json::from_value::<IncomingState>(data.clone()) else { return Vec::new() };
-				vec![crate::command::Command::SetState { path: state.path, selection: state.selection }]
+				let Ok(state) = serde_json::from_value::<IncomingTabUpdate>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::UpdateTab { path: state.path, selection: state.selection }]
+			}),
+		);
+		registry.sub(
+			"core",
+			"switch-tab",
+			Box::new(|body| {
+				let Body::Custom { data, .. } = body else { return Vec::new() };
+				let Ok(target) = serde_json::from_value::<IncomingSwitchTab>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::SwitchTabTo(target.tab_id)]
+			}),
+		);
+		registry.sub(
+			"core",
+			"reveal",
+			Box::new(|body| {
+				let Body::Custom { data, .. } = body else { return Vec::new() };
+				let Ok(reveal) = serde_json::from_value::<IncomingReveal>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::Reveal(reveal.path)]
 			}),
 		);
 		registry.sub(
@@ -623,6 +700,14 @@ impl App {
 		self.active = self.tabs[next].id;
 	}
 
+	pub fn switch_tab_to(&mut self, id: usize) {
+		if self.tabs.iter().any(|tab| tab.id == id) {
+			self.active = id;
+		} else {
+			self.active_tab_mut().raise(NoticeLevel::Warn, format!("Tab {id} no longer exists"));
+		}
+	}
+
 	/// Quits outright when nothing's running; otherwise arms a confirmation
 	/// instead of just doing it — see `pending_quit`.
 	pub fn request_quit(&mut self) {
@@ -670,14 +755,19 @@ impl App {
 		self.publish(Body::Yank { paths: self.clipboard.clone(), cut });
 	}
 
-	/// Publishes an implicit App event locally and, when explicitly allowed
-	/// by `dds.broadcast`, to remote peers.
+	/// Publishes an implicit event locally. An explicit broadcast rule makes
+	/// it public; otherwise an interested controlling parent receives it
+	/// directly. Only one external route is used for each event.
 	pub(super) fn publish(&self, body: Body) {
 		let _ = self.tx.send(Event::DdsDeliver(body.clone()));
-		if self.config.dds.broadcast.iter().any(|kind| kind == body.kind())
-			&& let Some(client) = &self.dds_client
-		{
+		let Some(client) = &self.dds_client else { return };
+		if self.config.dds.broadcast.iter().any(|kind| kind == body.kind()) {
 			client.publish(body);
+		} else if let Some(controller) = &self.controller
+			&& controller.online
+			&& (controller.abilities.contains(body.kind()) || controller.abilities.contains(dds::WILDCARD_ABILITY))
+		{
+			client.publish_to(controller.launch.parent, body);
 		}
 	}
 
@@ -690,7 +780,7 @@ impl App {
 		}
 	}
 
-	pub(super) fn set_state(&mut self, path: Option<PathBuf>, selection: Vec<PathBuf>) {
+	pub(super) fn update_tab(&mut self, path: Option<PathBuf>, selection: Vec<PathBuf>) {
 		if let Some(path) = path
 			&& let Err(error) = self.active_tab_mut().cd(path)
 		{
@@ -704,6 +794,12 @@ impl App {
 		self.active_tab_mut().set_selection(selection);
 	}
 
+	pub(super) fn reveal_path(&mut self, path: PathBuf) {
+		if let Err(error) = self.active_tab_mut().reveal(path) {
+			self.active_tab_mut().raise(NoticeLevel::Error, format!("Cannot reveal path: {error}"));
+		}
+	}
+
 	pub(super) fn restore_state(&mut self, state: crate::session_state::SessionState) {
 		if let Err(error) = self.begin_restore(state) {
 			self.notices.push(Notice::new(
@@ -712,6 +808,32 @@ impl App {
 				std::time::Duration::from_secs(8),
 			));
 		}
+	}
+
+	pub(super) fn snapshot_state(&self) -> Result<crate::session_state::SessionState, String> {
+		let active_tab = self.tabs.iter().position(|tab| tab.id == self.active)
+			.ok_or_else(|| "active tab is missing".to_owned())?;
+		let state = crate::session_state::SessionState {
+			version: crate::session_state::SESSION_STATE_VERSION,
+			active_tab,
+			tabs: self.tabs.iter().map(Tab::snapshot_state).collect(),
+		};
+		crate::session_state::validate_and_normalize(state)
+	}
+
+	pub(super) fn reply_state(&self, query_id: u64) {
+		let (Some(controller), Some(client)) = (&self.controller, &self.dds_client) else { return };
+		let body = match self.snapshot_state() {
+			Ok(state) => Body::State { query_id, state },
+			Err(error) => Body::StateError { query_id, error },
+		};
+		client.publish_to(controller.launch.parent, body);
+	}
+
+	pub(super) fn reply_tabs(&self, query_id: u64) {
+		let (Some(controller), Some(client)) = (&self.controller, &self.dds_client) else { return };
+		let tabs = self.tabs.iter().map(|tab| dds::TabInfo { id: tab.id, cwd: tab.tree.root.path.clone() }).collect();
+		client.publish_to(controller.launch.parent, Body::Tabs { query_id, active_tab_id: self.active, tabs });
 	}
 
 	pub fn request_delete(&mut self, mode: DeleteMode) {
@@ -1776,7 +1898,7 @@ mod tests {
 		let (mut app, _rx) = app(&root).await;
 		Arc::make_mut(&mut app.config).dds.open = DdsOpen::Parent;
 		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
-		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "open-test".into()).unwrap(), online: true });
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "open-test".into()).unwrap(), online: true, abilities: HashSet::new() });
 
 		app.open_selected(false);
 		let opened = loop {
@@ -1809,7 +1931,7 @@ mod tests {
 		app.open_selected(false);
 		assert_eq!(app.active_tab().pending_notice.as_ref().map(|(_, message)| message.as_str()), Some("open requires a controlling parent"));
 
-		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(99, "offline".into()).unwrap(), online: false });
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(99, "offline".into()).unwrap(), online: false, abilities: HashSet::new() });
 		app.open_selected(false);
 		assert_eq!(app.active_tab().pending_notice.as_ref().map(|(_, message)| message.as_str()), Some("controller unavailable"));
 
@@ -1817,19 +1939,26 @@ mod tests {
 	}
 
 	#[test]
-	fn controlled_tuzi_accepts_set_state_only_from_its_parent() {
-		let supported = HashSet::from(["set-state".into()]);
+	fn controlled_tuzi_accepts_tab_updates_only_from_its_parent() {
+		let supported = HashSet::from(["update-tab".into()]);
 		let state = |sender, data| dds::Payload {
 			receiver: 7,
 			sender,
-			body: Body::Custom { kind: "set-state".into(), data },
+			body: Body::Custom { kind: "update-tab".into(), data },
 		};
 		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(41, serde_json::json!({}))).is_ok());
 		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(42, serde_json::json!({}))).is_err());
 		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(41, serde_json::json!({ "unknown": true }))).is_err());
+		let mut broadcast_update = state(41, serde_json::json!({}));
+		broadcast_update.receiver = 0;
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &broadcast_update).is_err());
 		assert!(App::validate_dds_message(None, 7, &supported, &state(42, serde_json::Value::Null)).is_ok(), "an independent Tuzi keeps its normal subscription behavior");
 		let broadcast = dds::Payload { receiver: 0, sender: 42, body: Body::Hover { path: None } };
 		assert!(App::validate_dds_message(Some(41), 7, &supported, &broadcast).is_ok(), "ordinary subscribed broadcasts are not parent control messages");
+		let switch = dds::Payload { receiver: 7, sender: 41, body: Body::Custom { kind: "switch-tab".into(), data: serde_json::json!({ "tab_id": 2 }) } };
+		let supported_switch = HashSet::from(["switch-tab".into()]);
+		assert!(App::validate_dds_message(Some(41), 7, &supported_switch, &switch).is_ok());
+		assert!(App::validate_dds_message(Some(42), 7, &supported_switch, &switch).is_err());
 	}
 
 	#[test]
@@ -1855,6 +1984,130 @@ mod tests {
 		fs::remove_dir_all(root).unwrap();
 	}
 
+	#[test]
+	fn controlled_tuzi_validates_reveal_sender_and_path() {
+		let supported = HashSet::from(["reveal".into()]);
+		let payload = |sender, data| dds::Payload {
+			receiver: 7,
+			sender,
+			body: Body::Custom { kind: "reveal".into(), data },
+		};
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, serde_json::json!({ "path": "/tmp/file" }))).is_ok());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(42, serde_json::json!({ "path": "/tmp/file" }))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, serde_json::json!({ "path": "relative" }))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, serde_json::json!({ "path": "/tmp/file", "extra": true }))).is_err());
+	}
+
+	#[test]
+	fn controlled_tuzi_accepts_get_state_only_from_its_parent_as_a_direct_request() {
+		let supported = HashSet::from(["get-state".into()]);
+		let payload = |sender, receiver| dds::Payload { sender, receiver, body: Body::GetState { query_id: 42 } };
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 7)).is_ok());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(42, 7)).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 0)).is_err());
+	}
+
+	#[tokio::test]
+	async fn current_session_snapshot_round_trips_through_restore_validation() {
+		let root = std::env::temp_dir().join("tuzi-app-test-current-session-snapshot");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("nested")).unwrap();
+		fs::write(root.join("nested/file.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let target = root.join("nested/file.txt");
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().reveal(target.clone()).unwrap();
+		while app.active_tab().visible_at(app.active_tab().cursor).is_none_or(|(_, node)| node.path != target) {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			Dispatcher::dispatch_event(&mut app, event);
+		}
+		app.tabs[0].selection.insert(target.clone());
+		app.new_tab();
+		let state = app.snapshot_state().unwrap();
+		assert_eq!(state.active_tab, 1);
+		assert_eq!(state.tabs.len(), 2);
+		assert_eq!(state.tabs[0].cursor, Some(target.clone()));
+		assert_eq!(state.tabs[0].selection, [target]);
+		assert_eq!(state.tabs[0].expanded, [root.join("nested")]);
+		assert_eq!(crate::session_state::validate_and_normalize(state.clone()).unwrap(), state);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn get_state_request_returns_a_direct_snapshot_to_the_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-dds-get-state");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let socket_path = root.join("dds.sock");
+		let (parent, mut inbox) = dds::Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "query".into()).unwrap(), online: true, abilities: HashSet::new() });
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), Some(parent.id())).await.unwrap());
+		let app_id = app.dds_client.as_ref().unwrap().id();
+		loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::Sync { ref peers } if peers.iter().any(|peer| peer.id == app_id)) { break }
+		}
+		parent.publish_to(app_id, Body::GetState { query_id: 42 });
+		loop {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			let requested = matches!(&event, Event::DdsDeliver(Body::GetState { query_id: 42 }));
+			Dispatcher::dispatch_event(&mut app, event);
+			if requested { break }
+		}
+		let response = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::State { query_id: 42, .. }) { break payload }
+		};
+		assert_eq!(response.receiver, parent.id());
+		assert_eq!(response.sender, app_id);
+		let Body::State { state, .. } = response.body else { unreachable!() };
+		assert_eq!(state.tabs[0].cwd, root.canonicalize().unwrap());
+		app.new_tab();
+		let second_id = app.active;
+		parent.publish_to(app_id, Body::GetTabs { query_id: 43 });
+		loop {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			let requested = matches!(&event, Event::DdsDeliver(Body::GetTabs { query_id: 43 }));
+			Dispatcher::dispatch_event(&mut app, event);
+			if requested { break }
+		}
+		let response = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::Tabs { query_id: 43, .. }) { break payload }
+		};
+		assert_eq!(response.receiver, parent.id());
+		let Body::Tabs { active_tab_id, tabs, .. } = response.body else { unreachable!() };
+		assert_eq!(active_tab_id, second_id);
+		assert_eq!(tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(), vec![0, second_id]);
+		assert!(tabs.iter().all(|tab| tab.cwd == root.canonicalize().unwrap()));
+		let switch = Body::Custom { kind: "switch-tab".into(), data: serde_json::json!({ "tab_id": 0 }) };
+		for command in app.pubsub.deliver(&switch) { app.execute(command); }
+		assert_eq!(app.active, 0);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn reveal_message_expands_the_active_tab_and_reports_local_failure() {
+		let root = std::env::temp_dir().join("tuzi-app-test-dds-reveal");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("nested")).unwrap();
+		fs::write(root.join("nested/file.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let target = root.join("nested/file.txt");
+		let (mut app, mut rx) = app(&root).await;
+		let body = Body::Custom { kind: "reveal".into(), data: serde_json::json!({ "path": target }) };
+		for command in app.pubsub.deliver(&body) { app.execute(command); }
+		while app.active_tab().visible_at(app.active_tab().cursor).is_none_or(|(_, node)| node.path != target) {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			Dispatcher::dispatch_event(&mut app, event);
+		}
+		assert_eq!(app.active_tab().tree.root.path, root);
+		app.execute(Command::Reveal(root.join("missing.txt")));
+		assert!(app.notices.iter().any(|notice| notice.message.contains("Cannot reveal path")));
+		fs::remove_dir_all(root).unwrap();
+	}
+
 	#[tokio::test]
 	async fn restore_state_registry_message_starts_the_atomic_executor() {
 		let old = std::env::temp_dir().join("tuzi-app-test-dds-restore-old");
@@ -1876,8 +2129,8 @@ mod tests {
 	}
 
 	#[test]
-	fn app_advertises_both_state_operations() {
-		assert_eq!(App::new_registry().abilities(), ["restore-state", "set-state"]);
+	fn app_advertises_its_control_operations() {
+		assert_eq!(App::new_registry().abilities(), ["get-state", "get-tabs", "restore-state", "reveal", "switch-tab", "update-tab"]);
 	}
 
 	#[tokio::test]
@@ -1900,7 +2153,7 @@ mod tests {
 				&& peers.len() >= 2
 			{
 				let abilities = &peers.iter().find(|peer| peer.id == app_peer).unwrap().abilities;
-				assert_eq!(abilities, &["restore-state", "set-state"], "the App advertises its Registry snapshot instead of '*'");
+				assert_eq!(abilities.iter().map(String::as_str).collect::<HashSet<_>>(), HashSet::from(["get-state", "get-tabs", "restore-state", "reveal", "switch-tab", "update-tab"]), "the App advertises its Registry snapshot instead of '*'");
 				break;
 			}
 		}
@@ -1929,7 +2182,7 @@ mod tests {
 		}
 
 		remote.publish(Body::Custom {
-			kind: "set-state".into(),
+			kind: "update-tab".into(),
 			data: serde_json::json!({ "selection": ["selected.txt", "missing.txt"] }),
 		});
 		while !app.active_tab().selection.contains(&root.join("selected.txt")) {
@@ -1937,7 +2190,7 @@ mod tests {
 			Dispatcher::dispatch_event(&mut app, event);
 		}
 
-		assert!(app.active_tab().selection.contains(&root.join("selected.txt")), "the remote message entered Event::DdsDeliver and produced SetState");
+		assert!(app.active_tab().selection.contains(&root.join("selected.txt")), "the remote message entered Event::DdsDeliver and produced UpdateTab");
 		assert!(!app.active_tab().selection.contains(&root.join("missing.txt")), "missing paths are ignored");
 		drop(remote);
 		drop(app);
@@ -1945,8 +2198,65 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn controlled_implicit_events_use_parent_or_explicit_broadcast_once() {
+		let root = std::env::temp_dir().join("tuzi-app-test-dds-parent-events");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let socket_path = root.join("dds.sock");
+		let (parent, mut parent_inbox) = dds::Client::connect(&socket_path, vec!["hover".into()]).await.unwrap();
+		let (_observer, mut observer_inbox) = dds::Client::connect(&socket_path, vec![dds::WILDCARD_ABILITY.into()]).await.unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "events".into()).unwrap(), online: true, abilities: HashSet::new() });
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), Some(parent.id())).await.unwrap());
+		while !app.controller.as_ref().unwrap().abilities.contains("hover") {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			Dispatcher::dispatch_event(&mut app, event);
+		}
+		app.publish(Body::Cd { path: root.clone() });
+		assert!(tokio::time::timeout(std::time::Duration::from_millis(100), async {
+			while let Some(payload) = parent_inbox.recv().await {
+				if payload.body.kind() == "cd" { return }
+			}
+		}).await.is_err(), "the parent did not subscribe to cd");
+
+		let hover = Body::Hover { path: Some(root.join("file.txt")) };
+		app.publish(hover.clone());
+		let directed = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
+			if payload.body.kind() == "hover" { break payload }
+		};
+		assert_eq!(directed.receiver, parent.id());
+		assert_eq!(directed.body, hover);
+		assert!(tokio::time::timeout(std::time::Duration::from_millis(100), async {
+			while let Some(payload) = observer_inbox.recv().await {
+				if payload.body.kind() == "hover" { return }
+			}
+		}).await.is_err(), "an observer must not see a parent-only event");
+
+		Arc::make_mut(&mut app.config).dds.broadcast.push("hover".into());
+		app.publish(hover.clone());
+		let public_for_parent = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
+			if payload.body.kind() == "hover" { break payload }
+		};
+		let public_for_observer = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), observer_inbox.recv()).await.unwrap().unwrap();
+			if payload.body.kind() == "hover" { break payload }
+		};
+		assert_eq!(public_for_parent.receiver, 0);
+		assert_eq!(public_for_observer.receiver, 0);
+		assert_eq!(public_for_parent.body, hover);
+		assert!(tokio::time::timeout(std::time::Duration::from_millis(100), parent_inbox.recv()).await.is_err(), "broadcast must not also send a direct copy");
+
+		app.update_controller_peers(&[]);
+		assert!(!app.controller.as_ref().unwrap().online);
+		assert!(app.controller.as_ref().unwrap().abilities.is_empty());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn set_state_can_change_directory_and_resolve_relative_selections() {
-		let root = std::env::temp_dir().join("tuzi-app-test-set-state-path");
+		let root = std::env::temp_dir().join("tuzi-app-test-update-tab-path");
 		let _ = fs::remove_dir_all(&root);
 		fs::create_dir_all(root.join("next")).unwrap();
 		fs::write(root.join("next/keep.txt"), b"").unwrap();
@@ -1957,7 +2267,7 @@ mod tests {
 		Dispatcher::dispatch_event(
 			&mut app,
 			Event::DdsDeliver(Body::Custom {
-				kind: "set-state".into(),
+				kind: "update-tab".into(),
 				data: serde_json::json!({
 					"path": next,
 					"selection": ["keep.txt", "gone.txt"]

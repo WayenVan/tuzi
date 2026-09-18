@@ -7,7 +7,7 @@ mod payload;
 mod registry;
 mod transport;
 
-pub use body::{BUILTIN_KINDS, Body, PeerInfo};
+pub use body::{BUILTIN_KINDS, Body, PeerInfo, TabInfo};
 pub use launch::{DdsLaunch, MAX_LAUNCH_TOKEN_BYTES};
 pub use payload::{Payload, PeerId, socket_path};
 pub use registry::Registry;

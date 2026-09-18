@@ -77,8 +77,9 @@ pub struct Watcher { pub debounce_ms: u64, pub max_wait_ms: u64, pub poll_interv
 pub struct Dds {
 	pub enabled:   bool,
 	pub open:      DdsOpen,
-	/// Implicit built-in App events allowed to leave this process. Explicit
-	/// `emit` commands are governed only by `enabled`.
+	/// Implicit built-in App events explicitly made public to all interested
+	/// DDS peers. Other implicit events go only to an interested controlling
+	/// parent, if present. Explicit `emit` is governed only by `enabled`.
 	pub broadcast: Vec<String>,
 }
 
@@ -571,7 +572,7 @@ mod tests {
 	#[test]
 	fn dds_rejects_unknown_implicit_broadcast_kinds() {
 		let mut config = Config::default();
-		config.dds.broadcast.push("set-state".into());
+		config.dds.broadcast.push("update-tab".into());
 		assert!(config.validate(Path::new("test.toml")).is_err());
 	}
 

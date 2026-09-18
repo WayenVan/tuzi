@@ -89,11 +89,11 @@ enum DdsCommand {
 
 	/// Bridge Neovim or another host to the Tuzi clients it controls.
 	#[command(
-		after_long_help = "Examples:\n  tu dds controller\n  tu dds controller --abilities hover,cd,renamed\n\nInput (JSON Lines):\n  {\"request_id\":1,\"op\":\"register\",\"token\":\"launch-token\"}\n  {\"request_id\":2,\"op\":\"list\"}\n  {\"request_id\":3,\"op\":\"set-state\",\"peer_id\":902,\"state\":{\"path\":\"/project\"}}"
+		after_long_help = "Examples:\n  tu dds controller\n  tu dds controller --abilities hover,cd,renamed\n\nInput (JSON Lines):\n  {\"request_id\":1,\"op\":\"register\",\"token\":\"launch-token\"}\n  {\"request_id\":2,\"op\":\"list\"}\n  {\"request_id\":3,\"op\":\"get-tabs\",\"peer_id\":902}\n  {\"request_id\":4,\"op\":\"switch-tab\",\"peer_id\":902,\"tab_id\":3}\n  {\"request_id\":5,\"op\":\"update-tab\",\"peer_id\":902,\"update\":{\"path\":\"/project\"}}"
 	)]
 	Controller {
-		/// Broadcast kinds to receive; messages from uncontrolled peers are filtered out.
-		#[arg(long, value_delimiter = ',', default_value = "hover,cd,yank,renamed,task-done", value_name = "KINDS")]
+		/// Event kinds to receive from controlled peers, including their implicit state events.
+		#[arg(long, value_delimiter = ',', default_value = "cd,yank,renamed,task-done", value_name = "KINDS")]
 		abilities: Vec<String>,
 	},
 }
@@ -152,7 +152,11 @@ enum ControllerRequest {
 	CancelRegister { request_id: u64, token: String },
 	List { request_id: u64 },
 	Detach { request_id: u64, peer_id: u64 },
-	SetState { request_id: u64, peer_id: u64, state: ControllerStatePatch },
+	UpdateTab { request_id: u64, peer_id: u64, update: TabUpdate },
+	GetState { request_id: u64, peer_id: u64 },
+	GetTabs { request_id: u64, peer_id: u64 },
+	SwitchTab { request_id: u64, peer_id: u64, tab_id: usize },
+	Reveal { request_id: u64, peer_id: u64, path: PathBuf },
 	RestoreState { request_id: u64, peer_id: u64, state: SessionState },
 	Publish {
 		request_id: u64,
@@ -164,9 +168,28 @@ enum ControllerRequest {
 	Ping { request_id: u64 },
 }
 
+impl ControllerRequest {
+	fn request_id(&self) -> u64 {
+		match self {
+			Self::Register { request_id, .. }
+			| Self::CancelRegister { request_id, .. }
+			| Self::List { request_id }
+			| Self::Detach { request_id, .. }
+			| Self::UpdateTab { request_id, .. }
+			| Self::GetState { request_id, .. }
+			| Self::GetTabs { request_id, .. }
+			| Self::SwitchTab { request_id, .. }
+			| Self::Reveal { request_id, .. }
+			| Self::RestoreState { request_id, .. }
+			| Self::Publish { request_id, .. }
+			| Self::Ping { request_id } => *request_id,
+		}
+	}
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ControllerStatePatch {
+struct TabUpdate {
 	#[serde(default)]
 	path:      Option<PathBuf>,
 	#[serde(default)]
@@ -179,10 +202,30 @@ struct ControllerState {
 	controlled: HashMap<String, u64>,
 	missing:    HashMap<u64, Instant>,
 	peers:      HashMap<u64, HashSet<String>>,
+	queries: HashMap<u64, PendingQuery>,
+	next_query_id: u64,
+}
+
+struct PendingQuery {
+	request_id: u64,
+	peer_id: u64,
+	deadline: Instant,
+	kind: QueryKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryKind { State, Tabs }
+
+impl QueryKind {
+	fn name(self) -> &'static str {
+		match self { Self::State => "get-state", Self::Tabs => "get-tabs" }
+	}
 }
 
 const PEER_LEFT_GRACE: Duration = Duration::from_millis(500);
-const CONTROLLER_PROTOCOL_VERSION: u64 = 1;
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PENDING_QUERIES: usize = 128;
+const CONTROLLER_PROTOCOL_VERSION: u64 = 2;
 
 impl ControllerState {
 	fn register(&mut self, token: String) -> Result<(), &'static str> {
@@ -255,6 +298,49 @@ impl ControllerState {
 		Ok(())
 	}
 
+	fn begin_query(&mut self, request_id: u64, peer_id: u64, kind: QueryKind, now: Instant) -> Result<u64, &'static str> {
+		if self.queries.values().any(|query| query.request_id == request_id) {
+			return Err("request_id is already pending");
+		}
+		if self.queries.len() >= MAX_PENDING_QUERIES {
+			return Err("too many pending queries");
+		}
+		let query_id = self.next_query_id.checked_add(1).ok_or("query ID space exhausted")?;
+		self.next_query_id = query_id;
+		self.queries.insert(query_id, PendingQuery { request_id, peer_id, deadline: now + QUERY_TIMEOUT, kind });
+		Ok(query_id)
+	}
+
+	fn complete_query(&mut self, query_id: u64, sender: u64, kind: QueryKind) -> Option<u64> {
+		let query = self.queries.get(&query_id)?;
+		if query.peer_id != sender || query.kind != kind { return None }
+		self.queries.remove(&query_id).map(|query| query.request_id)
+	}
+
+	fn take_expired_queries(&mut self, now: Instant) -> Vec<(u64, QueryKind)> {
+		let mut expired = Vec::new();
+		self.queries.retain(|_, query| {
+			if now >= query.deadline {
+				expired.push((query.request_id, query.kind));
+				false
+			} else { true }
+		});
+		expired.sort_unstable_by_key(|query| query.0);
+		expired
+	}
+
+	fn take_queries_for_peer(&mut self, peer_id: u64) -> Vec<(u64, QueryKind)> {
+		let mut canceled = Vec::new();
+		self.queries.retain(|_, query| {
+			if query.peer_id == peer_id {
+				canceled.push((query.request_id, query.kind));
+				false
+			} else { true }
+		});
+		canceled.sort_unstable_by_key(|query| query.0);
+		canceled
+	}
+
 	fn take_departed(&mut self, now: Instant) -> Vec<(String, u64)> {
 		let departed_ids: HashSet<_> = self.missing.iter()
 			.filter_map(|(&peer_id, &since)| (now.duration_since(since) >= PEER_LEFT_GRACE).then_some(peer_id))
@@ -296,7 +382,13 @@ async fn controller(socket: &std::path::Path, abilities: Vec<String>) -> io::Res
 			},
 			_ = lifecycle.tick() => {
 				for (token, peer_id) in state.take_departed(Instant::now()) {
+					for (request_id, kind) in state.take_queries_for_peer(peer_id) {
+						write_json_line(&mut output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": format!("peer left before {} completed", kind.name()) })).await?;
+					}
 					write_json_line(&mut output, &serde_json::json!({ "event": "tuzi-left", "token": token, "peer_id": peer_id })).await?;
+				}
+				for (request_id, kind) in state.take_expired_queries(Instant::now()) {
+					write_json_line(&mut output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": format!("{} timed out", kind.name()) })).await?;
 				}
 			},
 		}
@@ -313,6 +405,9 @@ async fn handle_controller_request(
 		Ok(request) => request,
 		Err(error) => return write_json_line(output, &serde_json::json!({ "ok": false, "error": format!("invalid request: {error}") })).await,
 	};
+	if state.queries.values().any(|query| query.request_id == request.request_id()) {
+		return write_json_line(output, &serde_json::json!({ "ok": false, "error": "request_id is already pending" })).await;
+	}
 	match request {
 		ControllerRequest::Register { request_id, token } => match state.register(token) {
 			Ok(()) => write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true })).await,
@@ -333,19 +428,62 @@ async fn handle_controller_request(
 		ControllerRequest::Detach { request_id, peer_id } => {
 			let removed = state.detach(peer_id).is_some();
 			if removed {
-				write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true })).await
+				write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true })).await?;
+				for (pending_id, kind) in state.take_queries_for_peer(peer_id) {
+					write_json_line(output, &serde_json::json!({ "request_id": pending_id, "ok": false, "error": format!("peer detached before {} completed", kind.name()) })).await?;
+				}
+				Ok(())
 			} else {
 				write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "peer_id is not controlled" })).await
 			}
 		}
-		ControllerRequest::SetState { request_id, peer_id, state: update } => {
-			if let Err(error) = state.validate_target(peer_id, "set-state") {
+		ControllerRequest::UpdateTab { request_id, peer_id, update } => {
+			if let Err(error) = state.validate_target(peer_id, "update-tab") {
 				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
 			}
 			client.publish_to(peer_id, Body::Custom {
-				kind: "set-state".into(),
+				kind: "update-tab".into(),
 				data: serde_json::json!({ "path": update.path, "selection": update.selection }),
 			});
+			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
+		}
+		ControllerRequest::GetState { request_id, peer_id } => {
+			if let Err(error) = state.validate_target(peer_id, "get-state") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			let query_id = match state.begin_query(request_id, peer_id, QueryKind::State, Instant::now()) {
+				Ok(query_id) => query_id,
+				Err(error) => return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await,
+			};
+			client.publish_to(peer_id, Body::GetState { query_id });
+			Ok(())
+		}
+		ControllerRequest::GetTabs { request_id, peer_id } => {
+			if let Err(error) = state.validate_target(peer_id, "get-tabs") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			let query_id = match state.begin_query(request_id, peer_id, QueryKind::Tabs, Instant::now()) {
+				Ok(query_id) => query_id,
+				Err(error) => return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await,
+			};
+			client.publish_to(peer_id, Body::GetTabs { query_id });
+			Ok(())
+		}
+		ControllerRequest::SwitchTab { request_id, peer_id, tab_id } => {
+			if let Err(error) = state.validate_target(peer_id, "switch-tab") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			client.publish_to(peer_id, Body::Custom { kind: "switch-tab".into(), data: serde_json::json!({ "tab_id": tab_id }) });
+			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
+		}
+		ControllerRequest::Reveal { request_id, peer_id, path } => {
+			if let Err(error) = state.validate_target(peer_id, "reveal") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			if !path.is_absolute() {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "path must be absolute" })).await;
+			}
+			client.publish_to(peer_id, Body::Custom { kind: "reveal".into(), data: serde_json::json!({ "path": path }) });
 			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
 		}
 		ControllerRequest::RestoreState { request_id, peer_id, state: snapshot } => {
@@ -359,7 +497,7 @@ async fn handle_controller_request(
 			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
 		}
 		ControllerRequest::Publish { request_id, peer_id, kind, data } => {
-			if kind.is_empty() || matches!(kind.as_str(), "set-state" | "restore-state") || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
+			if kind.is_empty() || matches!(kind.as_str(), "update-tab" | "switch-tab" | "restore-state" | "reveal") || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
 				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "kind is empty or reserved" })).await;
 			}
 			if let Err(error) = state.validate_target(peer_id, &kind) {
@@ -394,6 +532,39 @@ async fn handle_controller_payload(
 			return write_json_line(output, &serde_json::json!({ "event": "tuzi-ready", "token": token, "peer_id": payload.sender })).await;
 		}
 		return Ok(());
+	}
+	match &payload.body {
+		Body::SessionEnd { state: snapshot } => {
+			if payload.receiver == controller_id && state.controls(payload.sender) {
+				write_json_line(output, &serde_json::json!({ "event": "tuzi-exit", "peer_id": payload.sender, "state": snapshot })).await?;
+			}
+			return Ok(());
+		}
+		Body::State { query_id, state: snapshot } => {
+			if payload.receiver == controller_id
+				&& let Some(request_id) = state.complete_query(*query_id, payload.sender, QueryKind::State)
+			{
+					write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "state": snapshot })).await?;
+			}
+			return Ok(());
+		}
+		Body::StateError { query_id, error } => {
+			if payload.receiver == controller_id
+				&& let Some(request_id) = state.complete_query(*query_id, payload.sender, QueryKind::State)
+			{
+					write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await?;
+			}
+			return Ok(());
+		}
+		Body::Tabs { query_id, active_tab_id, tabs } => {
+			if payload.receiver == controller_id
+				&& let Some(request_id) = state.complete_query(*query_id, payload.sender, QueryKind::Tabs)
+			{
+				write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "active_tab_id": active_tab_id, "tabs": tabs })).await?;
+			}
+			return Ok(());
+		}
+		_ => {}
 	}
 	if state.controls(payload.sender) && !matches!(payload.body, Body::Sync { .. } | Body::Join { .. }) {
 		write_json_line(output, &serde_json::json!({
@@ -594,7 +765,7 @@ mod tests {
 
 		state.observe_peers(&[], start);
 		assert!(state.take_departed(start + PEER_LEFT_GRACE - Duration::from_millis(1)).is_empty());
-		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["set-state".into()] }], start + Duration::from_millis(250));
+		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["update-tab".into()] }], start + Duration::from_millis(250));
 		assert!(state.take_departed(start + PEER_LEFT_GRACE).is_empty(), "reappearing during failover cancels departure");
 
 		state.observe_peers(&[], start + Duration::from_secs(1));
@@ -606,7 +777,7 @@ mod tests {
 
 	#[test]
 	fn controller_protocol_uses_request_id_and_op() {
-		assert_eq!(CONTROLLER_PROTOCOL_VERSION, 1);
+		assert_eq!(CONTROLLER_PROTOCOL_VERSION, 2);
 		assert!(matches!(
 			serde_json::from_str::<ControllerRequest>(r#"{"request_id":7,"op":"register","token":"known"}"#).unwrap(),
 			ControllerRequest::Register { request_id: 7, token } if token == "known"
@@ -616,7 +787,11 @@ mod tests {
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":9,"op":"ping"}"#).unwrap(), ControllerRequest::Ping { request_id: 9 }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":10,"op":"cancel-register","token":"known"}"#).unwrap(), ControllerRequest::CancelRegister { request_id: 10, .. }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":11,"op":"detach","peer_id":42}"#).unwrap(), ControllerRequest::Detach { request_id: 11, peer_id: 42 }));
-		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":12,"op":"set-state","peer_id":42,"state":{"path":"/tmp","selection":[]}}"#).unwrap(), ControllerRequest::SetState { request_id: 12, peer_id: 42, .. }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":12,"op":"update-tab","peer_id":42,"update":{"path":"/tmp","selection":[]}}"#).unwrap(), ControllerRequest::UpdateTab { request_id: 12, peer_id: 42, .. }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":16,"op":"get-state","peer_id":42}"#).unwrap(), ControllerRequest::GetState { request_id: 16, peer_id: 42 }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":17,"op":"get-tabs","peer_id":42}"#).unwrap(), ControllerRequest::GetTabs { request_id: 17, peer_id: 42 }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":18,"op":"switch-tab","peer_id":42,"tab_id":3}"#).unwrap(), ControllerRequest::SwitchTab { request_id: 18, peer_id: 42, tab_id: 3 }));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":15,"op":"reveal","peer_id":42,"path":"/tmp/file"}"#).unwrap(), ControllerRequest::Reveal { request_id: 15, peer_id: 42, path } if path == PathBuf::from("/tmp/file")));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":14,"op":"restore-state","peer_id":42,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/tmp","cursor":null,"selection":[],"expanded":[]}]}}"#).unwrap(), ControllerRequest::RestoreState { request_id: 14, peer_id: 42, .. }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":13,"op":"publish","peer_id":42,"kind":"event","data":null}"#).unwrap(), ControllerRequest::Publish { request_id: 13, peer_id: 42, .. }));
 		assert!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":10,"op":"publish","token":"known","kind":"event"}"#).is_err());
@@ -630,8 +805,8 @@ mod tests {
 		assert!(state.accept_attach("second", 22));
 		assert!(state.accept_attach("first", 11));
 		state.observe_peers(&[
-			dds::PeerInfo { id: 22, abilities: vec!["set-state".into()] },
-			dds::PeerInfo { id: 11, abilities: vec!["set-state".into()] },
+			dds::PeerInfo { id: 22, abilities: vec!["update-tab".into()] },
+			dds::PeerInfo { id: 11, abilities: vec!["update-tab".into()] },
 		], Instant::now());
 		assert_eq!(state.clients(), vec![("first", 11, true), ("second", 22, true)]);
 		assert_eq!(state.detach(11).as_deref(), Some("first"));
@@ -652,15 +827,42 @@ mod tests {
 		let mut state = ControllerState::default();
 		state.register("known".into()).unwrap();
 		assert!(state.accept_attach("known", 11));
-		assert_eq!(state.validate_target(12, "set-state"), Err("peer_id is not controlled"));
-		assert_eq!(state.validate_target(11, "set-state"), Err("peer is offline"));
+		assert_eq!(state.validate_target(12, "update-tab"), Err("peer_id is not controlled"));
+		assert_eq!(state.validate_target(11, "update-tab"), Err("peer is offline"));
 		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["hover".into()] }], Instant::now());
-		assert_eq!(state.validate_target(11, "set-state"), Err("peer does not support this operation"));
-		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["set-state".into()] }], Instant::now());
-		assert_eq!(state.validate_target(11, "set-state"), Ok(()));
+		assert_eq!(state.validate_target(11, "update-tab"), Err("peer does not support this operation"));
+		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["update-tab".into()] }], Instant::now());
+		assert_eq!(state.validate_target(11, "update-tab"), Ok(()));
 		assert_eq!(state.validate_target(11, "restore-state"), Err("peer does not support this operation"));
 		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["restore-state".into()] }], Instant::now());
 		assert_eq!(state.validate_target(11, "restore-state"), Ok(()));
+		assert_eq!(state.validate_target(11, "reveal"), Err("peer does not support this operation"));
+		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["reveal".into()] }], Instant::now());
+		assert_eq!(state.validate_target(11, "reveal"), Ok(()));
+		assert_eq!(state.validate_target(11, "get-state"), Err("peer does not support this operation"));
+		state.observe_peers(&[dds::PeerInfo { id: 11, abilities: vec!["get-state".into()] }], Instant::now());
+		assert_eq!(state.validate_target(11, "get-state"), Ok(()));
+	}
+
+	#[test]
+	fn queries_match_the_right_peer_and_expire_without_replaying() {
+		let now = Instant::now();
+		let mut state = ControllerState::default();
+		let first = state.begin_query(7, 11, QueryKind::State, now).unwrap();
+		assert_eq!(state.begin_query(7, 12, QueryKind::Tabs, now), Err("request_id is already pending"));
+		assert_eq!(state.complete_query(first, 12, QueryKind::State), None);
+		assert_eq!(state.complete_query(first, 11, QueryKind::Tabs), None);
+		assert_eq!(state.complete_query(first, 11, QueryKind::State), Some(7));
+		assert_eq!(state.complete_query(first, 11, QueryKind::State), None);
+		let second = state.begin_query(7, 11, QueryKind::Tabs, now).unwrap();
+		assert_ne!(first, second, "a late reply must not complete a reused request_id");
+		assert!(state.take_expired_queries(now + QUERY_TIMEOUT - Duration::from_millis(1)).is_empty());
+		assert_eq!(state.take_expired_queries(now + QUERY_TIMEOUT), vec![(7, QueryKind::Tabs)]);
+		assert_eq!(state.complete_query(second, 11, QueryKind::Tabs), None);
+		state.begin_query(8, 11, QueryKind::State, now).unwrap();
+		state.begin_query(9, 12, QueryKind::Tabs, now).unwrap();
+		assert_eq!(state.take_queries_for_peer(11), vec![(8, QueryKind::State)]);
+		assert_eq!(state.take_queries_for_peer(12), vec![(9, QueryKind::Tabs)]);
 	}
 
 	#[tokio::test]

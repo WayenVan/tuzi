@@ -19,31 +19,39 @@ messages that claim another sender ID.
 | `sync` | server → all clients | broadcast | no | publish the current peer table |
 | `attach` | Tuzi → parent | direct | no | complete a token-authorized launch |
 | `open` | Tuzi → parent | direct | no | ask the host to open paths |
-| `set-state` | parent → Tuzi | direct | `set-state` | update the active tab |
+| `update-tab` | parent → Tuzi | direct | `update-tab` | update the active tab |
+| `get-tabs` | parent → Tuzi | direct | `get-tabs` | request live tab IDs, order, and roots |
+| `tabs` | Tuzi → parent | direct | no | reply to one `get-tabs` request |
+| `switch-tab` | parent → Tuzi | direct | `switch-tab` | select a live tab by ID |
+| `get-state` | parent → Tuzi | direct | `get-state` | request the visible session snapshot |
+| `state` / `state-error` | Tuzi → parent | direct | no | reply to one `get-state` request |
+| `session-end` | Tuzi → parent | direct | no | send a restorable snapshot during graceful exit |
+| `reveal` | parent → Tuzi | direct | `reveal` | reveal a path in the active tab |
 | `restore-state` | parent → Tuzi | direct | `restore-state` | replace the complete session atomically |
-| `cd` | Tuzi → subscribers | broadcast | `cd` | active tab root changed |
-| `hover` | Tuzi → subscribers | broadcast | `hover` | cursor path changed |
-| `yank` | Tuzi → subscribers | broadcast | `yank` | copy/cut state changed |
-| `renamed` | Tuzi → subscribers | broadcast | `renamed` | a path was renamed |
-| `task-done` | Tuzi → subscribers | broadcast | `task-done` | file task completed |
+| `cd` | Tuzi → parent/subscribers | parent direct or public broadcast | `cd` | active tab root changed |
+| `hover` | Tuzi → parent/subscribers | parent direct or public broadcast | `hover` | cursor path changed |
+| `yank` | Tuzi → parent/subscribers | parent direct or public broadcast | `yank` | copy/cut state changed |
+| `renamed` | Tuzi → parent/subscribers | parent direct or public broadcast | `renamed` | a path was renamed |
+| `task-done` | Tuzi → parent/subscribers | parent direct or public broadcast | `task-done` | file task completed |
 | custom | any peer → subscribers/peer | either | custom kind | extension message |
 
 Broadcast delivery requires the receiver to declare the matching ability or
 the wildcard ability `*`. Direct DDS routing itself does not inspect abilities;
 controller performs an ability check before sending, and controlled Tuzi does
-the final receiver-side check.
+the final receiver-side check. For implicit state events, Tuzi also checks its
+parent's advertised abilities before sending directly.
 
 ## Handshake messages
 
 ```json
-{"Join":{"abilities":["restore-state","set-state"]}}
+{"Join":{"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}}
 ```
 
 `Join` must be the first message on a connection. A second `Join`, a duplicate peer
 ID, or a later message with a different sender ID closes that connection.
 
 ```json
-{"Sync":{"peers":[{"id":701,"abilities":["hover","cd"]},{"id":902,"abilities":["restore-state","set-state"]}]}}
+{"Sync":{"peers":[{"id":701,"abilities":["hover","cd"]},{"id":902,"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}]}}
 ```
 
 `Sync` is emitted whenever the connected peer table changes.
@@ -64,16 +72,34 @@ new Tuzi peer ID. The controller accepts it only when the token was registered.
 `open` is always direct to the parent. It is emitted for ordinary opens when
 `dds.open` selects the parent route; interactive opens remain local.
 
-`set-state` is encoded as a custom body on the wire, but is a reserved
+`update-tab` is encoded as a custom body on the wire, but is a reserved
 controller operation rather than a general `publish` kind:
 
 ```json
-{"Custom":{"kind":"set-state","data":{"path":"/project","selection":["README.md"]}}}
+{"Custom":{"kind":"update-tab","data":{"path":"/project","selection":["README.md"]}}}
 ```
 
 `path` and `selection` are optional. `selection` replaces the current selection
 and defaults to an empty list. A controlled Tuzi accepts this operation only
 from its saved parent and validates the JSON schema before delivery.
+
+`switch-tab` is also a reserved custom body. It targets a runtime tab ID:
+
+```json
+{"Custom":{"kind":"switch-tab","data":{"tab_id":3}}}
+```
+
+If that tab has closed before Tuzi handles the message, Tuzi reports the
+failure locally. The controller does not receive an execution result.
+
+`reveal` is another reserved custom body. Its `path` must be absolute:
+
+```json
+{"Custom":{"kind":"reveal","data":{"path":"/project/src/main.rs"}}}
+```
+
+Tuzi tries to expand the active tab's tree and place the cursor on the path.
+Failures appear only in the Tuzi UI; there is no execution acknowledgement.
 
 `restore-state` is also encoded as a reserved custom body:
 
@@ -85,6 +111,37 @@ The snapshot is the sole source of truth for tab count, order, active tab,
 roots, cursors, selections, and expanded directories. Tuzi fully validates it,
 builds the replacement trees off-screen, and atomically swaps sessions only
 after every lazy listing succeeds. Failure leaves the visible session intact.
+
+`get-state` and its replies use typed direct bodies. The controller assigns
+an internal `query_id`, correlates the reply with the original JSON Lines
+`request_id`, and accepts it only from the requested controlled peer:
+
+```json
+{"GetState":{"query_id":1}}
+{"State":{"query_id":1,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/project","cursor":null,"selection":[],"expanded":[]}]}}}
+{"StateError":{"query_id":1,"error":"invalid tab 0: ..."}}
+```
+
+`get-tabs` uses the same query ID correlation but returns only live tab
+metadata. Array order is the current visual tab order:
+
+```json
+{"GetTabs":{"query_id":2}}
+{"Tabs":{"query_id":2,"active_tab_id":3,"tabs":[{"id":0,"cwd":"/project"},{"id":3,"cwd":"/other"}]}}
+```
+
+Runtime tab IDs are valid only for this Tuzi process. `SessionState.active_tab`
+remains an array index so saved sessions do not depend on runtime IDs.
+
+On graceful exit, a controlled Tuzi sends the same snapshot schema to its
+parent without a preceding request:
+
+```json
+{"SessionEnd":{"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/project","cursor":null,"selection":[],"expanded":[]}]}}}
+```
+
+This is a best-effort notification. Forced termination, a disconnected parent,
+or a snapshot that cannot be validated may prevent it from being sent.
 
 ## State events
 
@@ -99,9 +156,13 @@ after every lazy listing succeeds. Failure leaves the visible session intact.
 
 `TaskDone.kind` is one of `Copy`, `Move`, `Trash`, or `Delete`.
 
-These five implicit events are private by default. A Tuzi broadcasts only the
-kinds present in `config.dds.broadcast`; local in-process subscribers still
-receive them.
+These five implicit events always reach local in-process subscribers. A
+controlled Tuzi sends an event directly to its online parent when that parent
+advertised the matching ability (or `*`). An event listed in
+`config.dds.broadcast` is publicly broadcast instead, so every interested
+DDS peer can receive it, including the parent. Tuzi chooses one external
+route per event and does not send a second direct copy. Without a parent or
+an explicit broadcast rule, the event stays local.
 
 ## Custom messages
 
@@ -112,8 +173,10 @@ receive them.
 Custom `data` may be any JSON value. Explicit `emit`/`pub` commands bypass the
 implicit broadcast allowlist but still require DDS to be enabled. The built-in
 names `join`, `sync`, `attach`, `open`, `cd`, `hover`, `yank`, `renamed`, and
-`task-done` are reserved. Controller additionally reserves `set-state` and
-`restore-state` for their typed operations.
+`task-done`, plus `get-state`, `get-tabs`, `state`, `state-error`, `tabs`, and
+`session-end` are reserved. Controller additionally reserves `update-tab`,
+`switch-tab`, `restore-state`, and `reveal`
+for their typed operations.
 
 ## Privacy and authentication
 

@@ -189,6 +189,31 @@ impl Tab {
 		self.projection.get(&self.tree, target)
 	}
 
+	/// Captures visible cursor and expanded tree state. Descendants cached
+	/// under a collapsed ancestor are omitted because restore must not open
+	/// a path whose parent is closed.
+	pub(super) fn snapshot_state(&self) -> crate::session_state::TabState {
+		let mut expanded = Vec::new();
+		let mut pending = vec![&self.tree.root];
+		while let Some(node) = pending.pop() {
+			if !node.expanded { continue }
+			if node.path != self.tree.root.path {
+				expanded.push(node.path.clone());
+			}
+			if let Some(children) = &node.children {
+				pending.extend(children.iter().rev());
+			}
+		}
+		let mut selection: Vec<_> = self.selection.iter().cloned().collect();
+		selection.sort_unstable();
+		crate::session_state::TabState {
+			cwd: self.tree.root.path.clone(),
+			cursor: self.visible_at(self.cursor).map(|(_, node)| node.path.clone()),
+			selection,
+			expanded,
+		}
+	}
+
 	pub fn visible_range(&self, range: std::ops::Range<usize>) -> Vec<(usize, &Node)> {
 		self.projection.range(&self.tree, range)
 	}

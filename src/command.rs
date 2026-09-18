@@ -69,6 +69,8 @@ pub enum Command {
 	NewTab,
 	CloseTab,
 	SwitchTab(isize),
+	/// Selects a live tab by its runtime ID, as requested by the parent.
+	SwitchTabTo(usize),
 	SetColumnMode(ColumnMode),
 	SetSort(SortPolicy),
 	ToggleHidden,
@@ -81,10 +83,16 @@ pub enum Command {
 	ToggleTasks,
 	/// Applies a state snapshot received from DDS. This is intentionally an
 	/// internal command rather than part of the textual command language.
-	SetState { path: Option<PathBuf>, selection: Vec<PathBuf> },
+	UpdateTab { path: Option<PathBuf>, selection: Vec<PathBuf> },
+	/// Reveals a path in the active tab without changing its root.
+	Reveal(PathBuf),
 	/// Atomically replaces the complete session from a snapshot. This is a
 	/// DDS-internal command and intentionally has no textual syntax.
 	RestoreState(crate::session_state::SessionState),
+	/// Replies to a parent with the current complete session snapshot.
+	GetState { query_id: u64 },
+	/// Replies with live tab IDs, order, roots, and the active ID.
+	GetTabs { query_id: u64 },
 	/// Publishes a custom event on the internal DDS bus (`.ai/dds-plan.md`
 	/// P2). `data` defaults to `Value::Null` when the command carries no
 	/// JSON argument.

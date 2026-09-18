@@ -49,6 +49,7 @@ impl App {
 			Command::NewTab => self.new_tab(),
 			Command::CloseTab => self.close_tab(),
 			Command::SwitchTab(delta) => self.switch_tab(delta),
+			Command::SwitchTabTo(id) => self.switch_tab_to(id),
 			Command::SetColumnMode(mode) => self.active_tab_mut().column_mode = mode,
 			Command::SetSort(policy) => self.active_tab_mut().set_sort(policy),
 			Command::ToggleHidden => self.active_tab_mut().toggle_hidden(),
@@ -59,8 +60,11 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
-			Command::SetState { path, selection } => self.set_state(path, selection),
+			Command::UpdateTab { path, selection } => self.update_tab(path, selection),
+			Command::Reveal(path) => self.reveal_path(path),
 			Command::RestoreState(state) => self.restore_state(state),
+			Command::GetState { query_id } => self.reply_state(query_id),
+			Command::GetTabs { query_id } => self.reply_tabs(query_id),
 			Command::Emit { kind, data } => self.emit(Body::Custom { kind, data }),
 		}
 		self.drain_tab_notices();

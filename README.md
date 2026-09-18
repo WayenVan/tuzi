@@ -109,7 +109,7 @@ only accepts a Tuzi after its launch token has been
 registered:
 
 ```text
-← {"event":"controller-ready","protocol_version":1,"peer_id":701}
+← {"event":"controller-ready","protocol_version":2,"peer_id":701}
 → {"request_id":1,"op":"register","token":"launch-token"}
 ← {"request_id":1,"ok":true}
 ```
@@ -121,21 +121,28 @@ that peer:
 ```text
 ← {"event":"tuzi-ready","token":"launch-token","peer_id":902}
 ← {"event":"message","peer_id":902,"kind":"hover","body":{...}}
-→ {"request_id":2,"op":"set-state","peer_id":902,"state":{"path":"/project","selection":["README.md"]}}
+→ {"request_id":2,"op":"update-tab","peer_id":902,"update":{"path":"/project","selection":["README.md"]}}
 ← {"request_id":2,"ok":true,"status":"queued"}
 ```
 
 Use `restore-state` when the host needs to replace the complete tab session,
 including cursor positions and expanded directories. The replacement is built
 off-screen and becomes visible only after every tab has restored successfully.
+Use `get-state` to retrieve the current complete session as a matching
+snapshot for later restoration. Its response arrives after Tuzi has built and
+validated the snapshot; it is not a `queued` acknowledgement.
+Use `get-tabs` for the current tab order, runtime IDs, roots, and active ID;
+`switch-tab` selects one of those IDs.
 
 Only messages whose sender is a successfully controlled Tuzi are emitted.
 The token authorizes the initial handshake; runtime commands address one
 controlled `peer_id` at a time. Use `list`, `cancel-register`, `detach`, and
 `ping` to inspect or manage controller state.
-The default abilities are `hover,cd,yank,renamed,task-done`; override them with
-`--abilities`. Stdout contains JSON Lines only, while stdin EOF shuts the
-controller down.
+The default abilities are `cd,yank,renamed,task-done`; add `hover` with
+`--abilities` when cursor movement events are needed. A controlled Tuzi sends
+matching state events directly to its online parent by default. Events
+explicitly listed in `dds.broadcast` are public broadcasts instead. Stdout
+contains JSON Lines only, while stdin EOF shuts the controller down.
 
 When a controlled peer disappears from `Sync`, the controller waits 500ms for
 server failover/reconnection. If it remains absent, the mapping is removed and
@@ -203,7 +210,8 @@ poll_interval_ms = 1000    # 50–60000
 [dds]
 enabled = true
 open = "auto"             # auto, local, parent
-# Implicit events are private by default. Opt in to any of:
+# Implicit events go to a subscribed controlling parent, if present.
+# List kinds here only to broadcast them publicly to other DDS peers:
 # "cd", "hover", "yank", "renamed", "task-done".
 broadcast = []
 ```
