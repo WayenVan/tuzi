@@ -1,7 +1,8 @@
-use std::{collections::VecDeque, io, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::{HashSet, VecDeque}, io, path::{Path, PathBuf}, sync::Arc};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -46,11 +47,29 @@ pub struct App {
 	pub(super) processes: VecDeque<ProcessRequest>,
 	pub(super) tx: mpsc::UnboundedSender<Event>,
 	pub(super) pubsub: dds::Registry,
+	/// The TUI's long-lived DDS peer. Tests that exercise only local app
+	/// behavior leave this as `None` and keep using the in-process bus.
+	pub(super) dds_client: Option<dds::Client>,
+	pub(super) controller: Option<ControllerLink>,
 	pub tasks: TaskManager,
 	/// One-off toasts (invalid cd, refused delete, a failed external
 	/// process, …) — global, not tied to whichever tab is active, and
 	/// timeout-driven rather than something the user dismisses.
 	pub(super) notices: Vec<Notice>,
+}
+
+pub(super) struct ControllerLink {
+	pub launch: dds::DdsLaunch,
+	pub online: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IncomingState {
+	#[serde(default)]
+	path:      Option<PathBuf>,
+	#[serde(default)]
+	selection: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,11 +93,24 @@ impl Default for MouseState {
 }
 
 impl App {
-	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme) -> io::Result<()> {
+	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let config = Arc::new(config);
+		let pubsub = Self::new_registry();
+		if dds_launch.is_some() && !config.dds.enabled {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, "controlled launch requires DDS, but dds.enabled is false"));
+		}
+		let (dds_client, dds_error) = match config.dds.enabled {
+			true => match Self::connect_dds(tx.clone(), pubsub.abilities(), dds_launch.as_ref().map(|launch| launch.parent)).await {
+				Ok(client) => (Some(client), None),
+				Err(error) if dds_launch.is_some() => return Err(io::Error::new(error.kind(), format!("controlled launch could not connect to DDS: {error}"))),
+				Err(error) => (None, Some(error)),
+			},
+			false => (None, None),
+		};
 
 		let first = Tab::open_configured(0, path, tx.clone(), config.clone())?;
+		let controller = dds_launch.clone().map(|launch| ControllerLink { launch, online: true });
 		let mut app = Self {
 			config: config.clone(),
 			tabs: vec![first],
@@ -99,11 +131,23 @@ impl App {
 			processes: VecDeque::new(),
 			tasks: TaskManager::configured(tx.clone(), config.tasks.clone()),
 			notices: Vec::new(),
-			pubsub: dds::Registry::new(),
+			pubsub,
+			dds_client,
+			controller,
 			tx,
 		};
+		if let Some(error) = dds_error {
+			app.notices.push(Notice::new(
+				NoticeLevel::Warn,
+				format!("DDS unavailable; continuing with local events only: {error}"),
+				std::time::Duration::from_secs(5),
+			));
+		}
 		let mut terminal = TerminalSession::start()?;
 		let mut router = Router::new(keymap);
+		if let Some(launch) = dds_launch {
+			app.announce_ready(&launch);
+		}
 
 		app.render(terminal.terminal())?;
 		loop {
@@ -139,8 +183,78 @@ impl App {
 		Ok(())
 	}
 
+	async fn connect_dds(tx: mpsc::UnboundedSender<Event>, abilities: Vec<String>, parent: Option<dds::PeerId>) -> io::Result<dds::Client> {
+		Self::connect_dds_at(tx, &dds::socket_path(), abilities, parent).await
+	}
+
+	async fn connect_dds_at(tx: mpsc::UnboundedSender<Event>, socket_path: &Path, abilities: Vec<String>, parent: Option<dds::PeerId>) -> io::Result<dds::Client> {
+		let supported: HashSet<_> = abilities.iter().cloned().collect();
+		let (client, mut inbox) = dds::Client::connect(socket_path, abilities).await?;
+		let self_id = client.id();
+		tokio::spawn(async move {
+			while let Some(payload) = inbox.recv().await {
+				if let Err(error) = Self::validate_dds_message(parent, self_id, &supported, &payload) {
+					let _ = tx.send(Event::DdsRejected(error));
+					continue;
+				}
+				if tx.send(Event::DdsDeliver(payload.body)).is_err() {
+					break;
+				}
+			}
+		});
+		Ok(client)
+	}
+
+	fn validate_dds_message(parent: Option<dds::PeerId>, self_id: dds::PeerId, supported: &HashSet<String>, payload: &dds::Payload) -> Result<(), String> {
+		let Some(parent) = parent else { return Ok(()) };
+		let is_control = payload.receiver == self_id || payload.body.kind() == "set-state";
+		if !is_control { return Ok(()) }
+		if payload.sender != parent {
+			return Err(format!("rejected DDS control message from unauthorized peer {}", payload.sender));
+		}
+		let kind = payload.body.kind();
+		if !supported.contains(kind) && !supported.contains(dds::WILDCARD_ABILITY) {
+			return Err(format!("rejected unsupported DDS control operation '{kind}'"));
+		}
+		if kind == "set-state" {
+			let Body::Custom { data, .. } = &payload.body else {
+				return Err("rejected malformed DDS set-state message".into());
+			};
+			serde_json::from_value::<IncomingState>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS set-state content: {error}"))?;
+		}
+		Ok(())
+	}
+
+	fn announce_ready(&self, launch: &dds::DdsLaunch) {
+		self.dds_client.as_ref().expect("controlled launch requires a DDS client").publish_to(
+			launch.parent,
+			Body::Ready { token: launch.token.clone() },
+		);
+	}
+
+	pub(super) fn update_controller_peers(&mut self, peers: &[dds::PeerInfo]) {
+		let Some(controller) = &mut self.controller else { return };
+		controller.online = peers.iter().any(|peer| peer.id == controller.launch.parent);
+	}
+
+	fn new_registry() -> dds::Registry {
+		let mut registry = dds::Registry::new();
+		registry.sub(
+			"core",
+			"set-state",
+			Box::new(|body| {
+				let Body::Custom { data, .. } = body else { return Vec::new() };
+				let Ok(state) = serde_json::from_value::<IncomingState>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::SetState { path: state.path, selection: state.selection }]
+			}),
+		);
+		registry
+	}
+
 	fn handle_event(&mut self, event: Event, router: &mut Router) -> bool {
-		match event {
+		let before = self.hovered_path();
+		let dirty = match event {
 			Event::Term(crossterm::event::Event::Key(key)) if key.kind == KeyEventKind::Press => self.handle_key(key, router),
 			Event::Term(crossterm::event::Event::Mouse(mouse)) => self.handle_mouse(mouse),
 			Event::Term(crossterm::event::Event::FocusGained) => self.set_terminal_focus(true),
@@ -151,7 +265,16 @@ impl App {
 				Dispatcher::dispatch_event(self, event);
 				true
 			}
+		};
+		let after = self.hovered_path();
+		if after != before {
+			self.publish(Body::Hover { path: after });
 		}
+		dirty
+	}
+
+	fn hovered_path(&self) -> Option<PathBuf> {
+		self.active_tab().visible_at(self.active_tab().cursor).map(|(_, node)| node.path.clone())
 	}
 
 	fn set_terminal_focus(&mut self, focused: bool) -> bool {
@@ -450,12 +573,38 @@ impl App {
 		self.publish(Body::Yank { paths: self.clipboard.clone(), cut });
 	}
 
-	/// Publishes a message on the internal DDS bus (`.ai/dds-plan.md`).
-	/// Round-trips through the event channel instead of calling subscriber
-	/// handlers directly, so delivery stays serialized with everything
-	/// else touching `App`.
+	/// Publishes an implicit App event locally and, when explicitly allowed
+	/// by `dds.broadcast`, to remote peers.
 	pub(super) fn publish(&self, body: Body) {
-		let _ = self.tx.send(Event::Pubsub(body));
+		let _ = self.tx.send(Event::DdsDeliver(body.clone()));
+		if self.config.dds.broadcast.iter().any(|kind| kind == body.kind())
+			&& let Some(client) = &self.dds_client
+		{
+			client.publish(body);
+		}
+	}
+
+	/// An `emit` command is an explicit request to publish, so it bypasses
+	/// the implicit-event allowlist while still respecting `dds.enabled`.
+	pub(super) fn emit(&self, body: Body) {
+		let _ = self.tx.send(Event::DdsDeliver(body.clone()));
+		if let Some(client) = &self.dds_client {
+			client.publish(body);
+		}
+	}
+
+	pub(super) fn set_state(&mut self, path: Option<PathBuf>, selection: Vec<PathBuf>) {
+		if let Some(path) = path
+			&& let Err(error) = self.active_tab_mut().cd(path)
+		{
+			self.notices.push(Notice::new(
+				NoticeLevel::Error,
+				format!("Cannot apply DDS state: {error}"),
+				std::time::Duration::from_secs(8),
+			));
+			return;
+		}
+		self.active_tab_mut().set_selection(selection);
 	}
 
 	pub fn request_delete(&mut self, mode: DeleteMode) {
@@ -594,7 +743,7 @@ mod tests {
 	use std::{fs, path::Path};
 	use crossterm::event::KeyEvent;
 
-	use crate::{command::Command, column_mode::ColumnMode};
+	use crate::{command::Command, column_mode::ColumnMode, config::DdsOpen};
 
 	use super::*;
 
@@ -621,7 +770,9 @@ mod tests {
 			processes: VecDeque::new(),
 			tasks: TaskManager::new(tx.clone()),
 			notices: Vec::new(),
-			pubsub: dds::Registry::new(),
+			pubsub: App::new_registry(),
+			dds_client: None,
+			controller: None,
 			tx,
 		};
 
@@ -637,12 +788,13 @@ mod tests {
 			let task_finished = matches!(&event, Event::Task(TaskEvent::Finished { .. }));
 			let task_event = matches!(&event, Event::Task(_));
 			let listing_pending = matches!(&event, Event::Loaded { done: false, .. });
+			let publish_event = matches!(&event, Event::DdsPublish(_));
 			// A DDS publish (e.g. from `cd`/`yank`/rename) has no subscriber
 			// yet in these tests, but it's still queued ahead of whatever
 			// "real" event the test is waiting for — keep draining past it.
-			let pubsub_event = matches!(&event, Event::Pubsub(_));
+			let pubsub_event = matches!(&event, Event::DdsDeliver(_) | Event::DdsRejected(_));
 			Dispatcher::dispatch_event(app, event);
-			if (!task_event || task_finished) && !listing_pending && !pubsub_event {
+			if (!task_event || task_finished) && !listing_pending && !publish_event && !pubsub_event {
 				break;
 			}
 		}
@@ -1291,11 +1443,31 @@ mod tests {
 		assert!(!app.tasks.visible);
 		app.yank_selected(false);
 		let event = rx.recv().await.unwrap();
-		assert!(matches!(event, Event::Pubsub(_)));
+		assert!(matches!(event, Event::DdsDeliver(_)));
 		Dispatcher::dispatch_event(&mut app, event);
 
 		assert!(app.tasks.visible, "the subscriber's Command actually ran through App::execute");
 
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_changed_hover_path_publishes_one_hover_event() {
+		let root = std::env::temp_dir().join("tuzi-app-test-hover");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("child")).unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut app, mut rx) = app(&root).await;
+		app.pubsub.sub("test", "move", Box::new(|_| vec![Command::Cursor(crate::command::CursorTarget::Relative(1))]));
+		let mut router = Router::default();
+		app.handle_event(
+			Event::DdsDeliver(Body::Custom { kind: "move".into(), data: serde_json::Value::Null }),
+			&mut router,
+		);
+
+		let event = rx.recv().await.unwrap();
+		assert!(matches!(event, Event::DdsDeliver(Body::Hover { path: Some(path) }) if path == root.join("child")));
 		fs::remove_dir_all(&root).unwrap();
 	}
 
@@ -1327,6 +1499,201 @@ mod tests {
 		assert_eq!(*seen.lock().unwrap(), Some(serde_json::json!({"a": 1})));
 		assert!(app.tasks.visible);
 
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn controlled_launch_reports_the_app_peer_directly_to_its_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-dds-ready");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let socket_path = root.join("dds.sock");
+
+		let (parent, mut parent_inbox) = dds::Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (_observer, mut observer_inbox) = dds::Client::connect(&socket_path, vec![dds::WILDCARD_ABILITY.into()]).await.unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
+		let app_id = app.dds_client.as_ref().unwrap().id();
+
+		app.announce_ready(&dds::DdsLaunch::new(parent.id(), "launch-token".into()).unwrap());
+		let ready = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::Ready { .. }) {
+				break payload;
+			}
+		};
+		assert_eq!(ready.sender, app_id);
+		assert_eq!(ready.receiver, parent.id());
+		assert_eq!(ready.body, Body::Ready { token: "launch-token".into() });
+
+		loop {
+			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
+				Err(_) | Ok(None) => break,
+				Ok(Some(payload)) if matches!(payload.body, Body::Hey { .. }) => continue,
+				Ok(Some(payload)) => panic!("observer unexpectedly received direct message: {:?}", payload.body),
+			}
+		}
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn controlled_open_is_sent_only_to_the_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-parent-open");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("selected.txt"), b"").unwrap();
+		let socket_path = root.join("dds.sock");
+
+		let (parent, mut parent_inbox) = dds::Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (_observer, mut observer_inbox) = dds::Client::connect(&socket_path, vec![dds::WILDCARD_ABILITY.into()]).await.unwrap();
+		let (mut app, _rx) = app(&root).await;
+		Arc::make_mut(&mut app.config).dds.open = DdsOpen::Parent;
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "open-test".into()).unwrap(), online: true });
+
+		app.open_selected(false);
+		let opened = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::Open { .. }) {
+				break payload;
+			}
+		};
+		assert_eq!(opened.receiver, parent.id());
+		assert!(matches!(opened.body, Body::Open { paths } if !paths.is_empty()));
+		loop {
+			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
+				Err(_) | Ok(None) => break,
+				Ok(Some(payload)) if matches!(payload.body, Body::Hey { .. }) => continue,
+				Ok(Some(payload)) => panic!("observer unexpectedly received parent open: {:?}", payload.body),
+			}
+		}
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn strict_parent_open_never_falls_back_when_controller_is_unavailable() {
+		let root = std::env::temp_dir().join("tuzi-app-test-parent-open-unavailable");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, _rx) = app(&root).await;
+		Arc::make_mut(&mut app.config).dds.open = DdsOpen::Parent;
+
+		app.open_selected(false);
+		assert_eq!(app.active_tab().pending_notice.as_ref().map(|(_, message)| message.as_str()), Some("open requires a controlling parent"));
+
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(99, "offline".into()).unwrap(), online: false });
+		app.open_selected(false);
+		assert_eq!(app.active_tab().pending_notice.as_ref().map(|(_, message)| message.as_str()), Some("controller unavailable"));
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[test]
+	fn controlled_tuzi_accepts_set_state_only_from_its_parent() {
+		let supported = HashSet::from(["set-state".into()]);
+		let state = |sender, data| dds::Payload {
+			receiver: 7,
+			sender,
+			body: Body::Custom { kind: "set-state".into(), data },
+		};
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(41, serde_json::json!({}))).is_ok());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(42, serde_json::json!({}))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &state(41, serde_json::json!({ "unknown": true }))).is_err());
+		assert!(App::validate_dds_message(None, 7, &supported, &state(42, serde_json::Value::Null)).is_ok(), "an independent Tuzi keeps its normal subscription behavior");
+		let broadcast = dds::Payload { receiver: 0, sender: 42, body: Body::Hover { path: None } };
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &broadcast).is_ok(), "ordinary subscribed broadcasts are not parent control messages");
+	}
+
+	#[tokio::test]
+	async fn the_app_peer_sends_and_receives_dds_messages_through_the_event_loop() {
+		let root = std::env::temp_dir().join("tuzi-app-test-dds-peer");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		fs::write(root.join("selected.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let socket_path = root.join("dds.sock");
+
+		let (mut app, mut rx) = app(&root).await;
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
+		let app_peer = app.dds_client.as_ref().unwrap().id();
+		let (remote, mut remote_inbox) = dds::Client::connect(&socket_path, vec!["from-app".into(), "yank".into()]).await.unwrap();
+
+		loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), remote_inbox.recv()).await.unwrap().unwrap();
+			if let Body::Hey { peers } = payload.body
+				&& peers.len() >= 2
+			{
+				let abilities = &peers.iter().find(|peer| peer.id == app_peer).unwrap().abilities;
+				assert_eq!(abilities, &["set-state"], "the App advertises its Registry snapshot instead of '*'");
+				break;
+			}
+		}
+
+		app.emit(Body::Custom { kind: "from-app".into(), data: serde_json::Value::Null });
+		loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), remote_inbox.recv()).await.unwrap().unwrap();
+			if payload.body.kind() == "from-app" {
+				break;
+			}
+		}
+
+		let yank = Body::Yank { paths: vec![root.join("selected.txt")], cut: false };
+		app.publish(yank.clone());
+		assert!(
+			tokio::time::timeout(std::time::Duration::from_millis(200), remote_inbox.recv()).await.is_err(),
+			"implicit built-in events stay private by default"
+		);
+		Arc::make_mut(&mut app.config).dds.broadcast.push("yank".into());
+		app.publish(yank);
+		loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), remote_inbox.recv()).await.unwrap().unwrap();
+			if payload.body.kind() == "yank" {
+				break;
+			}
+		}
+
+		remote.publish(Body::Custom {
+			kind: "set-state".into(),
+			data: serde_json::json!({ "selection": ["selected.txt", "missing.txt"] }),
+		});
+		while !app.active_tab().selection.contains(&root.join("selected.txt")) {
+			let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap();
+			Dispatcher::dispatch_event(&mut app, event);
+		}
+
+		assert!(app.active_tab().selection.contains(&root.join("selected.txt")), "the remote message entered Event::DdsDeliver and produced SetState");
+		assert!(!app.active_tab().selection.contains(&root.join("missing.txt")), "missing paths are ignored");
+		drop(remote);
+		drop(app);
+		let _ = fs::remove_dir_all(&root);
+	}
+
+	#[tokio::test]
+	async fn set_state_can_change_directory_and_resolve_relative_selections() {
+		let root = std::env::temp_dir().join("tuzi-app-test-set-state-path");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("next")).unwrap();
+		fs::write(root.join("next/keep.txt"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let next = root.join("next");
+
+		let (mut app, _rx) = app(&root).await;
+		Dispatcher::dispatch_event(
+			&mut app,
+			Event::DdsDeliver(Body::Custom {
+				kind: "set-state".into(),
+				data: serde_json::json!({
+					"path": next,
+					"selection": ["keep.txt", "gone.txt"]
+				}),
+			}),
+		);
+
+		assert_eq!(app.active_tab().tree.root.path, next);
+		assert!(app.active_tab().selection.contains(&next.join("keep.txt")));
+		assert!(!app.active_tab().selection.contains(&next.join("gone.txt")));
 		fs::remove_dir_all(&root).unwrap();
 	}
 }

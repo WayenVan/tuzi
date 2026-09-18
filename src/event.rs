@@ -23,9 +23,15 @@ pub enum Event {
 	/// same way a shell's `cd` hook would.
 	Visited(PathBuf),
 	Task(TaskEvent),
+	/// A local producer requests DDS publication. Dispatcher sends it to
+	/// the local Registry and applies the configured external allowlist.
+	DdsPublish(Body),
 	/// A message published on the internal DDS bus (see `.ai/dds-plan.md`).
 	/// Round-tripping through the event channel — even for same-process
 	/// delivery — keeps subscriber-produced `Command`s on the same
 	/// synchronous execution path as everything else touching `App`.
-	Pubsub(Body),
+	DdsDeliver(Body),
+	/// A controlled DDS message failed receiver-side authentication or
+	/// validation and was not delivered to the Registry.
+	DdsRejected(String),
 }

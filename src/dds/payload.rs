@@ -29,10 +29,9 @@ impl Payload {
 	}
 }
 
-/// A best-effort unique id for this process's DDS connection — collisions
-/// are astronomically unlikely (process id mixed with a nanosecond
-/// timestamp) and harmless anyway: at worst two peers briefly overwrite
-/// each other's entry in the server's peer table.
+/// A best-effort unique id for this process's DDS connection. Collisions are
+/// astronomically unlikely (process id mixed with a nanosecond timestamp),
+/// and the server rejects a duplicate rather than replacing the first route.
 pub fn new_peer_id() -> PeerId {
 	let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
 	((std::process::id() as u64) << 32) ^ nanos
@@ -44,5 +43,11 @@ pub fn new_peer_id() -> PeerId {
 /// rather than pulling in an XDG crate for one path).
 pub fn socket_path() -> PathBuf {
 	let base = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(env::temp_dir);
-	base.join("tuzi").join("dds.sock")
+	let directory = if env::var_os("XDG_RUNTIME_DIR").is_some() {
+		"tuzi".to_string()
+	} else {
+		// SAFETY: `geteuid` has no preconditions and only reads process state.
+		format!("tuzi-{}", unsafe { libc::geteuid() })
+	};
+	base.join(directory).join("dds.sock")
 }

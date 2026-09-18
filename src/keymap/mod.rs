@@ -12,7 +12,7 @@ pub struct Keymap {
 }
 
 impl Default for Keymap {
-	fn default() -> Self { Self::load(&crate::config::LoadOptions { config_dir: None, no_config: true }).expect("built-in keymap must be valid") }
+	fn default() -> Self { Self::load(&crate::config::LoadOptions { config_dir: None, no_config: true, ..Default::default() }).expect("built-in keymap must be valid") }
 }
 
 impl Keymap {

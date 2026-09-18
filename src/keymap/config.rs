@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::{command::Command, config::{LoadOptions, read_user_file}};
+use crate::{command::Command, config::{LoadOptions, read_user_file, runtime_documents}};
 
 use super::{Binding, Key, Keymap};
 
@@ -44,20 +44,31 @@ pub(super) fn load(options: &LoadOptions) -> Result<Keymap, String> {
 
 	if let Some((path, source)) = read_user_file(options, "keymap.toml")? {
 		let user: Document = toml::from_str(&source).map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-		if let Some(replacement) = user.mgr.keymap { core = entries(replacement, &path)?; }
-		let prepend = entries(user.mgr.prepend_keymap, &path)?;
-		let append = entries(user.mgr.append_keymap, &path)?;
-		validate_section(&prepend, &path, "prepend_keymap")?;
-		validate_section(&append, &path, "append_keymap")?;
-		for binding in &prepend { core.retain(|old| old.context != binding.context || old.keys != binding.keys); }
-		let mut merged = prepend;
-		merged.append(&mut core);
-		for binding in append {
-			if !merged.iter().any(|old| old.context == binding.context && old.keys == binding.keys) { merged.push(binding); }
+		apply_document(&mut core, user, &path)?;
+	}
+	for (origin, document) in runtime_documents(options)? {
+		if let Some(value) = document.get("keymap") {
+			let runtime: Document = serde_json::from_value(value.clone()).map_err(|error| format!("invalid {origin} keymap: {error}"))?;
+			apply_document(&mut core, runtime, Path::new(&origin))?;
 		}
-		core = merged;
 	}
 	Keymap::new(core).map_err(|error| format!("invalid keymap: {error}"))
+}
+
+fn apply_document(core: &mut Vec<Binding>, document: Document, path: &Path) -> Result<(), String> {
+	if let Some(replacement) = document.mgr.keymap { *core = entries(replacement, path)?; }
+	let prepend = entries(document.mgr.prepend_keymap, path)?;
+	let append = entries(document.mgr.append_keymap, path)?;
+	validate_section(&prepend, path, "prepend_keymap")?;
+	validate_section(&append, path, "append_keymap")?;
+	for binding in &prepend { core.retain(|old| old.context != binding.context || old.keys != binding.keys); }
+	let mut merged = prepend;
+	merged.append(core);
+	for binding in append {
+		if !merged.iter().any(|old| old.context == binding.context && old.keys == binding.keys) { merged.push(binding); }
+	}
+	*core = merged;
+	Ok(())
 }
 
 fn validate_section(bindings: &[Binding], path: &Path, name: &str) -> Result<(), String> {
@@ -102,11 +113,25 @@ mod tests {
 		let directory = std::env::temp_dir().join(format!("tuzi-keymap-test-{}-{nonce}", std::process::id()));
 		fs::create_dir(&directory).unwrap();
 		fs::write(directory.join("keymap.toml"), "[mgr]\nprepend_keymap = [{ on = 'q', run = 'escape', desc = 'Do not quit' }]\nappend_keymap = [{ on = '<F2>', run = 'preview toggle', desc = 'Preview' }]\n").unwrap();
-		let keymap = load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false }).unwrap();
+		let keymap = load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false, ..Default::default() }).unwrap();
 		let q = keymap.bindings(super::super::KeyContext::Manager).find(|binding| binding.keys == [Key::char('q')]).unwrap();
 		assert_eq!(q.commands, [Command::Escape]);
 		assert!(keymap.bindings(super::super::KeyContext::Manager).any(|binding| binding.keys == [Key::plain(KeyCode::F(2))]));
 		fs::remove_dir_all(directory).unwrap();
+	}
+
+	#[test]
+	fn runtime_config_can_override_keymap() {
+		let options = LoadOptions {
+			no_config: true,
+			runtime_config: vec![crate::config::RuntimeConfigSource::Inline(
+				r#"{"keymap":{"mgr":{"prepend_keymap":[{"on":"q","run":"escape","desc":"Stay open"}]}}}"#.into(),
+			)],
+			..Default::default()
+		};
+		let keymap = load(&options).unwrap();
+		let q = keymap.bindings(super::super::KeyContext::Manager).find(|binding| binding.keys == [Key::char('q')]).unwrap();
+		assert_eq!(q.commands, [Command::Escape]);
 	}
 
 	#[test]

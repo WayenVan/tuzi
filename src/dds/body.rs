@@ -18,7 +18,14 @@ pub enum Body {
 	Hi { abilities: Vec<String> },
 	/// Broadcast by the server whenever the peer table changes.
 	Hey { peers: Vec<PeerInfo> },
+	/// Point-to-point launch acknowledgement sent to an external controller.
+	/// The Tuzi peer ID is the enclosing Payload's sender.
+	Ready { token: String },
+	/// Requests that the controlling parent open these paths in its host.
+	/// This message is point-to-point and is never an implicit broadcast.
+	Open { paths: Vec<PathBuf> },
 	Cd { path: PathBuf },
+	Hover { path: Option<PathBuf> },
 	Yank { paths: Vec<PathBuf>, cut: bool },
 	Renamed { from: PathBuf, to: PathBuf },
 	TaskDone { kind: TaskKind, ok: bool },
@@ -30,7 +37,7 @@ pub enum Body {
 
 /// Built-in kind names, reserved so `emit` can't be used to spoof one of
 /// them.
-pub const BUILTIN_KINDS: &[&str] = &["hi", "hey", "cd", "yank", "renamed", "task-done"];
+pub const BUILTIN_KINDS: &[&str] = &["hi", "hey", "ready", "open", "cd", "hover", "yank", "renamed", "task-done"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PeerInfo {
@@ -43,7 +50,10 @@ impl Body {
 		match self {
 			Body::Hi { .. } => "hi",
 			Body::Hey { .. } => "hey",
+			Body::Ready { .. } => "ready",
+			Body::Open { .. } => "open",
 			Body::Cd { .. } => "cd",
+			Body::Hover { .. } => "hover",
 			Body::Yank { .. } => "yank",
 			Body::Renamed { .. } => "renamed",
 			Body::TaskDone { .. } => "task-done",

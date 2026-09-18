@@ -2,17 +2,48 @@ use std::{io, path::{Path, PathBuf}};
 
 use tokio::process::Command;
 
-use crate::{notice::NoticeLevel, opener::{OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
+use crate::{config::DdsOpen, dds::Body, notice::NoticeLevel, opener::{OpenPicker, OpenTarget}, process::{ProcessCompletion, ProcessOutput, ProcessPurpose, ProcessRequest}, runner::OpenPlanner};
 
 use super::App;
 
 impl App {
 	pub(super) fn open_selected(&mut self, interactive: bool) {
+		if !interactive {
+			match self.config.dds.open {
+				DdsOpen::Parent => {
+					self.open_selected_in_parent();
+					return;
+				}
+				DdsOpen::Auto if self.controller.as_ref().is_some_and(|controller| controller.online) => {
+					self.open_selected_in_parent();
+					return;
+				}
+				DdsOpen::Auto | DdsOpen::Local => {}
+			}
+		}
 		let (id, cwd, targets) = {
 			let tab = self.active_tab_mut();
 			(tab.id, tab.tree.root.path.clone(), tab.take_open_targets())
 		};
 		self.open.open(id, cwd, targets, interactive);
+	}
+
+	fn open_selected_in_parent(&mut self) {
+		let Some(controller) = &self.controller else {
+			self.active_tab_mut().raise(NoticeLevel::Error, "open requires a controlling parent");
+			return;
+		};
+		if !controller.online {
+			self.active_tab_mut().raise(NoticeLevel::Error, "controller unavailable");
+			return;
+		}
+		let parent = controller.launch.parent;
+		let paths = self.active_tab_mut().take_open_targets();
+		let Some(client) = &self.dds_client else {
+			self.active_tab_mut().raise(NoticeLevel::Error, "DDS unavailable");
+			return;
+		};
+		client.publish_to(parent, Body::Open { paths });
 	}
 
 	pub(super) fn on_open_resolved(&mut self, tab: usize, cwd: PathBuf, interactive: bool, result: io::Result<Vec<OpenTarget>>) {

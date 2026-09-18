@@ -76,7 +76,7 @@ impl Theme {
 }
 
 impl Default for Theme {
-	fn default() -> Self { Self::load(&LoadOptions { config_dir: None, no_config: true }).expect("built-in theme must be valid") }
+	fn default() -> Self { Self::load(&LoadOptions { config_dir: None, no_config: true, ..Default::default() }).expect("built-in theme must be valid") }
 }
 
 #[derive(Deserialize)]
@@ -282,7 +282,7 @@ mod tests {
 		let directory = std::env::temp_dir().join(format!("tuzi-theme-test-{}-{nonce}", std::process::id()));
 		fs::create_dir(&directory).unwrap();
 		fs::write(directory.join("theme.toml"), "[icon]\ndirectory = { text = 'D', fg = '#112233' }\nprepend_exts = [{ name = 'rs', text = 'R', fg = 'red' }]\n[style]\n'mgr.error' = { fg = '#abcdef', bold = true }\n").unwrap();
-		let theme = Theme::load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false }).unwrap();
+		let theme = Theme::load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false, ..Default::default() }).unwrap();
 		assert_eq!(theme.icon.directory.text, "D");
 		assert_eq!(theme.icon.directory.color, Color::Rgb(0x11, 0x22, 0x33));
 		assert_eq!(theme.icon.exts[0].name, "rs");

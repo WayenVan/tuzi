@@ -25,7 +25,7 @@ I love Yazi, but some of my work calls for a more convenient tree-shaped view, e
 
 ## Install
 
-Download the macOS or Linux archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` somewhere on your `PATH`.
+Download the macOS or Linux archive for your platform from [GitHub Releases](https://github.com/WayenVan/tuzi/releases), extract it, and place `tuzi` and its companion command `tu` somewhere on your `PATH`.
 
 To build from source, install a recent Rust toolchain, clone the repository, and run:
 
@@ -46,6 +46,86 @@ tuzi [PATH]
 ```sh
 tuzi --help
 tuzi --version
+```
+
+The companion CLI can inspect and exchange messages on Tuzi's local event
+bus. Every subcommand has examples in its long help:
+
+```sh
+tu dds pub greeting '{"text":"hello"}'
+tu dds pub-to PEER_ID greeting '{"text":"hello"}'
+tu dds sub hover yank
+tu dds peers
+tu dds spawn -- /project
+tu dds pub --help
+```
+
+`sub` subscribes to every kind when no kinds are supplied. Add `--json` to
+`sub` or `peers` for script-friendly output.
+
+An editor or plugin that launches Tuzi can identify that exact DDS peer with
+a point-to-point startup handshake. Connect the controller to DDS first, then
+launch Tuzi with a fresh token and the controller's peer ID:
+
+```sh
+TUZI_DDS_PARENT=701 TUZI_DDS_TOKEN=random-launch-token tuzi /project
+```
+
+Tuzi replies directly with a `ready` payload. Its `sender` field is the new
+Tuzi peer ID. The two variables must be provided together; managed startup
+fails instead of silently disabling DDS. `--dds-parent` and `--dds-token` are
+also available for manual debugging, but environment variables avoid exposing
+the token in ordinary command arguments.
+
+For manual testing, `tu dds spawn` performs that controller workflow itself:
+
+```sh
+tu dds spawn -- /project
+tu dds spawn --json -- --config-dir /tmp/tuzi-test /project
+```
+
+It remains as the foreground wrapper while Tuzi runs, then prints the launched
+Tuzi's peer ID after the TUI restores the terminal. Keeping the wrapper alive
+is required for correct shell job control. If the handshake times out, it
+terminates the unassociated child instead of leaving an unmanaged process
+behind. Use `tu dds peers` from another terminal to inspect the live ID.
+
+`tu dds controller` is the long-running JSON Lines bridge intended for editor
+plugins. See the concise [controller protocol guide](docs/controller-protocol.md)
+for integration details. It only accepts a Tuzi after its launch token has been
+registered:
+
+```text
+← {"event":"controller-ready","protocol_version":1,"peer_id":701}
+→ {"request_id":1,"op":"register","token":"launch-token"}
+← {"request_id":1,"ok":true}
+```
+
+The editor then starts Tuzi with `TUZI_DDS_PARENT=701` and the same
+`TUZI_DDS_TOKEN`. After the Ready handshake, the controller reports and tracks
+that peer:
+
+```text
+← {"event":"tuzi-ready","token":"launch-token","peer_id":902}
+← {"event":"message","peer_id":902,"kind":"hover","body":{...}}
+→ {"request_id":2,"op":"set-state","peer_id":902,"state":{"path":"/project","selection":["README.md"]}}
+← {"request_id":2,"ok":true,"status":"queued"}
+```
+
+Only messages whose sender is a successfully controlled Tuzi are emitted.
+The token authorizes the initial handshake; runtime commands address one
+controlled `peer_id` at a time. Use `list`, `cancel-register`, `detach`, and
+`ping` to inspect or manage controller state.
+The default abilities are `hover,cd,yank,renamed,task-done`; override them with
+`--abilities`. Stdout contains JSON Lines only, while stdin EOF shuts the
+controller down.
+
+When a controlled peer disappears from `Hey`, the controller waits 500ms for
+server failover/reconnection. If it remains absent, the mapping is removed and
+the controller emits:
+
+```json
+{"event":"tuzi-left","token":"launch-token","peer_id":902}
 ```
 
 ## Configuration
@@ -102,11 +182,38 @@ error_timeout = 8
 debounce_ms = 80           # 10–5000
 max_wait_ms = 500          # 10–10000; must be >= debounce_ms
 poll_interval_ms = 1000    # 50–60000
+
+[dds]
+enabled = true
+open = "auto"             # auto, local, parent
+# Implicit events are private by default. Opt in to any of:
+# "cd", "hover", "yank", "renamed", "task-done".
+broadcast = []
 ```
 
 Use `tuzi --config-dir DIR` to select another configuration directory, or
 `tuzi --no-config` to run with the built-in defaults. `TUZI_CONFIG_HOME` can
 also set the configuration directory globally.
+
+`--runtime-config` and `--runtime-config-file` apply JSON configuration to one
+Tuzi process without editing its files. They may be repeated and are applied
+in command-line order:
+
+```sh
+tuzi --runtime-config '{
+  "config": { "dds": { "open": "parent", "broadcast": ["hover"] } },
+  "keymap": { "mgr": { "prepend_keymap": [
+    { "on": "o", "run": "open", "desc": "Open through configured route" }
+  ] } }
+}' /project
+
+tuzi --runtime-config-file /tmp/tuzi-session.json /project
+```
+
+`dds.open = "auto"` sends ordinary opens to an available controlling parent
+and otherwise uses the local opener. `local` always uses the local opener;
+`parent` requires a controlled launch and never silently falls back. Interactive
+open remains local.
 
 The embedded TOML files are the single source of truth for defaults. An
 invalid embedded preset is treated as a Tuzi bug; Rust does not maintain a
@@ -117,7 +224,7 @@ uses the system trash, while permanent deletion still requires the explicit
 `remove --permanently` command. Conflict policy `rename` chooses a free
 `(copy)` name; `error` refuses an existing target without overwriting it.
 `popup_width` applies consistently to prompts, opener dialogs, and
-confirmation dialogs. Disabling `which_key` only hides chord hints; the
+ confirmation dialogs. Disabling `which_key` only hides chord hints; the
 keymap sequences themselves continue to work.
 Watcher changes are grouped for `debounce_ms`; `max_wait_ms` forces a refresh
 during nonstop filesystem churn. `poll_interval_ms` configures notify's
@@ -298,7 +405,7 @@ Prefix keys such as `Space`, `g`, `c`, `m`, and `,` show their available command
 ## Roadmap
 
 - [x] **User configuration** — configurable keybindings, themes, and behavior without rebuilding Tuzi.
-- [ ] **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
+- [x] **Socket event bus** — a Yazi-style publish/subscribe mechanism for external commands, integrations, and inter-process communication.
 
 ## Acknowledgements
 

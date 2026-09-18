@@ -53,6 +53,7 @@ jobs:
           package="tuzi-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/${package}"
           cp "target/${{ matrix.target }}/release/tuzi" "dist/${package}/"
+          cp "target/${{ matrix.target }}/release/tu" "dist/${package}/"
           cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${package}/"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
           cd dist

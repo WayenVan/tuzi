@@ -22,6 +22,15 @@ impl Registry {
 		Self::default()
 	}
 
+	/// The kinds this process can actually handle, used as the DDS `Hi`
+	/// ability snapshot when the App connects. Sorting keeps handshakes and
+	/// tests deterministic despite `HashMap` iteration order.
+	pub fn abilities(&self) -> Vec<String> {
+		let mut kinds: Vec<_> = self.handlers.keys().cloned().collect();
+		kinds.sort_unstable();
+		kinds
+	}
+
 	// No internal subscriber exists yet (phase 1 of `.ai/dds-plan.md` only
 	// wires publishers); `sub`/`unsub` are exercised by the tests below
 	// until phase 2/3 add a real caller.
@@ -79,5 +88,15 @@ mod tests {
 		registry.sub("a", "yank", Box::new(|_| vec![Command::ToggleTasks]));
 		let commands = registry.deliver(&Body::Cd { path: PathBuf::from("/tmp") });
 		assert!(commands.is_empty());
+	}
+
+	#[test]
+	fn abilities_are_the_sorted_registered_kinds() {
+		let mut registry = Registry::new();
+		registry.sub("b", "yank", Box::new(|_| Vec::new()));
+		registry.sub("a", "cd", Box::new(|_| Vec::new()));
+		registry.sub("another", "cd", Box::new(|_| Vec::new()));
+
+		assert_eq!(registry.abilities(), ["cd", "yank"]);
 	}
 }

@@ -21,6 +21,7 @@ pub struct Config {
 	pub ui:      Ui,
 	pub notify:  Notify,
 	pub watcher: Watcher,
+	pub dds:     Dds,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -72,16 +73,37 @@ pub struct Notify { pub info_timeout: u64, pub warn_timeout: u64, pub error_time
 #[derive(Clone, Debug, PartialEq)]
 pub struct Watcher { pub debounce_ms: u64, pub max_wait_ms: u64, pub poll_interval_ms: u64 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dds {
+	pub enabled:   bool,
+	pub open:      DdsOpen,
+	/// Implicit built-in App events allowed to leave this process. Explicit
+	/// `emit` commands are governed only by `enabled`.
+	pub broadcast: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DdsOpen { Auto, Local, Parent }
+
 impl Default for Config {
 	fn default() -> Self {
 		Self::from_preset().expect("embedded tuzi-default.toml must be valid")
 	}
 }
 
+#[derive(Clone, Debug)]
+pub enum RuntimeConfigSource {
+	Inline(String),
+	File(PathBuf),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LoadOptions {
 	pub config_dir: Option<PathBuf>,
 	pub no_config:  bool,
+	/// Process-local JSON documents, applied in command-line order.
+	pub runtime_config: Vec<RuntimeConfigSource>,
 }
 
 impl Config {
@@ -89,10 +111,18 @@ impl Config {
 		let mut config = Self::from_preset().map_err(|error| format!("invalid embedded preset/tuzi-default.toml (this is a Tuzi bug): {error}"))?;
 		config.validate(Path::new("preset/tuzi-default.toml")).map_err(|error| format!("{error} (this is a Tuzi bug)"))?;
 		let loader = Loader::new(options)?;
-		let Some((path, source)) = loader.read("tuzi.toml")? else { return Ok(config) };
-		let user: UserConfig = toml::from_str(&source).map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-		user.apply(&mut config);
-		config.validate(&path)?;
+		if let Some((path, source)) = loader.read("tuzi.toml")? {
+			let user: UserConfig = toml::from_str(&source).map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+			user.apply(&mut config);
+			config.validate(&path)?;
+		}
+		for (origin, document) in runtime_documents(options)? {
+			if let Some(value) = document.get("config") {
+				let user: UserConfig = serde_json::from_value(value.clone()).map_err(|error| format!("invalid {origin} config: {error}"))?;
+				user.apply(&mut config);
+				config.validate(Path::new(&origin))?;
+			}
+		}
 		Ok(config)
 	}
 
@@ -137,9 +167,35 @@ impl Config {
 		if !(10..=10000).contains(&self.watcher.max_wait_ms) { return Err(format!("invalid {}: watcher.max_wait_ms must be between 10 and 10000", path.display())); }
 		if self.watcher.debounce_ms > self.watcher.max_wait_ms { return Err(format!("invalid {}: watcher.debounce_ms cannot exceed watcher.max_wait_ms", path.display())); }
 		if !(50..=60000).contains(&self.watcher.poll_interval_ms) { return Err(format!("invalid {}: watcher.poll_interval_ms must be between 50 and 60000", path.display())); }
+		const ALLOWED: &[&str] = &["cd", "hover", "yank", "renamed", "task-done"];
+		for kind in &self.dds.broadcast {
+			if !ALLOWED.contains(&kind.as_str()) {
+				return Err(format!("invalid {}: dds.broadcast contains unsupported kind '{kind}'", path.display()));
+			}
+		}
 		self.opener.validate().map_err(|error| format!("invalid {}: {error}", path.display()))?;
 		Ok(())
 	}
+}
+
+pub(crate) fn runtime_documents(options: &LoadOptions) -> Result<Vec<(String, serde_json::Map<String, serde_json::Value>)>, String> {
+	options.runtime_config.iter().map(|source| {
+		let (origin, json) = match source {
+			RuntimeConfigSource::Inline(json) => ("--runtime-config".to_owned(), json.clone()),
+			RuntimeConfigSource::File(path) => (
+				format!("--runtime-config-file {}", path.display()),
+				fs::read_to_string(path).map_err(|error| format!("failed to read runtime config {}: {error}", path.display()))?,
+			),
+		};
+		let document = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+			.map_err(|error| format!("invalid {origin}: {error}"))?;
+		for key in document.keys() {
+			if !matches!(key.as_str(), "config" | "keymap") {
+				return Err(format!("invalid {origin}: unknown top-level key '{key}'"));
+			}
+		}
+		Ok((origin, document))
+	}).collect()
 }
 
 /// Shared file discovery for all configuration documents. Keymap and theme
@@ -186,7 +242,7 @@ fn default_config_dir() -> Result<PathBuf, String> {
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct UserConfig { mgr: UserManager, preview: UserPreview, tasks: UserTasks, confirm: UserConfirm, fs: UserFs, ui: UserUi, notify: UserNotify, watcher: UserWatcher, opener: HashMap<String, Vec<Opener>>, open: UserOpen }
+struct UserConfig { mgr: UserManager, preview: UserPreview, tasks: UserTasks, confirm: UserConfirm, fs: UserFs, ui: UserUi, notify: UserNotify, watcher: UserWatcher, dds: UserDds, opener: HashMap<String, Vec<Opener>>, open: UserOpen }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -236,11 +292,15 @@ struct UserWatcher { debounce_ms: Option<u64>, max_wait_ms: Option<u64>, poll_in
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
+struct UserDds { enabled: Option<bool>, open: Option<DdsOpen>, broadcast: Option<Vec<String>> }
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 struct UserOpen { rules: Option<Vec<OpenRule>> }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PresetConfig { mgr: PresetManager, preview: PresetPreview, tasks: PresetTasks, confirm: PresetConfirm, fs: PresetFs, ui: PresetUi, notify: PresetNotify, watcher: PresetWatcher, opener: HashMap<String, Vec<Opener>>, open: PresetOpen }
+struct PresetConfig { mgr: PresetManager, preview: PresetPreview, tasks: PresetTasks, confirm: PresetConfirm, fs: PresetFs, ui: PresetUi, notify: PresetNotify, watcher: PresetWatcher, dds: PresetDds, opener: HashMap<String, Vec<Opener>>, open: PresetOpen }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -290,6 +350,10 @@ struct PresetWatcher { debounce_ms: u64, max_wait_ms: u64, poll_interval_ms: u64
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PresetDds { enabled: bool, open: DdsOpen, broadcast: Vec<String> }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PresetOpen { rules: Vec<OpenRule> }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -328,6 +392,7 @@ impl From<PresetConfig> for Config {
 			ui: Ui { mouse: value.ui.mouse, popup_width: value.ui.popup_width, completion_max_items: value.ui.completion_max_items, which_key: value.ui.which_key },
 			notify: Notify { info_timeout: value.notify.info_timeout, warn_timeout: value.notify.warn_timeout, error_timeout: value.notify.error_timeout },
 			watcher: Watcher { debounce_ms: value.watcher.debounce_ms, max_wait_ms: value.watcher.max_wait_ms, poll_interval_ms: value.watcher.poll_interval_ms },
+			dds: Dds { enabled: value.dds.enabled, open: value.dds.open, broadcast: value.dds.broadcast },
 			opener: OpenConfig { openers: value.opener, rules: value.open.rules },
 		}
 	}
@@ -381,6 +446,9 @@ impl UserConfig {
 		if let Some(value) = self.watcher.debounce_ms { config.watcher.debounce_ms = value; }
 		if let Some(value) = self.watcher.max_wait_ms { config.watcher.max_wait_ms = value; }
 		if let Some(value) = self.watcher.poll_interval_ms { config.watcher.poll_interval_ms = value; }
+		if let Some(value) = self.dds.enabled { config.dds.enabled = value; }
+		if let Some(value) = self.dds.open { config.dds.open = value; }
+		if let Some(value) = self.dds.broadcast { config.dds.broadcast = value; }
 		for (name, variants) in self.opener { config.opener.openers.insert(name, variants); }
 		if let Some(rules) = self.open.rules { config.opener.rules = rules; }
 	}
@@ -419,6 +487,51 @@ mod tests {
 		assert_eq!(config.notify.warn_timeout, 12);
 		assert_eq!(config.watcher.debounce_ms, 120);
 		assert_eq!(config.watcher.max_wait_ms, 500);
+	}
+
+	#[test]
+	fn dds_is_enabled_but_implicit_broadcasts_are_private_by_default() {
+		let config = Config::default();
+		assert!(config.dds.enabled);
+		assert_eq!(config.dds.open, DdsOpen::Auto);
+		assert!(config.dds.broadcast.is_empty());
+
+		let user: UserConfig = toml::from_str("[dds]\nenabled = false\nbroadcast = ['cd', 'task-done']").unwrap();
+		let mut config = Config::default();
+		user.apply(&mut config);
+		assert!(!config.dds.enabled);
+		assert_eq!(config.dds.broadcast, ["cd", "task-done"]);
+		config.validate(Path::new("test.toml")).unwrap();
+	}
+
+	#[test]
+	fn runtime_config_applies_json_documents_in_order() {
+		let options = LoadOptions {
+			no_config: true,
+			runtime_config: vec![
+				RuntimeConfigSource::Inline(r#"{"config":{"dds":{"open":"parent","broadcast":["hover"]}}}"#.into()),
+				RuntimeConfigSource::Inline(r#"{"config":{"dds":{"open":"local"}}}"#.into()),
+			],
+			..Default::default()
+		};
+		let config = Config::load(&options).unwrap();
+		assert_eq!(config.dds.open, DdsOpen::Local, "later documents win");
+		assert_eq!(config.dds.broadcast, ["hover"]);
+	}
+
+	#[test]
+	fn runtime_config_rejects_bad_json_and_unknown_keys() {
+		for value in ["not-json", r#"{"unknown":{}}"#, r#"{"config":{"dds":{"unknown":true}}}"#, r#"{"config":{"dds":{"enabled":"perhaps"}}}"#] {
+			let result = Config::load(&LoadOptions { no_config: true, runtime_config: vec![RuntimeConfigSource::Inline(value.into())], ..Default::default() });
+			assert!(result.is_err(), "{value} should be rejected");
+		}
+	}
+
+	#[test]
+	fn dds_rejects_unknown_implicit_broadcast_kinds() {
+		let mut config = Config::default();
+		config.dds.broadcast.push("set-state".into());
+		assert!(config.validate(Path::new("test.toml")).is_err());
 	}
 
 	#[test]
@@ -487,7 +600,7 @@ mod tests {
 		fs::create_dir(&directory).unwrap();
 		fs::write(directory.join("tuzi.toml"), "[mgr]\nshow_hidden = true\n[preview]\nratio = 61\n").unwrap();
 
-		let config = Config::load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false }).unwrap();
+		let config = Config::load(&LoadOptions { config_dir: Some(directory.clone()), no_config: false, ..Default::default() }).unwrap();
 		assert!(config.mgr.show_hidden);
 		assert_eq!(config.preview.ratio, 61);
 
@@ -497,8 +610,8 @@ mod tests {
 	#[test]
 	fn missing_user_file_and_no_config_both_use_the_embedded_preset() {
 		let missing = env::temp_dir().join(format!("tuzi-missing-config-{}", std::process::id()));
-		let from_missing = Config::load(&LoadOptions { config_dir: Some(missing), no_config: false }).unwrap();
-		let disabled = Config::load(&LoadOptions { config_dir: None, no_config: true }).unwrap();
+		let from_missing = Config::load(&LoadOptions { config_dir: Some(missing), no_config: false, ..Default::default() }).unwrap();
+		let disabled = Config::load(&LoadOptions { config_dir: None, no_config: true, ..Default::default() }).unwrap();
 		assert_eq!(from_missing, Config::default());
 		assert_eq!(disabled, Config::default());
 	}

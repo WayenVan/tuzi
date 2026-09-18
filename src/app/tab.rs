@@ -356,6 +356,20 @@ impl Tab {
 		self.move_cursor(1);
 	}
 
+	/// Replaces the current selection from an external state snapshot.
+	/// Relative paths are resolved against this tab's root; entries that no
+	/// longer exist or fall outside the root are ignored.
+	pub(super) fn set_selection(&mut self, paths: Vec<PathBuf>) {
+		self.selection.clear();
+		let root = self.tree.root.path.clone();
+		for path in paths {
+			let path = if path.is_absolute() { path } else { root.join(path) };
+			if path.starts_with(&root) && path.exists() {
+				self.selection.insert(path);
+			}
+		}
+	}
+
 	pub fn enter_visual(&mut self, unset: bool) {
 		self.visual = Some(Visual::new(self.cursor, unset));
 	}
@@ -737,7 +751,7 @@ impl Tab {
 		if std::fs::rename(&target, &dest).is_err() {
 			return;
 		}
-		let _ = self.tx.send(Event::Pubsub(Body::Renamed { from: target.clone(), to: dest.clone() }));
+		let _ = self.tx.send(Event::DdsPublish(Body::Renamed { from: target.clone(), to: dest.clone() }));
 
 		self.watcher.unwatch(&target);
 		self.fs_scheduler.forget(&target);
@@ -760,7 +774,7 @@ impl Tab {
 		}
 		let mut replacement = Self::open_configured(self.id, path, self.tx.clone(), self.config.clone())?;
 		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
-		let _ = self.tx.send(Event::Pubsub(Body::Cd { path: replacement.tree.root.path.clone() }));
+		let _ = self.tx.send(Event::DdsPublish(Body::Cd { path: replacement.tree.root.path.clone() }));
 		replacement.input_seq = self.input_seq;
 		replacement.sort_policy = self.sort_policy;
 		replacement.column_mode = self.column_mode;
@@ -1336,7 +1350,7 @@ mod tests {
 	async fn pump(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
 		loop {
 			let event = rx.recv().await.unwrap();
-			let done = !matches!(&event, Event::Loaded { done: false, .. } | Event::Pubsub(_));
+			let done = !matches!(&event, Event::Loaded { done: false, .. } | Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_));
 			apply(tab, event);
 			if done {
 				break;
@@ -1353,9 +1367,9 @@ mod tests {
 			Event::FilesChanged { parent, changes, .. } => tab.on_files_changed(parent, changes),
 			Event::Loaded { path, ticket, result, done, .. } => tab.on_loaded(path, ticket, result, done),
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
-			// No subscriber exists yet in these single-tab tests; a DDS
-			// publish from `cd`/rename is a no-op here.
-			Event::Pubsub(_) => {}
+			// No App/Registry exists in these single-tab tests; DDS publication
+			// from `cd`/rename is a no-op here.
+			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) => {}
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}

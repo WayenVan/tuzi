@@ -59,7 +59,8 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
-			Command::Emit { kind, data } => self.publish(Body::Custom { kind, data }),
+			Command::SetState { path, selection } => self.set_state(path, selection),
+			Command::Emit { kind, data } => self.emit(Body::Custom { kind, data }),
 		}
 		self.drain_tab_notices();
 	}
@@ -124,11 +125,16 @@ impl Dispatcher {
 			Event::OpenResolved { tab, cwd, interactive, result } => app.on_open_resolved(tab, cwd, interactive, result),
 			Event::Visited(path) => app.record_visit(path),
 			Event::Task(event) => app.on_task_event(event),
-			Event::Pubsub(body) => {
+			Event::DdsPublish(body) => app.publish(body),
+			Event::DdsDeliver(body) => {
+				if let Body::Hey { peers } = &body {
+					app.update_controller_peers(peers);
+				}
 				for command in app.pubsub.deliver(&body) {
 					app.execute(command);
 				}
 			}
+			Event::DdsRejected(error) => app.active_tab_mut().raise(crate::notice::NoticeLevel::Warn, error),
 			Event::Term(_) => {}
 		}
 		app.drain_tab_notices();

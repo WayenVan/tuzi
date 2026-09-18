@@ -47,6 +47,14 @@ debounce_ms = 80
 max_wait_ms = 500
 poll_interval_ms = 1000
 
+[dds]
+enabled = true
+# auto: parent when controlled, otherwise local; local/parent force a route.
+open = "auto"
+# Implicit App events are private by default. Add any of:
+# "cd", "hover", "yank", "renamed", "task-done".
+broadcast = []
+
 [opener]
 edit = [
 	{ run = "$EDITOR", args = ["{files}"], desc = "$EDITOR", for = "unix", block = true },

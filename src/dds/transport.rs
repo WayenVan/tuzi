@@ -1,12 +1,14 @@
-//! The Unix-socket half of DDS (`.ai/dds-plan.md` P3): whichever process
+//! The Unix-socket half of DDS (`.ai/dds-plan.md` P3/P4a): whichever process
 //! tries to connect first and finds nobody listening becomes the `Server`
-//! for every later `Client`, including itself. Kept local-only (no
+//! for every later `Client`, including itself. Clients reconnect and repeat
+//! that election if the server owner exits. Kept local-only (no
 //! `Send`-across-network transport) — every peer lives on the same
 //! machine.
 
 use std::{
 	collections::{HashMap, HashSet},
 	io,
+	os::unix::fs::{MetadataExt, PermissionsExt},
 	path::Path,
 	sync::Arc,
 	time::Duration,
@@ -15,17 +17,20 @@ use std::{
 use tokio::{
 	io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 	net::{UnixListener, UnixStream},
+	select,
 	sync::{Mutex, mpsc},
+	task::{JoinHandle, JoinSet},
 };
 
 use super::{Body, Payload, PeerId, PeerInfo, new_peer_id};
 
-/// A connected DDS client: send `publish`/`publish_to` to write onto the
-/// socket, and drain the paired receiver for payloads other peers sent us.
+/// A long-lived DDS client: send `publish`/`publish_to` to its supervisor,
+/// which maintains the socket connection, and drain the paired receiver for
+/// payloads other peers sent us.
 pub struct Client {
 	id:         PeerId,
 	outbox:     mpsc::UnboundedSender<Payload>,
-	write_task: tokio::task::JoinHandle<()>,
+	supervisor: JoinHandle<()>,
 }
 
 /// A peer that wants every kind forwarded to it, regardless of ability —
@@ -37,34 +42,18 @@ impl Client {
 	/// nothing answers. `abilities` are the kinds this client wants
 	/// forwarded from other peers — announced immediately via `Hi`.
 	pub async fn connect(socket_path: &Path, abilities: Vec<String>) -> io::Result<(Self, mpsc::UnboundedReceiver<Payload>)> {
-		let stream = connect_or_bootstrap(socket_path).await?;
-
 		let id = new_peer_id();
-		let (read_half, write_half) = stream.into_split();
+		let connection = connect_or_bootstrap(socket_path).await?;
 		let (outbox_tx, outbox_rx) = mpsc::unbounded_channel::<Payload>();
 		let (inbox_tx, inbox_rx) = mpsc::unbounded_channel::<Payload>();
-
-		let write_task = tokio::spawn(write_loop(write_half, outbox_rx));
-		tokio::spawn(async move {
-			let mut lines = BufReader::new(read_half).lines();
-			while let Ok(Some(line)) = lines.next_line().await {
-				if let Ok(payload) = serde_json::from_str::<Payload>(&line)
-					&& payload.sender != id
-				{
-					let _ = inbox_tx.send(payload);
-				}
-			}
-		});
-
-		let client = Self { id, outbox: outbox_tx, write_task };
-		let _ = client.outbox.send(Payload::broadcast(id, Body::Hi { abilities }));
+		let path = socket_path.to_path_buf();
+		let supervisor = tokio::spawn(supervise(id, abilities, path, connection, outbox_rx, inbox_tx));
+		let client = Self { id, outbox: outbox_tx, supervisor };
 		Ok((client, inbox_rx))
 	}
 
-	// No production caller needs its own id or point-to-point addressing
-	// yet (`tuzi emit`/`tuzi sub` only broadcast/listen); exercised by the
-	// tests below until a real point-to-point use case lands.
-	#[allow(dead_code)]
+	/// This connection's routing identity. Controllers use their own ID as
+	/// the parent address; a Ready payload's sender identifies the child.
 	pub fn id(&self) -> PeerId {
 		self.id
 	}
@@ -74,7 +63,6 @@ impl Client {
 		let _ = self.outbox.send(Payload::broadcast(self.id, body));
 	}
 
-	#[allow(dead_code)]
 	pub fn publish_to(&self, receiver: PeerId, body: Body) {
 		let _ = self.outbox.send(Payload { receiver, sender: self.id, body });
 	}
@@ -85,18 +73,107 @@ impl Client {
 	/// its background write task gets a chance to run.
 	pub async fn flush(self) {
 		drop(self.outbox);
-		let _ = self.write_task.await;
+		let _ = self.supervisor.await;
 	}
 }
 
-async fn write_loop(mut write_half: tokio::net::unix::OwnedWriteHalf, mut outbox: mpsc::UnboundedReceiver<Payload>) {
-	while let Some(payload) = outbox.recv().await {
-		let Ok(mut line) = serde_json::to_string(&payload) else { continue };
-		line.push('\n');
-		if write_half.write_all(line.as_bytes()).await.is_err() {
-			break;
+struct Connection {
+	stream: UnixStream,
+	/// Present only when this client won the election and hosts the server.
+	/// Keeping the handle here ties that server's lifetime to its owner.
+	server: Option<JoinHandle<()>>,
+}
+
+async fn supervise(
+	id: PeerId,
+	abilities: Vec<String>,
+	socket_path: std::path::PathBuf,
+	mut connection: Connection,
+	mut outbox: mpsc::UnboundedReceiver<Payload>,
+	inbox: mpsc::UnboundedSender<Payload>,
+) {
+	let mut pending_retry = None;
+	loop {
+		let (read_half, mut write_half) = connection.stream.into_split();
+		let mut lines = BufReader::new(read_half).lines();
+		if write_payload(&mut write_half, &Payload::broadcast(id, Body::Hi { abilities: abilities.clone() })).await.is_err() {
+			connection = reconnect(&socket_path, connection.server.take()).await;
+			continue;
+		}
+		if let Some(payload) = pending_retry.take()
+			&& write_payload(&mut write_half, &payload).await.is_err()
+		{
+			// This was the one permitted retry. Drop the payload and repair the
+			// connection without replaying it again.
+			connection = reconnect(&socket_path, connection.server.take()).await;
+			continue;
+		}
+
+		pending_retry = loop {
+			select! {
+				message = outbox.recv() => {
+					let Some(payload) = message else {
+						if let Some(server) = connection.server.take() { server.abort(); }
+						return;
+					};
+					if write_payload(&mut write_half, &payload).await.is_err() {
+						break Some(payload);
+					}
+				}
+				line = lines.next_line() => match line {
+					Ok(Some(line)) => {
+						if let Ok(payload) = serde_json::from_str::<Payload>(&line)
+							&& payload.sender != id
+						{
+							let _ = inbox.send(payload);
+						}
+					}
+					Ok(None) | Err(_) => break None,
+				}
+			}
+		};
+
+		connection = reconnect(&socket_path, connection.server.take()).await;
+	}
+}
+
+async fn reconnect(socket_path: &Path, mut owned_server: Option<JoinHandle<()>>) -> Connection {
+	// A client that owns a healthy server should reconnect to it without
+	// throwing away ownership. If that fails, stop the suspect server and
+	// join the same election as every other peer.
+	if let Some(server) = owned_server.take() {
+		if !server.is_finished()
+			&& let Ok(stream) = UnixStream::connect(socket_path).await
+		{
+			return Connection { stream, server: Some(server) };
+		}
+		server.abort();
+	}
+	let mut failures = 0;
+	loop {
+		match connect_or_bootstrap(socket_path).await {
+			Ok(connection) => return connection,
+			Err(_) => {
+				tokio::time::sleep(reconnect_backoff(failures)).await;
+				failures += 1;
+			}
 		}
 	}
+}
+
+/// The first reconnect attempt happens immediately. These delays are only
+/// paid after consecutive failures, then cap at 500ms to avoid a busy loop
+/// during a longer outage.
+const RECONNECT_BACKOFF_MS: &[u64] = &[20, 50, 100, 250, 500];
+
+fn reconnect_backoff(failures: usize) -> Duration {
+	Duration::from_millis(RECONNECT_BACKOFF_MS[failures.min(RECONNECT_BACKOFF_MS.len() - 1)])
+}
+
+async fn write_payload(write_half: &mut tokio::net::unix::OwnedWriteHalf, payload: &Payload) -> io::Result<()> {
+	let mut line = serde_json::to_string(payload).map_err(io::Error::other)?;
+	line.push('\n');
+	write_half.write_all(line.as_bytes()).await
 }
 
 struct Peer {
@@ -122,9 +199,9 @@ type PeerTable = Arc<Mutex<HashMap<PeerId, Peer>>>;
 /// for: one long-running `tuzi` plus occasional `tuzi emit`/`tuzi sub`
 /// calls, not a cold-start stampede. Jittered backoff below is enough to
 /// make that realistic case reliable.
-async fn connect_or_bootstrap(socket_path: &Path) -> io::Result<UnixStream> {
+async fn connect_or_bootstrap(socket_path: &Path) -> io::Result<Connection> {
 	if let Ok(stream) = UnixStream::connect(socket_path).await {
-		return Ok(stream);
+		return Ok(Connection { stream, server: None });
 	}
 
 	// Desyncs racers so they don't all reach "nobody answered, I'll clean
@@ -136,15 +213,15 @@ async fn connect_or_bootstrap(socket_path: &Path) -> io::Result<UnixStream> {
 	for attempt in 0..ATTEMPTS {
 		match Server::try_bind(socket_path) {
 			Ok(listener) => {
-				Server::serve(listener);
-				return UnixStream::connect(socket_path).await;
+				let server = Server::serve(listener);
+				return UnixStream::connect(socket_path).await.map(|stream| Connection { stream, server: Some(server) });
 			}
 			Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
 				// Lost the race — someone else's `bind` just won. Give
 				// them a moment to start accepting and connect to them
 				// instead of fighting over the path again.
 				if let Ok(stream) = UnixStream::connect(socket_path).await {
-					return Ok(stream);
+					return Ok(Connection { stream, server: None });
 				}
 				consecutive_dead += 1;
 				// Only clear the path once several attempts in a row
@@ -161,7 +238,7 @@ async fn connect_or_bootstrap(socket_path: &Path) -> io::Result<UnixStream> {
 		let backoff = Duration::from_millis((attempt as u64 + 1) * 10 + jitter_ms);
 		tokio::time::sleep(backoff).await;
 	}
-	UnixStream::connect(socket_path).await
+	UnixStream::connect(socket_path).await.map(|stream| Connection { stream, server: None })
 }
 
 struct Server;
@@ -170,55 +247,85 @@ impl Server {
 	fn try_bind(socket_path: &Path) -> io::Result<UnixListener> {
 		if let Some(parent) = socket_path.parent() {
 			std::fs::create_dir_all(parent)?;
+			let metadata = std::fs::metadata(parent)?;
+			// SAFETY: `geteuid` has no preconditions and only reads process state.
+			if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+				return Err(io::Error::new(io::ErrorKind::PermissionDenied, "DDS runtime directory is not owned by the current user"));
+			}
+			std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
 		}
-		UnixListener::bind(socket_path)
+		let listener = UnixListener::bind(socket_path)?;
+		if let Err(error) = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600)) {
+			drop(listener);
+			let _ = std::fs::remove_file(socket_path);
+			return Err(error);
+		}
+		Ok(listener)
 	}
 
-	fn serve(listener: UnixListener) {
+	fn serve(listener: UnixListener) -> JoinHandle<()> {
 		tokio::spawn(async move {
 			let peers: PeerTable = Arc::new(Mutex::new(HashMap::new()));
+			let mut connections = JoinSet::new();
 			while let Ok((stream, _)) = listener.accept().await {
-				tokio::spawn(handle_connection(stream, peers.clone()));
+				connections.spawn(handle_connection(stream, peers.clone()));
 			}
-		});
+		})
 	}
 }
 
 async fn handle_connection(stream: UnixStream, peers: PeerTable) {
-	let (read_half, write_half) = stream.into_split();
+	let (read_half, mut write_half) = stream.into_split();
 	let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
-	tokio::spawn(write_lines(write_half, line_rx));
+	let mut line_rx = line_rx;
 
 	let mut lines = BufReader::new(read_half).lines();
 	let mut connected: Option<PeerId> = None;
-	while let Ok(Some(line)) = lines.next_line().await {
-		let Ok(payload) = serde_json::from_str::<Payload>(&line) else { continue };
-		match &payload.body {
-			Body::Hi { abilities } => {
-				connected = Some(payload.sender);
-				route_hi(&peers, payload.sender, abilities, line_tx.clone()).await;
+	loop {
+		select! {
+			line = lines.next_line() => {
+				let Ok(Some(line)) = line else { break };
+				let Ok(payload) = serde_json::from_str::<Payload>(&line) else { continue };
+				match &payload.body {
+					Body::Hi { abilities } if connected.is_none() => {
+						if !route_hi(&peers, payload.sender, abilities, line_tx.clone()).await {
+							// Never let a new connection replace an existing peer's
+							// routing identity. Closing it forces the claimant to retry.
+							break;
+						}
+						connected = Some(payload.sender);
+					}
+					Body::Hi { .. } => break,
+					_ if connected == Some(payload.sender) => route(&peers, &payload, &line).await,
+					_ => break,
+				}
 			}
-			_ => route(&peers, &payload, &line).await,
+			message = line_rx.recv() => {
+				let Some(mut line) = message else { break };
+				line.push('\n');
+				if write_half.write_all(line.as_bytes()).await.is_err() { break; }
+			}
 		}
 	}
 	if let Some(id) = connected {
-		peers.lock().await.remove(&id);
-	}
-}
-
-async fn write_lines(mut write_half: tokio::net::unix::OwnedWriteHalf, mut lines: mpsc::UnboundedReceiver<String>) {
-	while let Some(mut line) = lines.recv().await {
-		line.push('\n');
-		if write_half.write_all(line.as_bytes()).await.is_err() {
-			break;
+		let mut table = peers.lock().await;
+		if table.remove(&id).is_some() {
+			broadcast_hey(&table);
 		}
 	}
 }
 
-async fn route_hi(peers: &PeerTable, sender: PeerId, abilities: &[String], outbox: mpsc::UnboundedSender<String>) {
+async fn route_hi(peers: &PeerTable, sender: PeerId, abilities: &[String], outbox: mpsc::UnboundedSender<String>) -> bool {
 	let mut table = peers.lock().await;
+	if table.contains_key(&sender) {
+		return false;
+	}
 	table.insert(sender, Peer { abilities: abilities.iter().cloned().collect(), outbox });
+	broadcast_hey(&table);
+	true
+}
 
+fn broadcast_hey(table: &HashMap<PeerId, Peer>) {
 	let hey = Payload::broadcast(0, Body::Hey {
 		peers: table.iter().map(|(&id, peer)| PeerInfo { id, abilities: peer.abilities.iter().cloned().collect() }).collect(),
 	});
@@ -256,7 +363,7 @@ mod tests {
 	fn unique_socket_path() -> std::path::PathBuf {
 		static COUNTER: AtomicU64 = AtomicU64::new(0);
 		let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-		std::env::temp_dir().join(format!("tuzi-dds-test-{}-{n}.sock", std::process::id()))
+		std::env::temp_dir().join(format!("tuzi-dds-test-{}-{n}", std::process::id())).join("dds.sock")
 	}
 
 	/// Consumes `Hey` broadcasts on `inbox` until one lists at least `want`
@@ -267,6 +374,17 @@ mod tests {
 			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Hey").expect("channel closed");
 			if let Body::Hey { peers } = payload.body
 				&& peers.len() >= want
+			{
+				return;
+			}
+		}
+	}
+
+	async fn wait_for_exact_peer_count(inbox: &mut mpsc::UnboundedReceiver<Payload>, want: usize) {
+		loop {
+			let payload = timeout(Duration::from_secs(2), inbox.recv()).await.expect("timed out waiting for Hey").expect("channel closed");
+			if let Body::Hey { peers } = payload.body
+				&& peers.len() == want
 			{
 				return;
 			}
@@ -335,6 +453,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn duplicate_peer_ids_do_not_replace_the_original_route() {
+		let peers: PeerTable = Default::default();
+		let (original_tx, _original_rx) = mpsc::unbounded_channel();
+		let (claimant_tx, _claimant_rx) = mpsc::unbounded_channel();
+
+		assert!(route_hi(&peers, 42, &["first".into()], original_tx).await);
+		assert!(!route_hi(&peers, 42, &["second".into()], claimant_tx).await);
+
+		let table = peers.lock().await;
+		let peer = table.get(&42).unwrap();
+		assert!(peer.abilities.contains("first"));
+		assert!(!peer.abilities.contains("second"));
+	}
+
+	#[test]
+	fn reconnects_immediately_then_uses_bounded_backoff() {
+		let delays: Vec<_> = (0..7).map(|failure| reconnect_backoff(failure).as_millis()).collect();
+		assert_eq!(delays, [20, 50, 100, 250, 500, 500, 500]);
+	}
+
+	#[tokio::test]
 	async fn a_wildcard_subscriber_sees_every_kind() {
 		let socket_path = unique_socket_path();
 
@@ -374,6 +513,60 @@ mod tests {
 
 		second.publish(Body::Cd { path: "/tmp".into() });
 		assert!(matches!(recv(&mut first_inbox).await.body, Body::Cd { .. }), "the second client's message reached the first over the socket the first one bootstrapped");
+
+		let _ = std::fs::remove_file(&socket_path);
+	}
+
+	#[tokio::test]
+	async fn disconnect_broadcasts_an_updated_peer_table() {
+		let socket_path = unique_socket_path();
+
+		let (_owner, mut owner_inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (departing, mut departing_inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (_observer, mut observer_inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+		wait_for_peer_count(&mut owner_inbox, 3).await;
+		wait_for_peer_count(&mut departing_inbox, 3).await;
+		wait_for_peer_count(&mut observer_inbox, 3).await;
+
+		departing.flush().await;
+		wait_for_exact_peer_count(&mut observer_inbox, 2).await;
+
+		let _ = std::fs::remove_file(&socket_path);
+	}
+
+	#[tokio::test]
+	async fn socket_and_runtime_directory_are_private_to_the_owner() {
+		let socket_path = unique_socket_path();
+		let (_client, _inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+
+		let directory_mode = std::fs::metadata(socket_path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+		let socket_mode = std::fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777;
+		assert_eq!(directory_mode, 0o700);
+		assert_eq!(socket_mode, 0o600);
+
+		let _ = std::fs::remove_file(&socket_path);
+	}
+
+	#[tokio::test]
+	async fn surviving_peers_re_elect_a_server_after_its_owner_exits() {
+		let socket_path = unique_socket_path();
+
+		let (owner, mut owner_inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (_subscriber, mut subscriber_inbox) = Client::connect(&socket_path, vec!["ping".into()]).await.unwrap();
+		let (publisher, mut publisher_inbox) = Client::connect(&socket_path, Vec::new()).await.unwrap();
+		wait_for_peer_count(&mut owner_inbox, 3).await;
+		wait_for_peer_count(&mut subscriber_inbox, 3).await;
+		wait_for_peer_count(&mut publisher_inbox, 3).await;
+
+		// `owner` won the initial bootstrap. Ending its supervisor also ends
+		// the server runtime and every accepted connection, just as exiting
+		// the owner process would in production.
+		owner.flush().await;
+
+		wait_for_peer_count(&mut subscriber_inbox, 2).await;
+		wait_for_peer_count(&mut publisher_inbox, 2).await;
+		publisher.publish(Body::Custom { kind: "ping".into(), data: serde_json::Value::Null });
+		assert_eq!(recv(&mut subscriber_inbox).await.body.kind(), "ping");
 
 		let _ = std::fs::remove_file(&socket_path);
 	}

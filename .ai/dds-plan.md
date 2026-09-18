@@ -61,7 +61,7 @@ dispatch）做了裁剪。
 | 层 | yazi 做法 | Tuzi 方案 |
 |---|---|---|
 | 消息模型 | `Payload{receiver,sender,body:Ember}`，闭合 enum + `Custom` 兜底 | 同构，命名为 `Payload`/`Body` |
-| 本地分发 | 绕回主循环 `accept_payload` actor 再回调 Lua | 绕回主循环，`Event::Pubsub` -> `Dispatcher` -> handler 返回 `Vec<Command>` -> `App::execute()` |
+| 本地分发 | 绕回主循环 `accept_payload` actor 再回调 Lua | 绕回主循环，`Event::DdsDeliver` -> `Dispatcher` -> handler 返回 `Vec<Command>` -> `App::execute()` |
 | 订阅表 | `LOCAL`/`REMOTE` 两张表，key 为插件名 | 结构一致，key 为模块名/subscriber id |
 | 跨进程传输 | 本机 Unix Domain Socket，先启动者自举为 server，能力握手过滤转发 | 同构直接复用 |
 
@@ -79,8 +79,8 @@ src/dds/
 ```
 
 没有 `state.rs`：`@` 静态消息持久化被明确否决（见「会话状态跨重启」
-一节），P4 不需要新增 dds 子模块，只改 `main.rs`（`--state` 解析）和
-`App::serve`（退出广播）。
+一节）。下一阶段先完善现有 `transport.rs` 的连接生命周期，再把常驻
+`Client` 接入 `App::serve`；`--state` 与退出广播顺延到 P5。
 
 `Custom(kind, data)` 兜底分支和 `serde_json` 依赖已随 P2 落地（见下面
 「实施阶段」）。`Registry` 仍然没有 yazi 那样的 `LOCAL`/`REMOTE` 两张表：
@@ -89,20 +89,19 @@ P1/P2 都是单实例场景，`REMOTE`（转发给其他实例的订阅）要等
 
 ### Body 内建 kind
 
-只把「对外语义有意义」的事件提升为 DDS topic，例如 `cd`/`yank`/
+只把「对外语义有意义」的事件提升为 DDS topic，例如 `open`/`cd`/`yank`/
 `rename`/任务完成；`Loaded`/`PreviewLoaded`/`CompletionLoaded` 这类纯
 内部 IO 分片进度继续走现有 `Event` 通道，不进入 `Body`。
 
-P3 引入跨实例传输后的目标形态（`Hi`/`Hey`/`Bye`/`Hover` 是握手和跨实例
-才需要的 kind，现在还不存在）：
+跨实例传输的目标形态如下。当前除可选的 `Bye` 外均已实现：
 
 ```rust
 pub enum Body {
-    Hi { abilities: Vec<String>, version: String },   // [P3 待实现]
-    Hey { peers: Vec<PeerInfo> },                     // [P3 待实现]
-    Bye,                                               // [P3 待实现]
+    Hi { abilities: Vec<String> },                    // [P3 已实现]
+    Hey { peers: Vec<PeerInfo> },                     // [P3 已实现]
+    Bye,                                               // [待实现，可选]
     Cd { path: PathBuf },
-    Hover { path: Option<PathBuf> },                  // [P3 待实现]
+    Hover { path: Option<PathBuf> },                  // [已实现]
     Yank { paths: Vec<PathBuf>, cut: bool },
     Renamed { from: PathBuf, to: PathBuf },
     TaskDone { kind: TaskKind, ok: bool },
@@ -135,7 +134,7 @@ pub enum Event {
 
 ```rust
 // src/app/dispatcher.rs 的 dispatch_event 里
-Event::Pubsub(payload) => dds::registry::deliver(app, payload),
+Event::DdsDeliver(payload) => dds::registry::deliver(app, payload),
 ```
 
 `deliver` 查表拿到 handler 列表并调用，handler **不直接 mutate
@@ -158,21 +157,22 @@ impl Registry {
 
 同一 subscriber 对同一 kind 只能注册一次（对齐 yazi 防重复订阅行为）。
 
-这里没有 yazi 式的 `sub_remote`/统一 `Pubsub` 门面——`Registry`（本地订阅
-表）和 `dds::Client`（P3 的 socket 客户端）目前是两个独立的东西，没有
-互相打通：`Registry` 只服务进程内订阅（`Event::Pubsub` -> `deliver` ->
-`Command`），`Client` 只服务 `tuzi emit`/`tuzi sub` 这两个不跑 TUI 的
-独立 CLI 调用。交互式的 `App` 目前不持有 `Client`，也就是说**正在运行
-的 TUI 还没有接入 socket，收不到别的实例/`tuzi emit` 发来的消息**——
-这是 P4 要补上的集成工作（见下面「实施阶段」），ability 策略已定为
-方案 A：`App` 用通配符 `dds::WILDCARD_ABILITY` 声明，照单全收交给本地
-`Registry.deliver` 按 kind 过滤。
+这里没有 yazi 式的 `sub_remote`/统一 `Pubsub` 门面：`Registry` 仍只负责
+进程内 `Body -> Command`，`dds::Client` 只负责 socket 生命周期和传输。
+P4 已把两者在 App 边界接通：建立 Client 前完成内建 Registry 注册，再用
+`Registry::abilities()` 的 kind 快照发送 `Hi`；socket inbox 回灌
+`Event::DdsDeliver` 后仍由 Registry 决定如何处理。当前生产订阅只有
+`set-state`，所以 TUI 声明 `["set-state"]`；通配符 `"*"` 只给
+`tuzi sub` 这种调试流量探针使用。
 
 ### 跨实例传输（P3 已实现，见下面「实施阶段」的细节）
 
-- Socket 路径：`$XDG_RUNTIME_DIR/tuzi/dds.sock`，缺省回退系统临时目录
+- Socket 路径：`$XDG_RUNTIME_DIR/tuzi/dds.sock`，缺省回退系统临时目录下
+  带有效 UID 的 `tuzi-<uid>/dds.sock`，避免不同本机用户共享路径
   （`src/dds/payload.rs::socket_path`，手写 env 查找，风格对齐
   `config::default_config_dir`，没有引入 XDG crate）。
+  Server 校验 runtime 目录归当前用户所有并收紧为 `0700`，socket 为
+  `0600`。
 - 协议：换行分隔的单行 JSON object，用 `Payload`/`Body` 的默认 serde
   enum 表示（`{"Cd":{"path":"..."}}` 这种外部打标签形式），比 yazi 的
   逗号分隔混合格式更简单，两端都是 Rust，不需要跨语言兼容，仍保持纯
@@ -184,16 +184,22 @@ impl Registry {
 - 不做 `@` 静态消息持久化/服务端缓存——跨重启的状态恢复已经明确划给
   外部程序负责（见「会话状态跨重启」一节），tuzi 自己不缓存任何保留值。
 
-### CLI 对外接口（P3 已实现）
+### CLI 对外接口（已实现）
 
-- `tuzi emit <kind> [json]`：一次性发布，`json` 缺省 `null`，`kind` 为空
+- `tu dds pub <kind> [json]`：一次性广播，`json` 缺省 `null`，`kind` 为空
   或撞上 `dds::BUILTIN_KINDS` 会被拒绝。不需要声明 ability（只发不收）。
-- `tuzi sub`：声明通配符 ability `dds::WILDCARD_ABILITY`（`"*"`），打印
-  收到的每条消息（一行一个 JSON `Body`），直到被中断——`ya sub` 的等价
+- `tu dds pub-to <peer-id> <kind> [json]`：绕过 ability 过滤，定点发送给
+  一个在线 peer。
+- `tu dds sub [kind...]`：声明给定 ability；未给 kind 时声明通配符
+  `dds::WILDCARD_ABILITY`（`"*"`），持续打印收到的消息；`--json` 输出
+  一行一个完整 JSON `Payload`。这是 `ya sub` 的等价
   物，没有做 yazi 那样的 `--local-events`/`--remote-events` 过滤参数
-  （用不上：`tuzi sub` 本身就是唯一目的是看流量的调试用途，不像 yazi
+  （用不上：`tu dds sub` 本身就是唯一目的是看流量的调试用途，不像 yazi
   那样要跟正常运行的 TUI 共享同一个二进制的参数体系）。
-- 两个子命令都是 `src/main.rs` 里 `Cli` 枚举新增的两个变体，识别方式是
+- `tu dds peers` 等待一次 `Hey` 并打印 peer id 与 abilities；`sub`/`peers`
+  都支持 `--json`。每个 clap 子命令的 `--help` 内置可直接复制的示例。
+- 旧的 `tuzi emit` / `tuzi sub` 暂时保留为兼容入口；新的 DDS 命令不再与
+  `[PATH]` 位置参数争用。旧入口仍存在
   "第一个参数字面量等于 `emit`/`sub`"，跟已有的 `[PATH]` 位置参数解析
   共用同一个 `parse_args`。真有目录字面量叫 `emit`/`sub` 时用
   `tuzi -- emit`/`tuzi -- sub` 转义（复用已有的 `--` 语法，不是新加的）。
@@ -231,14 +237,12 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
    }
    struct RestoreState { selection: Vec<PathBuf> }
    ```
-2. **退出时广播**：`App::serve` 主循环 `app.quit` 即将返回前，做一次
-   跟 `tuzi emit` 内部逻辑完全一样的一次性发布——连接 DDS socket、
-   `client.publish(Body::Custom { kind: "exit-state", data: {"path":
-   ..., "selection": [...]} })`、`client.flush().await`、再真正退出。
-   **不需要**让 App 常驻加入 socket、不需要解决"App 该声明哪些
-   ability"这个之前搁置的难题——退出广播只是最后连一下、发一条、走人，
-   跟正在运行时是否已经是 DDS peer无关。给这次连接+发布+flush 包一个
-   超时（例如 500ms），避免 socket 有问题时卡住退出流程。
+2. **退出时广播**：`App::serve` 主循环 `app.quit` 即将返回前，通过 P4b
+   已接入的常驻 DDS Client 发布 `Body::Custom { kind: "exit-state", data:
+   {"path": ..., "selection": [...]} }`，等待已排队消息完成写入后再退出。
+   给收尾过程设置短超时（例如 500ms），避免 socket 故障卡住退出。早期
+   方案曾考虑退出时临时连接；该方案已经废弃，因为 TUI 在 P4b 会成为
+   常驻 Peer，并且运行期间也需要收发 `set-state` 等消息。
 
 这样设计的关键含义，需要用户理解并在写外部包装脚本时对应处理：
 
@@ -259,7 +263,7 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
 
 ## 实施阶段
 
-1. **P1 内部骨架**（已完成）：`src/dds/{body,registry}.rs` + `Event::Pubsub`
+1. **P1 内部骨架**（已完成）：`src/dds/{body,registry}.rs` + `Event::DdsDeliver`
    接线，纯进程内、无 socket。已把 `cd`（`Tab::cd_inner`）、`yank`
    （`App::yank_selected`）、`rename`（`Tab::confirm_rename`）、任务完成
    （`App::on_task_event`）四个内部事件迁到这条路径。`Registry` 是
@@ -269,13 +273,13 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
    sender,...}` 信封结构——单实例场景下这些字段没有意义，留到 P3 引入
    跨实例传输时再加。已用
    `app::tests::a_pubsub_subscriber_can_drive_app_state_through_a_yank`
-   验证端到端链路：订阅 -> 发布 -> `Event::Pubsub` -> `Dispatcher` ->
+   验证端到端链路：订阅 -> 发布 -> `Event::DdsDeliver` -> `Dispatcher` ->
    `App::execute()`。
    - 涉及测试基础设施的连带修改：`app.rs`/`tab.rs` 测试模块里的 `pump`/
      `apply` 辅助函数原先假设事件通道里只有测试期望的那一个事件，新增
-     的 `Event::Pubsub` 会先于目标事件被消费掉，导致既有测试断言错位。
+     的 `Event::DdsDeliver` 会先于目标事件被消费掉，导致既有测试断言错位。
      两处 `pump` 都已改为「跳过 Pubsub 事件继续等待」，`tab.rs` 的
-     `apply` 对 `Event::Pubsub(_)` 显式忽略（无订阅者时是合法的空操作）。
+     `apply` 对 `Event::DdsDeliver(_)` 显式忽略（无订阅者时是合法的空操作）。
 2. **P2 CLI 可编程**（已完成）：新增 `Command::Emit { kind: String, data:
    serde_json::Value }`，让 keymap/`:` 命令能发布任意 custom kind，不
    依赖 socket。语法定为 `emit <kind> [json]`：
@@ -293,7 +297,7 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      （`serde_json::Value` 含 `f64`，不能 `Eq`），连带 `keymap::Route`
      也去掉了 `Eq`。
    - 端到端测试：`app::tests::the_emit_command_publishes_a_custom_kind_with_its_json_payload`
-     跑通 `":emit ..."` 解析 -> `execute` -> `Event::Pubsub` ->
+     跑通 `":emit ..."` 解析 -> `execute` -> `Event::DdsDeliver` ->
      `Dispatcher` -> 订阅者收到 `data` 且产生的 `Command` 被执行。
 3. **P3 跨实例 socket**（已完成）：新增 `src/dds/{payload,transport}.rs`
    + `Cargo.toml` 加 `serde_json`/tokio `net` feature + `TaskKind` 补
@@ -302,12 +306,13 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      失败则 `connect_or_bootstrap` 尝试自举 server 再连自己；返回
      `(Client, mpsc::UnboundedReceiver<Payload>)`。`Client::publish`/
      `publish_to`/`flush`（后者给 `tuzi emit` 这种一次性调用用，关闭
-     发送端并等后台写任务把已入队的消息真正落到 socket 上再返回）。
+     发送端并等 supervisor 把已入队的消息真正落到 socket 上再返回）。
    - `Server`（`transport.rs` 内部私有，外部拿不到句柄）：`try_bind` +
      `serve`（accept 循环，每个连接一对读写 task + 一份 `PeerTable`）。
      `Hi` -> 记录 ability -> 广播 `Hey`；`receiver==0` 按 ability 过滤
      广播（含通配符 `dds::WILDCARD_ABILITY = "*"`，`tuzi sub` 用它收
-     全部消息）；`receiver!=0` 定点转发；连接断开时移出 peer 表。
+     全部消息）；`receiver!=0` 定点转发；连接断开时移出 peer 表并立即向
+     剩余 Peer 广播新版 `Hey`，避免各 Client 持有过期的 Peer 列表。
    - `tuzi emit <kind> [json]` / `tuzi sub`：`src/main.rs` 新增 `Cli`
      变体，`parse_args` 在进入原有的位置参数解析前先看第一个参数是不是
      字面量 `emit`/`sub`。
@@ -326,42 +331,66 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
      变体，靠连接断开（EOF）让 server 清理 peer 表，没做 yazi 那样的
      优雅下线握手；没有 `@` 静态消息持久化（已明确不做，见「会话状态
      跨重启」一节）。
-4. **P4 App 接入 DDS 主循环 + `Command::SetState`**：不再是预先搭脚手架
-   ——现在有明确的真实需求驱动：广播 App 当前 state，并允许其它客户端
-   发"设置 state"的消息来改这个 App 的状态。结论：**这个需求靠现有的
-   `Command` 机制就能优雅实现，不需要引入 Event/State 双轨模型**——
-   "收到消息 -> 翻译成 Command -> `App::execute()`"跟按键触发完全是
-   同一条路，"广播 state"也就是普通的一次性 `publish`，都不需要
-   "保留最新值可查询"这个语义。具体：
-   - `App` 新增字段持有一个常驻 `dds::Client`：`App::serve` 构造
+4. **P4a DDS 连接生命周期闭环**（已完成）：先让传输层在承载 Server 的
+   进程退出后能够自行恢复，再接业务层。当前 P3 只会在首次连接时自举
+   Server；连接建立后若读到 EOF 或写入失败，读写 task 会直接结束，仍在
+   运行的 Peer 不会重连。这会让后续所有 App 集成都建立在不稳定的生命周期
+   上。P4a 只修改 `src/dds/transport.rs` 及其测试，不接触 `App`、
+   `Registry`、`Command`：
+   - 把 `Client` 重构为常驻连接管理器；它保存自己的 `id`、abilities 和
+     出站队列，并在内部拥有单一 supervisor task。
+   - 首次连接和断线重连共用同一条 `connect_or_bootstrap` 路径；读 EOF 或
+     写失败后立即进行第一次重连/选主。只有连续失败才按
+     `20ms -> 50ms -> 100ms -> 250ms -> 500ms` 退避并封顶，避免长故障
+     期间忙循环。
+   - 每次成功连接都重新发送 `Hi`，确保新 Server 恢复该 Peer 的 abilities；
+     已收到的 `Hey` 继续通过 inbox 交给上层。
+   - 写失败时只重试当前尚未确认写入的消息一次；DDS 仍是 best-effort，
+     不引入 ACK、磁盘队列或 exactly-once 语义。
+   - 保持 `Registry` 与传输层完全独立：Registry 只做进程内
+     `Body -> Vec<Command>`，不参与连接、选主和重连。
+   - 已新增确定性测试：启动 Server-owner 与两个 Peer，终止 owner 后验证
+     幸存 Peer 能重新选出 Server、重发 `Hi`，并继续相互收发。
+
+5. **P4b App 接入 DDS 主循环 + `Command::SetState`**（已完成）：P4a
+   通过后再让 TUI
+   成为可靠的常驻 Peer。真实需求是广播 App 当前 state，并允许其它客户端
+   发"设置 state"的消息来改这个 App 的状态。这个需求复用现有 `Command`
+   机制，不引入 Event/State 双轨模型："收到消息 -> 翻译成 Command ->
+   `App::execute()`"跟按键触发走同一条路。具体：
+   - [已完成] `App` 新增字段持有一个常驻 `dds::Client`：`App::serve` 构造
      `App` 之后 `Client::connect(socket_path, abilities)` 一次，贯穿
      整个运行期（不再是 `tuzi emit`/`tuzi sub` 那种一次性连接）。
-   - ability 策略：先用通配符 `dds::WILDCARD_ABILITY`（`"*"`），照单全收
-     交给本地 `Registry.deliver` 过滤——没人订阅的 kind 就是空操作，
-     简单；等真出现性能/噪音问题，再收紧成"只声明 `Registry` 里已注册
-     的 kind 集合"。
-   - 后台任务把 `Client` 收到的 `Payload` 转成 `Event::Pubsub(body)`
+   - [已完成] ability 策略：`Registry::abilities()` 返回去重、排序后的已
+     注册 kind，App 用该启动时快照发送 `Hi`。当前值为 `["set-state"]`；
+     `tuzi sub` 仍用 `"*"` 接收全部流量。运行期动态 sub/unsub 尚无生产
+     用例；未来若加入，需要在注册表变化后重新发送 `Hi`。
+   - [已完成] 后台任务把 `Client` 收到的 `Payload` 转成 `Event::DdsDeliver(body)`
      灌回 `tx`，直接复用 P1 已有的 `Dispatcher::dispatch_event ->
      Registry.deliver -> Command -> App::execute()`，不需要新写分发
      逻辑。
-   - `App::publish` 同时对外广播（不再只 `tx.send` 本地）——本地事件
-     （`cd`/`yank`/`emit` 等）从此也对外可见，这是"广播 state"这个
-     需求成立的前提。
-   - 新增 `Command::SetState { path: Option<PathBuf>, selection:
+   - [已完成] 本地生产者通过 `Event::DdsPublish` 与本地分发
+     `Event::DdsDeliver` 明确区分，防止入站消息形成广播回路。显式 `emit`
+     在 DDS 启用时直接外发；隐式 `cd`/`hover`/`yank`/`renamed`/`task-done` 只有
+     列入 `dds.broadcast` allowlist 才外发，默认列表为空。
+   - [已完成] 新增 `Command::SetState { path: Option<PathBuf>, selection:
      Vec<PathBuf> }`（字段跟下面 P5 的 `--state`/`RestoreState` 保持
      一致——出现第二个"批量应用一份状态快照"的场景时，就值得让两者共用
      同一个 apply 函数）。
-   - 注册一个内建订阅者（`registry.sub("core", "set-state", handler)`），
+   - [已完成] 注册一个内建订阅者（`registry.sub("core", "set-state", handler)`），
      把 `Body::Custom { kind: "set-state", data }` 翻译成
      `Command::SetState`。
+   - `selection` 中的相对路径以应用 state 后的 tab root 为基准；绝对路径
+     必须位于该 root 下。不存在或越出 root 的路径静默忽略。这样即使新
+     root 的异步 listing 尚未返回，也能基于文件系统安全恢复 selection。
    - "广播 state"的具体触发点（每次 cd/yank 都广播，还是只在显式请求
      时才广播）留到实现时定，见「尚待确认事项」。
-5. **P5 会话状态跨重启**：按上面「会话状态跨重启：交给外部程序」一节
+6. **P5 会话状态跨重启**：按上面「会话状态跨重启：交给外部程序」一节
    实施——`Cli::Run` 加 `state: Option<RestoreState>` 字段和
    `--state <JSON>` 解析；`RestoreState { selection: Vec<PathBuf> }`
-   应用到初始 tab 的 `selection`（跟 P4 的 `Command::SetState` 共用同一
+   应用到初始 tab 的 `selection`（跟 P4b 的 `Command::SetState` 共用同一
    个 apply 函数）；`App::serve` 的 `quit` 分支退出前广播
-   `Body::Custom { kind: "exit-state", data: {...} }`——P4 落地后 `App`
+   `Body::Custom { kind: "exit-state", data: {...} }`——P4b 落地后 `App`
    已经持有常驻 `Client`，这里直接复用它 `publish` 一次 + `flush`，
    不用再像最初设想的那样单独开一次一次性连接。**不需要**
    `publish_state`/`get_state`、不需要磁盘持久化、不需要
@@ -369,19 +398,24 @@ tuzi 的职责收窄成两件对称的事，都是**一次性广播/一次性接
 
 每阶段应可独立验证、独立提交，不必一次性大改完才能用。
 
+## 已确认的实施顺序
+
+P4a 与 P4b 已完成并通过测试：TUI 是声明 Registry 精确 ability 的常驻
+Peer（当前为 `set-state`），socket inbox 会回灌 `Event::DdsDeliver`，显式
+emit 会对外广播，隐式内建事件受 `dds.broadcast` allowlist 控制；
+`set-state` 会经 Registry 转为 `Command::SetState`。
+下一步进入 P5，实现 `--state` 启动注入和 `exit-state` 退出广播。
+
 ## 尚待确认事项
 
-- P4 的具体广播触发点：`App::publish` 已经统一对外广播之后，是不是
-  所有内部事件（`cd`/`yank`/`renamed`/`task-done`）都无条件对外广播，
-  还是只有显式的 `Command::Emit`/`SetState` 相关的才广播？全量广播最
-  简单，但意味着"这个人在哪个目录、选中了什么"默认就是对外可见的——
-  要不要留一个配置项关掉，等实现时定。
 - `src/actor/` 空存根是否要在本计划里复用或先删除，需与用户确认。
 - `--state` 目前只设计了 `selection` 一个字段；要不要扩展到
   `sort_policy`/`column_mode`/展开的子树等，等外部程序真的需要时再加，
   不必一次性照搬全部 Tab 字段。
-- 退出广播的超时时长（草案 500ms）、以及 socket 连接失败时是否要给用户
-  一个可见的警告还是静默放弃退出流程，留到 P4 实现时定。
+- P4b 首次 DDS 连接失败时，TUI 是否降级为纯本地模式并显示 warning；建议
+  降级，不让辅助总线阻止文件管理器启动。P4a 内部的暂时断线则自动重连。
+- 退出广播的超时时长（草案 500ms）、以及最终发送失败时是否给用户一个
+  可见警告还是静默退出，留到 P5 实现时定。
 
 ## 续接建议
 
@@ -393,5 +427,6 @@ cargo test
 git diff --check
 ```
 
-确认基线后，从「P1 内部骨架」开始实施；若 P1 已完成，检查本文件的
-「实施阶段」章节确认当前进度并继续下一阶段。
+确认基线后，检查本文件「实施阶段」的当前进度。当前 P1-P4b 已完成，下一步
+是 **P5 会话状态跨重启**：让 `--state` 与 `Command::SetState` 共用状态应用
+路径，然后实现带短超时的 `exit-state` 退出广播。
