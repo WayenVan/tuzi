@@ -138,11 +138,12 @@ Only messages whose sender is a successfully controlled Tuzi are emitted.
 The token authorizes the initial handshake; runtime commands address one
 controlled `peer_id` at a time. Use `list`, `cancel-register`, `detach`, and
 `ping` to inspect or manage controller state.
-The default abilities are `cd,yank,renamed,task-done`; add `hover` with
-`--abilities` when cursor movement events are needed. A controlled Tuzi sends
-matching state events directly to its online parent by default. Events
-explicitly listed in `dds.broadcast` are public broadcasts instead. Stdout
-contains JSON Lines only, while stdin EOF shuts the controller down.
+The default abilities are `cd,yank,renamed,task-done`; pass a complete
+`--abilities` list including `hover` when cursor movement events are needed.
+A controlled Tuzi sends matching state events directly to its online parent
+by default. Events explicitly listed in `dds.broadcast` are public broadcasts
+instead. Stdout contains JSON Lines only, while stdin EOF shuts the controller
+down.
 
 When a controlled peer disappears from `Sync`, the controller waits 500ms for
 server failover/reconnection. If it remains absent, the mapping is removed and

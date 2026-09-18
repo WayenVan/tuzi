@@ -21,6 +21,11 @@ stdout. Keep the process running for the lifetime of the editor.
 Clients must check `protocol_version` before sending requests. Version `2` is
 the protocol documented on this page.
 
+Version 2 replaces the version 1 `set-state` request with
+`{"op":"update-tab","update":{...}}`. The old op and `state` request field
+are no longer accepted. `get-state`, `restore-state`, and `tuzi-exit` continue
+to use `state` for a complete session snapshot.
+
 Implemented operations are `register`, `cancel-register`, `list`, `detach`,
 `update-tab`, `get-tabs`, `switch-tab`, `get-state`, `reveal`, `restore-state`,
 `publish`, and `ping`.
@@ -54,13 +59,13 @@ Request shapes:
 {"request_id":3,"op":"list"}
 {"request_id":4,"op":"detach","peer_id":902}
 {"request_id":5,"op":"update-tab","peer_id":902,"update":{"path":"/project","selection":["README.md"]}}
-{"request_id":11,"op":"get-tabs","peer_id":902}
-{"request_id":12,"op":"switch-tab","peer_id":902,"tab_id":3}
 {"request_id":6,"op":"get-state","peer_id":902}
 {"request_id":7,"op":"reveal","peer_id":902,"path":"/project/src/main.rs"}
 {"request_id":8,"op":"restore-state","peer_id":902,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/project","cursor":"/project/README.md","selection":[],"expanded":["/project/src"]}]}}
 {"request_id":9,"op":"publish","peer_id":902,"kind":"plugin-event","data":{"value":1}}
 {"request_id":10,"op":"ping"}
+{"request_id":11,"op":"get-tabs","peer_id":902}
+{"request_id":12,"op":"switch-tab","peer_id":902,"tab_id":3}
 ```
 
 ## Event reference
@@ -112,8 +117,8 @@ the returned `peer_id` for runtime operations.
 
 ## Receive events
 
-Messages from controlled Tuzi instances are emitted as (when the controller
-subscribes to that event kind):
+When the controller subscribes to `hover`, a controlled Tuzi's cursor events
+appear as:
 
 ```json
 {"event":"message","peer_id":902,"kind":"hover","body":{"Hover":{"path":"/project/src/main.rs"}}}
@@ -127,11 +132,16 @@ to the controller in the same event envelope:
 ```
 
 The default abilities are `cd,yank,renamed,task-done`. Cursor movement can
-produce frequent `hover` events, so subscribe explicitly when needed:
+produce frequent `hover` events, so subscribe explicitly when needed.
+`--abilities` replaces the full default list:
 
 ```sh
 tu dds controller --abilities hover,cd,renamed
 ```
+
+Abilities select implicit state events sent directly by Tuzi and public DDS
+broadcasts delivered by the server. They do not gate direct protocol messages
+such as `Attach`, `Open`, `State`, `Tabs`, or `SessionEnd`.
 
 A controlled Tuzi sends these implicit state events directly to this parent
 when it is online and advertised the matching ability. An event explicitly
@@ -155,10 +165,11 @@ directory and selection with the typed `update-tab` operation:
 {"request_id":2,"ok":true,"status":"queued"}
 ```
 
-For `update-tab`, `switch-tab`, `reveal`, `restore-state`, and `publish`, `status: "queued"` means the
-target was controlled, online, declared the requested ability, and the message
-was queued for DDS delivery. It does not claim that Tuzi has already applied
-the action. An error response has `ok: false` and an `error` string.
+For `update-tab`, `switch-tab`, `reveal`, `restore-state`, and `publish`,
+`status: "queued"` means the target was controlled, online, declared the
+requested ability, and the message was queued for DDS delivery. It does not
+claim that Tuzi has already applied the action. An error response has
+`ok: false` and an `error` string.
 
 `reveal` tries to show an absolute path in the active tab without changing
 that tab's root or selection. Tuzi expands the path's ancestors and moves the
@@ -213,8 +224,8 @@ paths still exist. If a path has vanished or a restore limit is exceeded,
 `get-state` returns an error instead of a partial snapshot. The controller
 also returns an error if the peer leaves, is detached, or does not reply
 within five seconds. `get-tabs` has the same request timeout. Unlike
-state-changing operations, these queries have no
-intermediate `queued` response.
+state-changing operations, these queries have no intermediate `queued`
+response.
 
 Use `restore-state` to replace the whole session:
 
@@ -331,15 +342,16 @@ Closing controller stdin shuts the controller down.
 `request_id` matches a response to a request. It only needs to be unique among
 currently pending requests. Responses can arrive asynchronously, so callers
 should keep a `request_id -> callback` map and apply a timeout to each request.
-While a `get-state` or `get-tabs` is pending, the controller rejects any second request with
-the same `request_id` without attaching that ID to the rejection, so it cannot
-be mistaken for the first request's final response.
+While a `get-state` or `get-tabs` is pending, the controller rejects any second
+request with the same `request_id` without attaching that ID to the rejection,
+so it cannot be mistaken for the first request's final response.
 
 ## Identity model
 
 The launch token authorizes only the initial handshake. Runtime operations use
-one `peer_id` at a time. Tuzi accepts `update-tab`, `switch-tab`, `get-tabs`, `get-state`, `reveal`, and `restore-state` from its
-saved parent peer only, and the DDS server binds every sender ID to the
-connection that completed the `Join` handshake so another client cannot spoof
-the parent ID. Tuzi also checks that a directed control operation is supported
-and that its JSON schema is valid; rejected messages produce a local warning.
+one `peer_id` at a time. Tuzi accepts `update-tab`, `switch-tab`, `get-tabs`,
+`get-state`, `reveal`, and `restore-state` from its saved parent peer only, and
+the DDS server binds every sender ID to the connection that completed the
+`Join` handshake so another client cannot spoof the parent ID. Tuzi also
+checks that a directed control operation is supported and that its JSON schema
+is valid; rejected messages produce a local warning.

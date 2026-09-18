@@ -39,7 +39,11 @@ Broadcast delivery requires the receiver to declare the matching ability or
 the wildcard ability `*`. Direct DDS routing itself does not inspect abilities;
 controller performs an ability check before sending, and controlled Tuzi does
 the final receiver-side check. For implicit state events, Tuzi also checks its
-parent's advertised abilities before sending directly.
+parent's advertised abilities before sending directly. `tu dds controller`
+advertises `cd,yank,renamed,task-done` by default; use `--abilities` to replace
+that list and include `hover` when cursor events are needed. Direct protocol
+messages such as `Attach`, `Open`, `State`, `Tabs`, and `SessionEnd` do not
+require a matching receiver ability.
 
 ## Handshake messages
 
@@ -51,7 +55,7 @@ parent's advertised abilities before sending directly.
 ID, or a later message with a different sender ID closes that connection.
 
 ```json
-{"Sync":{"peers":[{"id":701,"abilities":["hover","cd"]},{"id":902,"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}]}}
+{"Sync":{"peers":[{"id":701,"abilities":["cd","yank","renamed","task-done"]},{"id":902,"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}]}}
 ```
 
 `Sync` is emitted whenever the connected peer table changes.
@@ -175,8 +179,7 @@ implicit broadcast allowlist but still require DDS to be enabled. The built-in
 names `join`, `sync`, `attach`, `open`, `cd`, `hover`, `yank`, `renamed`, and
 `task-done`, plus `get-state`, `get-tabs`, `state`, `state-error`, `tabs`, and
 `session-end` are reserved. Controller additionally reserves `update-tab`,
-`switch-tab`, `restore-state`, and `reveal`
-for their typed operations.
+`switch-tab`, `restore-state`, and `reveal` for their controller operations.
 
 ## Privacy and authentication
 
