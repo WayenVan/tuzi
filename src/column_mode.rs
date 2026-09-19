@@ -22,7 +22,7 @@ impl ColumnMode {
 	}
 }
 
-fn format_modified(modified: SystemTime) -> String {
+pub(crate) fn format_modified(modified: SystemTime) -> String {
 	let seconds = SystemTime::now().duration_since(modified).unwrap_or_default().as_secs();
 	match seconds {
 		0..60 => format!("{seconds}s ago"),

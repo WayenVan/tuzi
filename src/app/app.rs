@@ -55,6 +55,9 @@ pub struct App {
 	pub(super) theme: Theme,
 	pub(super) open: OpenScheduler,
 	pub(super) open_picker: Option<OpenPicker>,
+	pub(super) entry_details: bool,
+	pub(super) entry_details_scroll: u16,
+	pub(super) filename_peek: bool,
 	pub(super) processes: VecDeque<ProcessRequest>,
 	pub(super) tx: mpsc::UnboundedSender<Event>,
 	pub(super) pubsub: dds::Registry,
@@ -157,6 +160,9 @@ impl App {
 			theme,
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
+			entry_details: false,
+			entry_details_scroll: 0,
+			filename_peek: config.ui.filename_peek,
 			processes: VecDeque::new(),
 			tasks: TaskManager::configured(tx.clone(), config.tasks.clone()),
 			notices: Vec::new(),
@@ -401,7 +407,7 @@ impl App {
 		if !self.config.ui.mouse { return false; }
 		// Like Yazi, overlays own the input layer: do not let a click leak
 		// through to the manager underneath them.
-		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
+		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.entry_details || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
 			self.mouse.resizing = false;
 			return false;
 		}
@@ -512,6 +518,23 @@ impl App {
 				}
 				KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => {
 					self.tasks.visible = false;
+					true
+				}
+				_ => false,
+			};
+		}
+		if self.entry_details {
+			return match key.code {
+				KeyCode::Up | KeyCode::Char('k') => {
+					self.entry_details_scroll = self.entry_details_scroll.saturating_sub(1);
+					true
+				}
+				KeyCode::Down | KeyCode::Char('j') => {
+					self.entry_details_scroll = self.entry_details_scroll.saturating_add(1);
+					true
+				}
+				KeyCode::Esc | KeyCode::Char('q') => {
+					self.entry_details = false;
 					true
 				}
 				_ => false,
@@ -1003,6 +1026,9 @@ mod tests {
 			theme: Theme::default(),
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
+			entry_details: false,
+			entry_details_scroll: 0,
+			filename_peek: false,
 			processes: VecDeque::new(),
 			tasks: TaskManager::new(tx.clone()),
 			notices: Vec::new(),
@@ -1185,6 +1211,26 @@ mod tests {
 		let mut router = Router::default();
 		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &mut router));
 		assert!(app.which.is_empty());
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn entry_details_is_modal_and_closes_with_q_or_escape() {
+		let root = std::env::temp_dir().join("tuzi-app-test-entry-details");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let mut router = Router::default();
+
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut router));
+		assert!(app.entry_details);
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &mut router));
+		assert!(!app.entry_details);
+
+		app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut router);
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut router));
+		assert!(!app.entry_details);
 		fs::remove_dir_all(root).unwrap();
 	}
 

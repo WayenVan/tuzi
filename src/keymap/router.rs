@@ -86,6 +86,14 @@ mod tests {
 	}
 
 	#[test]
+	fn uppercase_k_opens_entry_details_without_replacing_lowercase_movement() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char('K')), Route::Commands(vec![Command::EntryDetails]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('k')), Route::Commands(vec![Command::Cursor(CursorTarget::Relative(-1))]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('I')), Route::Commands(vec![Command::ToggleFilenamePeek]));
+	}
+
+	#[test]
 	fn mismatch_clears_the_pending_sequence() {
 		let mut router = Router::default();
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('t')), Route::Pending(_)));

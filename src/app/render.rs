@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::{layout::{Constraint, Direction, Layout}, style::{Modifier, Style}};
 
-use crate::{event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
+use crate::{event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, EntryDetailsPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::{App, app::MouseState};
 
@@ -44,6 +44,8 @@ impl App {
 		let finder_query = tab.finder.as_ref().map(|finder| finder.query());
 		let filter_query = tab.filter.as_ref().map(|filter| filter.query());
 		let task_visible = self.tasks.visible;
+		let entry_details = self.entry_details;
+		let entry_details_scroll = self.entry_details_scroll;
 		let task_cursor = self.tasks.cursor;
 		let tasks = &self.tasks.tasks;
 		let running = tasks.len();
@@ -124,6 +126,7 @@ impl App {
 					theme,
 					finder: tab.finder.as_ref(),
 					filter: tab.filter.as_ref(),
+					filename_peek: self.filename_peek,
 					scroll: &mut scroll,
 				},
 			);
@@ -151,6 +154,9 @@ impl App {
 			}
 			if task_visible { TaskPopup::render(frame, frame.area(), tasks, task_cursor, theme); }
 			Toast::render(frame, body_area, notices, theme);
+			if entry_details && let Some(node) = selected_node {
+				EntryDetailsPopup::render(frame, frame.area(), node, entry_details_scroll, theme, popup_width);
+			}
 		})?;
 		tab.scroll = scroll;
 

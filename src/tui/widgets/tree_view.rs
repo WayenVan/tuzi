@@ -3,7 +3,7 @@ use ratatui::{
 	layout::Rect,
 	style::{Modifier, Style},
 	text::{Line, Span},
-	widgets::{List, ListItem, ListState},
+	widgets::{Clear, List, ListItem, ListState, Paragraph},
 };
 
 use crate::{
@@ -28,6 +28,7 @@ pub struct TreeViewState<'a> {
 	pub theme: &'a Theme,
 	pub finder: Option<&'a Finder>,
 	pub filter: Option<&'a Filter>,
+	pub filename_peek: bool,
 	/// The tab's persisted scroll offset — read to seed this frame's list,
 	/// then written back with whatever ratatui settled on, so it only
 	/// shifts when the cursor would otherwise leave the viewport.
@@ -37,7 +38,8 @@ pub struct TreeViewState<'a> {
 impl TreeView {
 	pub fn render(frame: &mut Frame, area: Rect, rows: &[(usize, &Node)], row_offset: usize, state: TreeViewState<'_>) {
 		*state.scroll = row_offset;
-		let items = rows.iter().enumerate().map(|(visible_index, (depth, node))| {
+		let mut peek = None;
+		let items: Vec<_> = rows.iter().enumerate().map(|(visible_index, (depth, node))| {
 			let index = row_offset + visible_index;
 			let name = node.path.file_name().map_or_else(|| node.path.display().to_string(), |n| n.to_string_lossy().into_owned());
 			let icon = state.icon_theme.icon_for(node);
@@ -69,17 +71,28 @@ impl TreeView {
 			// highlighting why doubles as a hint once `find` isn't also
 			// pointing at the same name.
 			let matches = state.finder.map(|finder| finder.ranges(&name)).or_else(|| state.filter.map(|filter| filter.ranges(&name))).unwrap_or_default();
+			if state.filename_peek && index == state.cursor {
+				let right = state.column_mode.text(node);
+				if let Some(remainder) = name_remainder(&indent_for(*depth), icon.as_ref(), &name, right.as_deref(), area.width as usize) {
+					peek = Some((visible_index as u16, remainder));
+				}
+			}
 			let line = row_line("  ".repeat(*depth), marker_style, icon, name, name_style, matches, suffix, state.column_mode.text(node), area.width as usize, is_cursor_row, state.theme);
 
 			ListItem::new(line)
-		});
+		}).collect();
 
 		let list = List::new(items).highlight_style(cursor_style(state.focused, state.theme));
 		let selected = state.cursor.checked_sub(row_offset).filter(|index| *index < rows.len());
 		let mut list_state = ListState::default().with_selected(selected);
 		frame.render_stateful_widget(list, area, &mut list_state);
+		if let Some((row, remainder)) = peek {
+			render_filename_peek(frame, area, row, &remainder, state.theme);
+		}
 	}
 }
+
+fn indent_for(depth: usize) -> String { "  ".repeat(depth) }
 
 fn cursor_style(focused: bool, theme: &Theme) -> Style {
 	if focused {
@@ -148,9 +161,16 @@ fn row_line(
 		return Line::from(truncate(format!("{indent}  {icon_text}{body}{suffix_text}"), left_limit));
 	}
 	let available = left_limit - prefix_width;
-	let suffix = suffix.map(|(text, style)| (truncate(text, available), style));
+	// The name is the row's primary content; suffixes such as a symlink
+	// target are supplementary and may only consume whatever remains.  In
+	// particular, a long target must never make the name disappear.
+	let body = truncate(body, available);
+	let body_width = Line::from(body.as_str()).width();
+	let suffix = suffix.and_then(|(text, style)| {
+		let text = truncate(text, available.saturating_sub(body_width));
+		(!text.is_empty() && text != "…").then_some((text, style))
+	});
 	let suffix_width = suffix.as_ref().map_or(0, |(text, _)| Line::from(text.as_str()).width());
-	let body = truncate(body, available.saturating_sub(suffix_width));
 	let left_width = prefix_width + Line::from(body.as_str()).width() + suffix_width;
 	let padding = right.as_ref().map_or(0, |_| width.saturating_sub(left_width + right_width));
 	let marker = marker.map_or_else(|| Span::raw(" "), |style| Span::styled("│", style));
@@ -208,6 +228,72 @@ fn highlight_matches(body: String, matches: &[std::ops::Range<usize>], name_styl
 	spans
 }
 
+fn name_remainder(indent: &str, icon: Option<&Icon>, name: &str, right: Option<&str>, width: usize) -> Option<String> {
+	let right_width = right.map_or(0, |text| Line::from(text).width());
+	if right_width >= width {
+		return Some(name.to_string());
+	}
+	let left_limit = if right.is_some() { width - right_width - 1 } else { width };
+	let icon_width = icon.map_or(0, |icon| Line::from(icon.text.as_str()).width() + 1);
+	let prefix_width = Line::from(indent).width() + 2 + icon_width;
+	let available = left_limit.saturating_sub(prefix_width);
+	if Line::from(name).width() <= available {
+		return None;
+	}
+	let target = available.saturating_sub(1);
+	let mut used = 0;
+	let mut split = name.len();
+	for (index, ch) in name.char_indices() {
+		let next = Line::from(ch.to_string()).width();
+		if used + next > target {
+			split = index;
+			break;
+		}
+		used += next;
+	}
+	(split < name.len()).then(|| name[split..].to_string())
+}
+
+fn render_filename_peek(frame: &mut Frame, area: Rect, cursor_row: u16, remainder: &str, theme: &Theme) {
+	if area.width == 0 || area.height <= 1 {
+		return;
+	}
+	let text = format!("…{remainder}");
+	let width = Line::from(text.as_str()).width().min(area.width as usize).max(1) as u16;
+	let lines = wrap_text(&text, width as usize);
+	let below = area.height.saturating_sub(cursor_row + 1);
+	let above = cursor_row;
+	let wanted = lines.len().min(u16::MAX as usize) as u16;
+	let (y, height) = if wanted <= below || below >= above {
+		(area.y + cursor_row + 1, wanted.min(below))
+	} else {
+		(area.y + cursor_row - wanted.min(above), wanted.min(above))
+	};
+	if height == 0 {
+		return;
+	}
+	let popup = Rect::new(area.right() - width, y, width, height);
+	frame.render_widget(Clear, popup);
+	frame.render_widget(Paragraph::new(lines).style(cursor_style(true, theme)), popup);
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<Line<'static>> {
+	let mut lines = Vec::new();
+	let mut current = String::new();
+	let mut current_width = 0;
+	for ch in text.chars() {
+		let ch_width = Line::from(ch.to_string()).width();
+		if !current.is_empty() && current_width + ch_width > width {
+			lines.push(Line::from(std::mem::take(&mut current)));
+			current_width = 0;
+		}
+		current.push(ch);
+		current_width += ch_width;
+	}
+	if !current.is_empty() { lines.push(Line::from(current)); }
+	lines
+}
+
 fn truncate(text: String, width: usize) -> String {
 	if Line::from(text.as_str()).width() <= width {
 		return text;
@@ -233,7 +319,7 @@ fn truncate(text: String, width: usize) -> String {
 mod tests {
 	use ratatui::style::{Color, Modifier, Style};
 
-	use super::{cursor_style, highlight_matches, marker_style, row_line, viewport};
+	use super::{cursor_style, highlight_matches, marker_style, name_remainder, row_line, viewport, wrap_text};
 	use crate::icon::Icon;
 	use crate::theme::Theme;
 
@@ -296,6 +382,41 @@ mod tests {
 		};
 		let line = row_line(String::new(), None, Some(icon), "name".to_string(), None, Vec::new(), None, None, 80, false, &theme);
 		assert_eq!(line.spans[3].style, Style::new().fg(Color::Blue));
+	}
+
+	#[test]
+	fn a_long_symlink_target_never_displaces_the_file_name() {
+		let theme = Theme::default();
+		let suffix = Some((" -> target".to_string(), Style::new().fg(Color::Gray)));
+		let line = row_line(String::new(), None, None, "name".to_string(), None, Vec::new(), suffix, None, 12, false, &theme);
+		let text = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+		assert_eq!(text, "  name -> t…");
+		assert_eq!(line.width(), 12);
+	}
+
+	#[test]
+	fn a_symlink_target_is_hidden_when_only_the_file_name_fits() {
+		let theme = Theme::default();
+		let suffix = Some((" -> target".to_string(), Style::new().fg(Color::Gray)));
+		let line = row_line(String::new(), None, None, "name".to_string(), None, Vec::new(), suffix, None, 6, false, &theme);
+		let text = line.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+
+		assert_eq!(text, "  name");
+	}
+
+	#[test]
+	fn filename_peek_contains_exactly_the_part_omitted_from_the_row() {
+		assert_eq!(name_remainder("", None, "abcdefgh", None, 8).as_deref(), Some("fgh"));
+		assert_eq!(name_remainder("", None, "abcdefgh", None, 10), None);
+	}
+
+	#[test]
+	fn filename_peek_wraps_without_losing_unicode_characters() {
+		let lines = wrap_text("…甲乙丙丁", 5);
+		let text = lines.iter().flat_map(|line| line.spans.iter()).map(|span| span.content.as_ref()).collect::<String>();
+		assert_eq!(text, "…甲乙丙丁");
+		assert!(lines.len() > 1);
 	}
 
 	#[test]

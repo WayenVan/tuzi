@@ -65,7 +65,7 @@ pub struct FsPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Ui { pub mouse: bool, pub popup_width: u16, pub completion_max_items: usize, pub which_key: bool }
+pub struct Ui { pub mouse: bool, pub popup_width: u16, pub completion_max_items: usize, pub which_key: bool, pub filename_peek: bool }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notify { pub info_timeout: u64, pub warn_timeout: u64, pub error_timeout: u64 }
@@ -295,7 +295,7 @@ struct UserFs { paste_conflict: Option<ConflictPolicy>, create_conflict: Option<
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct UserUi { mouse: Option<bool>, popup_width: Option<u16>, completion_max_items: Option<usize>, which_key: Option<bool> }
+struct UserUi { mouse: Option<bool>, popup_width: Option<u16>, completion_max_items: Option<usize>, which_key: Option<bool>, filename_peek: Option<bool> }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -353,7 +353,7 @@ struct PresetFs { paste_conflict: ConflictPolicy, create_conflict: ConflictPolic
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PresetUi { mouse: bool, popup_width: u16, completion_max_items: usize, which_key: bool }
+struct PresetUi { mouse: bool, popup_width: u16, completion_max_items: usize, which_key: bool, filename_peek: bool }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -404,7 +404,7 @@ impl From<PresetConfig> for Config {
 			},
 			confirm: Confirm { trash: value.confirm.trash, delete: value.confirm.delete },
 			fs: FsPolicy { paste_conflict: value.fs.paste_conflict, create_conflict: value.fs.create_conflict, rename_conflict: value.fs.rename_conflict },
-			ui: Ui { mouse: value.ui.mouse, popup_width: value.ui.popup_width, completion_max_items: value.ui.completion_max_items, which_key: value.ui.which_key },
+			ui: Ui { mouse: value.ui.mouse, popup_width: value.ui.popup_width, completion_max_items: value.ui.completion_max_items, which_key: value.ui.which_key, filename_peek: value.ui.filename_peek },
 			notify: Notify { info_timeout: value.notify.info_timeout, warn_timeout: value.notify.warn_timeout, error_timeout: value.notify.error_timeout },
 			watcher: Watcher { debounce_ms: value.watcher.debounce_ms, max_wait_ms: value.watcher.max_wait_ms, poll_interval_ms: value.watcher.poll_interval_ms },
 			dds: Dds { enabled: value.dds.enabled, open: value.dds.open, broadcast: value.dds.broadcast },
@@ -455,6 +455,7 @@ impl UserConfig {
 		if let Some(value) = self.ui.popup_width { config.ui.popup_width = value; }
 		if let Some(value) = self.ui.completion_max_items { config.ui.completion_max_items = value; }
 		if let Some(value) = self.ui.which_key { config.ui.which_key = value; }
+		if let Some(value) = self.ui.filename_peek { config.ui.filename_peek = value; }
 		if let Some(value) = self.notify.info_timeout { config.notify.info_timeout = value; }
 		if let Some(value) = self.notify.warn_timeout { config.notify.warn_timeout = value; }
 		if let Some(value) = self.notify.error_timeout { config.notify.error_timeout = value; }

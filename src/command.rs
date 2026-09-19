@@ -81,6 +81,8 @@ pub enum Command {
 	Zoxide,
 	Open { interactive: bool },
 	ToggleTasks,
+	EntryDetails,
+	ToggleFilenamePeek,
 	/// Applies a state snapshot received from DDS. This is intentionally an
 	/// internal command rather than part of the textual command language.
 	UpdateTab { path: Option<PathBuf>, selection: Vec<PathBuf> },
@@ -169,6 +171,8 @@ impl FromStr for Command {
 			["open"] => Ok(Self::Open { interactive: false }),
 			["open", "--interactive"] => Ok(Self::Open { interactive: true }),
 			["tasks", "toggle"] => Ok(Self::ToggleTasks),
+			["entry-details"] => Ok(Self::EntryDetails),
+			["filename-peek", "toggle"] => Ok(Self::ToggleFilenamePeek),
 			["emit", kind] => Ok(Self::Emit { kind: emit_kind(kind).map_err(|_| invalid())?, data: serde_json::Value::Null }),
 			["emit", kind, json] => Ok(Self::Emit {
 				kind: emit_kind(kind).map_err(|_| invalid())?,
@@ -205,6 +209,8 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "copy", description: "Copy path information", usages: &["copy path", "copy url", "copy dirpath", "copy dirurl", "copy filename", "copy stem"] },
 	CommandSpec { name: "create", description: "Create a file or directory", usages: &["create"] },
 	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#] },
+	CommandSpec { name: "entry-details", description: "Show details for the selected entry", usages: &["entry-details"] },
+	CommandSpec { name: "filename-peek", description: "Toggle truncated filename continuation", usages: &["filename-peek toggle"] },
 	CommandSpec { name: "escape", description: "Cancel the current mode", usages: &["escape"] },
 	CommandSpec { name: "expand", description: "Expand directories", usages: &["expand", "expand toggle"] },
 	CommandSpec { name: "filter", description: "Filter visible files", usages: &["filter"] },

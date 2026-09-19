@@ -197,6 +197,7 @@ mouse = true
 popup_width = 50           # 20–200 columns
 completion_max_items = 8   # 1–50 rows
 which_key = true
+filename_peek = false      # Show truncated filename continuations near the cursor
 
 [notify]
 info_timeout = 3           # seconds, 1–3600
@@ -274,7 +275,9 @@ uses the system trash, while permanent deletion still requires the explicit
 `remove --permanently` command. Conflict policy `rename` chooses a free
 `(copy)` name; `error` refuses an existing target without overwriting it.
 `popup_width` applies consistently to prompts, opener dialogs, and
- confirmation dialogs. Disabling `which_key` only hides chord hints; the
+ confirmation dialogs. `filename_peek` controls the initial state of the
+cursor-following truncated-name continuation (`I` toggles it at runtime).
+Disabling `which_key` only hides chord hints; the
 keymap sequences themselves continue to work.
 Watcher changes are grouped for `debounce_ms`; `max_wait_ms` forces a refresh
 during nonstop filesystem churn. `poll_interval_ms` configures notify's
@@ -433,6 +436,8 @@ silently ignored.
 | `o` / `O` | Open / open with |
 | `a` | Create file or directory |
 | `r` | Rename |
+| `K` | Show details for the current entry |
+| `I` | Toggle truncated filename peek |
 | `y` / `x` | Copy / cut selected files |
 | `p` | Paste |
 | `Space Space` | Jump with `fzf` |

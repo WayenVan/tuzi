@@ -36,6 +36,7 @@ mouse = true
 popup_width = 50
 completion_max_items = 8
 which_key = true
+filename_peek = false
 
 [notify]
 info_timeout = 3

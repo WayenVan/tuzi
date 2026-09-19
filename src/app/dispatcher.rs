@@ -60,6 +60,11 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
+			Command::EntryDetails => {
+				self.entry_details = true;
+				self.entry_details_scroll = 0;
+			}
+			Command::ToggleFilenamePeek => self.filename_peek = !self.filename_peek,
 			Command::UpdateTab { path, selection } => self.update_tab(path, selection),
 			Command::Reveal(path) => self.reveal_path(path),
 			Command::RestoreState(state) => self.restore_state(state),

@@ -1,5 +1,6 @@
 mod completion_popup;
 mod confirm_popup;
+mod entry_details_popup;
 mod prompt;
 mod open_popup;
 mod preview_view;
@@ -13,6 +14,7 @@ mod which_popup;
 
 pub use completion_popup::CompletionPopup;
 pub use confirm_popup::ConfirmPopup;
+pub use entry_details_popup::EntryDetailsPopup;
 pub use prompt::Prompt;
 pub use open_popup::OpenPopup;
 pub use preview_view::PreviewView;
