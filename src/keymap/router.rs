@@ -147,7 +147,12 @@ mod tests {
 	#[test]
 	fn z_prefix_controls_tree_folding_and_cursor_centering() {
 		let mut router = Router::default();
-		for (key, command) in [('c', Command::CollapseSubtree), ('m', Command::CollapseAll), ('z', Command::CenterCursor)] {
+		for (key, command) in [
+			('c', Command::CollapseSubtree),
+			('m', Command::CollapseSiblings),
+			('M', Command::CollapseAll),
+			('z', Command::CenterCursor),
+		] {
 			assert!(matches!(router.route(KeyContext::Manager, Key::char('z')), Route::Pending(_)));
 			assert_eq!(router.route(KeyContext::Manager, Key::char(key)), Route::Commands(vec![command]));
 		}

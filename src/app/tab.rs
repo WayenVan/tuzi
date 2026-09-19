@@ -72,6 +72,7 @@ pub struct Tab {
 	/// `Node` itself (`Node::load_error`) instead of here.
 	pub(super) pending_notice: Option<(NoticeLevel, String)>,
 	pending_reveal: Option<RevealState>,
+	pending_cursor: Option<PathBuf>,
 	pub(super) input: Option<InputSession>,
 	input_seq: u64,
 	tx: UnboundedSender<Event>,
@@ -167,6 +168,7 @@ impl Tab {
 			filter: None,
 			pending_notice: None,
 			pending_reveal: None,
+			pending_cursor: None,
 			input: None,
 			input_seq: 0,
 			tx,
@@ -389,6 +391,20 @@ impl Tab {
 		}
 		self.sync_projection(&target);
 		self.select(&target);
+		self.preview.target_changed();
+	}
+
+	pub fn collapse_siblings(&mut self) {
+		let Some((_, node)) = self.visible_at(self.cursor) else { return };
+		let path = node.path.clone();
+		let Some(parent) = self.tree.parent_of(&path) else { return };
+		for collapsed in self.tree.collapse_siblings(&path) {
+			self.cancel_listing(&collapsed);
+			self.watcher.unwatch(&collapsed);
+			self.fs_scheduler.forget(&collapsed);
+		}
+		self.sync_projection(&parent);
+		self.select(&path);
 		self.preview.target_changed();
 	}
 
@@ -827,7 +843,9 @@ impl Tab {
 		if path == self.tree.root.path {
 			return Ok(());
 		}
+		let previous_root = self.tree.root.path.clone();
 		let mut replacement = Self::open_configured(self.id, path, self.tx.clone(), self.config.clone())?;
+		replacement.pending_cursor = child_below(&replacement.tree.root.path, &previous_root);
 		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
 		let _ = self.tx.send(Event::DdsPublish(Body::Cd { path: replacement.tree.root.path.clone() }));
 		replacement.input_seq = self.input_seq;
@@ -1083,6 +1101,7 @@ impl Tab {
 			_ => return,
 		}
 		self.continue_reveal();
+		self.continue_pending_cursor();
 		self.clamp_cursor();
 	}
 
@@ -1124,7 +1143,19 @@ impl Tab {
 			}
 		}
 		self.continue_reveal();
+		self.continue_pending_cursor();
+		if path == self.tree.root.path && self.tree.is_loaded(&path) {
+			self.pending_cursor = None;
+		}
 		self.clamp_cursor();
+	}
+
+	fn continue_pending_cursor(&mut self) {
+		let Some(path) = self.pending_cursor.as_ref() else { return };
+		let Some(position) = self.visible_position(path) else { return };
+		self.cursor = position;
+		self.pending_cursor = None;
+		self.preview.target_changed();
 	}
 
 	pub fn on_created(&mut self, base: PathBuf, value: String, target: PathBuf, result: io::Result<()>) {
@@ -1278,6 +1309,15 @@ fn node_name(node: &Node) -> String {
 	node.path.file_name().map_or_else(|| node.path.display().to_string(), |name| name.to_string_lossy().into_owned())
 }
 
+fn child_below(parent: &Path, descendant: &Path) -> Option<PathBuf> {
+	let relative = descendant.strip_prefix(parent).ok()?;
+	let child = relative.components().find_map(|component| match component {
+		std::path::Component::Normal(part) => Some(part),
+		_ => None,
+	})?;
+	Some(parent.join(child))
+}
+
 fn file_url(path: &Path) -> Vec<u8> {
 	let mut out = b"file://".to_vec();
 	for byte in path.as_os_str().as_bytes() {
@@ -1299,7 +1339,7 @@ fn resolve_path(base: &Path, value: &str) -> io::Result<PathBuf> {
 		let path = PathBuf::from(value);
 		if path.is_absolute() { path } else { base.join(path) }
 	};
-	let path = raw.canonicalize()?;
+	let path = crate::fs::absolute_lexical(&raw)?;
 	if !path.is_dir() {
 		return Err(io::Error::new(io::ErrorKind::InvalidInput, "path is not a directory"));
 	}
@@ -1413,7 +1453,7 @@ mod tests {
 	async fn pump(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
 		loop {
 			let event = rx.recv().await.unwrap();
-			let done = !matches!(&event, Event::Loaded { done: false, .. } | Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_));
+			let done = !matches!(&event, Event::Loaded { done: false, .. } | Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_));
 			apply(tab, event);
 			if done {
 				break;
@@ -1432,7 +1472,7 @@ mod tests {
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			// No App/Registry exists in these single-tab tests; DDS publication
 			// from `cd`/rename is a no-op here.
-			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) => {}
+			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_) => {}
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}
@@ -1508,14 +1548,54 @@ mod tests {
 		fs::create_dir_all(root.join("child")).unwrap();
 		let root = root.canonicalize().unwrap();
 
-		let (mut tab, _rx) = tab(&root).await;
+		let (mut tab, mut rx) = tab(&root).await;
 		tab.move_cursor(1);
 		tab.cd_selected();
 		assert_eq!(tab.tree.root.path, root.join("child"));
+		pump(&mut tab, &mut rx).await;
 
 		tab.cd_path("..").unwrap();
+		pump(&mut tab, &mut rx).await;
 		assert_eq!(tab.tree.root.path, root);
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("child"));
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[cfg(unix)]
+	#[tokio::test]
+	async fn entering_a_symlinked_directory_keeps_its_logical_navigation_path() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-symlink-cd");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("real")).unwrap();
+		std::os::unix::fs::symlink("real", root.join("link")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let link = root.join("link");
+
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&link);
+		tab.cd_selected();
+		assert_eq!(tab.tree.root.path, link, "the visible symlink path must remain the tab root");
+		pump(&mut tab, &mut rx).await;
+
+		tab.cd_path("..").unwrap();
+		pump(&mut tab, &mut rx).await;
+		assert_eq!(tab.tree.root.path, root, "logical parent navigation returns to the directory containing the link");
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, link, "the cursor returns to the symlink that was exited");
+
+		tab.cd(link.clone()).unwrap();
+		pump(&mut tab, &mut rx).await;
+		tab.history_back();
+		pump(&mut tab, &mut rx).await;
+		assert_eq!(tab.tree.root.path, root, "history also restores the visible pre-link root");
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, link, "history focuses the directory that was exited");
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[test]
+	fn returning_to_an_ancestor_focuses_the_first_child_toward_the_old_root() {
+		assert_eq!(child_below(Path::new("/project"), Path::new("/project/src/deep")), Some(PathBuf::from("/project/src")));
+		assert_eq!(child_below(Path::new("/project"), Path::new("/elsewhere")), None);
+		assert_eq!(child_below(Path::new("/project"), Path::new("/project")), None);
 	}
 
 	#[tokio::test]
@@ -1645,6 +1725,38 @@ mod tests {
 		let a = tab.tree.root.children.as_ref().unwrap().iter().find(|n| n.path == root.join("a")).unwrap();
 		assert!(!a.expanded, "collapsing from a child closes its parent");
 		assert_eq!(tab.visible()[tab.cursor].1.path, root.join("a"), "cursor jumps to the parent");
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn collapse_siblings_closes_every_directory_at_the_current_level() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-collapse-siblings");
+		for name in ["a/inner", "b/inner", "c/inner"] {
+			fs::create_dir_all(root.join(name)).unwrap();
+		}
+		fs::write(root.join("file.txt"), b"hi").unwrap();
+		let root = root.canonicalize().unwrap();
+
+		let (mut tab, mut rx) = tab(&root).await;
+		for name in ["a", "b", "c"] {
+			tab.select(&root.join(name));
+			tab.expand_selected();
+			pump(&mut tab, &mut rx).await;
+		}
+		tab.select(&root.join("a/inner"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+
+		tab.select(&root.join("b"));
+		tab.collapse_siblings();
+
+		for name in ["a", "b", "c"] {
+			let node = tab.tree.root.find(&root.join(name)).unwrap();
+			assert!(!node.expanded, "{name} should be collapsed");
+		}
+		assert!(!tab.tree.root.find(&root.join("a/inner")).unwrap().expanded, "descendants are collapsed recursively");
+		assert_eq!(tab.visible()[tab.cursor].1.path, root.join("b"), "cursor stays on the selected sibling");
 
 		fs::remove_dir_all(&root).unwrap();
 	}

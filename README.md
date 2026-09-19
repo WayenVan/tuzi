@@ -431,7 +431,9 @@ silently ignored.
 | `j` / `k` | Move down / up |
 | `l` / `h` | Expand / collapse |
 | `Enter` | Toggle directory |
-| `zc` / `zm` | Collapse current subtree / all subtrees |
+| `zc` | Collapse current subtree |
+| `zm` | Collapse sibling subtrees at the current level |
+| `zM` | Collapse all subtrees |
 | `zz` | Center current row |
 | `;` | Toggle selection |
 | `v` | Visual selection |

@@ -29,6 +29,7 @@ impl App {
 			Command::ToggleExpand => self.active_tab_mut().toggle_expand_selected(),
 			Command::Collapse => self.active_tab_mut().collapse_selected(),
 			Command::CollapseSubtree => self.active_tab_mut().collapse_subtree(),
+			Command::CollapseSiblings => self.active_tab_mut().collapse_siblings(),
 			Command::CollapseAll => self.active_tab_mut().collapse_all(),
 			Command::CenterCursor => self.center_cursor(),
 			Command::ToggleSelect => self.active_tab_mut().toggle_selected(),
