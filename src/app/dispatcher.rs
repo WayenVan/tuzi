@@ -29,6 +29,7 @@ impl App {
 			Command::ToggleExpand => self.active_tab_mut().toggle_expand_selected(),
 			Command::Collapse => self.active_tab_mut().collapse_selected(),
 			Command::CollapseSubtree => self.active_tab_mut().collapse_subtree(),
+			Command::CollapseSiblings => self.active_tab_mut().collapse_siblings(),
 			Command::CollapseAll => self.active_tab_mut().collapse_all(),
 			Command::CenterCursor => self.center_cursor(),
 			Command::ToggleSelect => self.active_tab_mut().toggle_selected(),
@@ -60,6 +61,11 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
+			Command::EntryDetails => {
+				self.entry_details = true;
+				self.entry_details_scroll = 0;
+			}
+			Command::ToggleFilenamePeek => self.filename_peek = !self.filename_peek,
 			Command::UpdateTab { path, selection } => self.update_tab(path, selection),
 			Command::Reveal(path) => self.reveal_path(path),
 			Command::RestoreState(state) => self.restore_state(state),

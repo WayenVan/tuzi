@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::{
 	command::{CopyKind, DeleteMode},
-	config::Config,
+	config::{Config, PreviewLayout},
 	dds::{self, Body},
 	event::Event,
 	icon::IconTheme,
@@ -55,6 +55,9 @@ pub struct App {
 	pub(super) theme: Theme,
 	pub(super) open: OpenScheduler,
 	pub(super) open_picker: Option<OpenPicker>,
+	pub(super) entry_details: bool,
+	pub(super) entry_details_scroll: u16,
+	pub(super) filename_peek: bool,
 	pub(super) processes: VecDeque<ProcessRequest>,
 	pub(super) tx: mpsc::UnboundedSender<Event>,
 	pub(super) pubsub: dds::Registry,
@@ -104,6 +107,7 @@ pub(super) struct MouseState {
 	pub preview:         Option<Rect>,
 	pub tree_row_offset: usize,
 	pub preview_percent: u16,
+	pub preview_layout:  PreviewLayout,
 	pub resizing:        bool,
 }
 
@@ -111,7 +115,7 @@ impl Default for MouseState {
 	fn default() -> Self {
 		Self {
 			tabs: Rect::default(), body: Rect::default(), tree: Rect::default(), preview: None,
-			tree_row_offset: 0, preview_percent: 40, resizing: false,
+			tree_row_offset: 0, preview_percent: 40, preview_layout: PreviewLayout::Horizontal, resizing: false,
 		}
 	}
 }
@@ -157,6 +161,9 @@ impl App {
 			theme,
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
+			entry_details: false,
+			entry_details_scroll: 0,
+			filename_peek: config.ui.filename_peek,
 			processes: VecDeque::new(),
 			tasks: TaskManager::configured(tx.clone(), config.tasks.clone()),
 			notices: Vec::new(),
@@ -401,7 +408,7 @@ impl App {
 		if !self.config.ui.mouse { return false; }
 		// Like Yazi, overlays own the input layer: do not let a click leak
 		// through to the manager underneath them.
-		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
+		if self.pending_quit || self.tasks.visible || self.open_picker.is_some() || self.entry_details || self.active_tab().pending_delete.is_some() || self.active_tab().input.is_some() || !self.which.is_empty() {
 			self.mouse.resizing = false;
 			return false;
 		}
@@ -410,7 +417,10 @@ impl App {
 		match event.kind {
 			MouseEventKind::Down(MouseButton::Left) => {
 				if let Some(preview) = self.mouse.preview
-					&& event.column == preview.x
+					&& match self.mouse.preview_layout {
+						PreviewLayout::Vertical => event.row == preview.y,
+						PreviewLayout::Auto | PreviewLayout::Horizontal => event.column == preview.x,
+					}
 					&& contains(self.mouse.body, point)
 				{
 					self.mouse.resizing = true;
@@ -437,7 +447,7 @@ impl App {
 				self.mouse.resizing = false;
 				dirty
 			}
-			MouseEventKind::Drag(MouseButton::Left) if self.mouse.resizing => self.resize_preview(event.column),
+			MouseEventKind::Drag(MouseButton::Left) if self.mouse.resizing => self.resize_preview(event.column, event.row),
 			MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
 				let step = if matches!(event.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
 				if self.mouse.preview.is_some_and(|area| contains(area, point)) {
@@ -467,10 +477,13 @@ impl App {
 		true
 	}
 
-	fn resize_preview(&mut self, column: u16) -> bool {
-		if self.mouse.body.width == 0 { return false }
-		let tree = column.saturating_sub(self.mouse.body.x).min(self.mouse.body.width) as u32;
-		let tree_percent = (tree * 100 / self.mouse.body.width as u32).clamp(20, 80) as u16;
+	fn resize_preview(&mut self, column: u16, row: u16) -> bool {
+		let (tree, extent) = match self.mouse.preview_layout {
+			PreviewLayout::Vertical => (row.saturating_sub(self.mouse.body.y).min(self.mouse.body.height), self.mouse.body.height),
+			PreviewLayout::Auto | PreviewLayout::Horizontal => (column.saturating_sub(self.mouse.body.x).min(self.mouse.body.width), self.mouse.body.width),
+		};
+		if extent == 0 { return false }
+		let tree_percent = (tree as u32 * 100 / extent as u32).clamp(20, 80) as u16;
 		self.mouse.preview_percent = 100 - tree_percent;
 		true
 	}
@@ -512,6 +525,23 @@ impl App {
 				}
 				KeyCode::Esc | KeyCode::Char('w') | KeyCode::Char('q') => {
 					self.tasks.visible = false;
+					true
+				}
+				_ => false,
+			};
+		}
+		if self.entry_details {
+			return match key.code {
+				KeyCode::Up | KeyCode::Char('k') => {
+					self.entry_details_scroll = self.entry_details_scroll.saturating_sub(1);
+					true
+				}
+				KeyCode::Down | KeyCode::Char('j') => {
+					self.entry_details_scroll = self.entry_details_scroll.saturating_add(1);
+					true
+				}
+				KeyCode::Esc | KeyCode::Char('q') => {
+					self.entry_details = false;
 					true
 				}
 				_ => false,
@@ -1003,6 +1033,9 @@ mod tests {
 			theme: Theme::default(),
 			open: OpenScheduler::new(tx.clone()),
 			open_picker: None,
+			entry_details: false,
+			entry_details_scroll: 0,
+			filename_peek: false,
 			processes: VecDeque::new(),
 			tasks: TaskManager::new(tx.clone()),
 			notices: Vec::new(),
@@ -1189,6 +1222,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn entry_details_is_modal_and_closes_with_q_or_escape() {
+		let root = std::env::temp_dir().join("tuzi-app-test-entry-details");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		let mut router = Router::default();
+
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut router));
+		assert!(app.entry_details);
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &mut router));
+		assert!(!app.entry_details);
+
+		app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT), &mut router);
+		assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut router));
+		assert!(!app.entry_details);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn mouse_click_and_wheel_move_the_tree_cursor() {
 		let root = std::env::temp_dir().join("tuzi-app-test-mouse-tree");
 		let _ = fs::remove_dir_all(&root);
@@ -1205,6 +1258,25 @@ mod tests {
 		assert!(app.handle_mouse(mouse(MouseEventKind::ScrollDown, 8, 4)));
 		assert_eq!(app.active_tab().cursor, 2);
 
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn preview_resize_uses_columns_side_by_side_and_rows_when_stacked() {
+		let root = std::env::temp_dir().join("tuzi-app-test-preview-resize");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.mouse.body = Rect::new(10, 5, 100, 50);
+
+		app.mouse.preview_layout = PreviewLayout::Horizontal;
+		assert!(app.resize_preview(70, 0));
+		assert_eq!(app.mouse.preview_percent, 40);
+
+		app.mouse.preview_layout = PreviewLayout::Vertical;
+		assert!(app.resize_preview(0, 35));
+		assert_eq!(app.mouse.preview_percent, 40);
 		fs::remove_dir_all(root).unwrap();
 	}
 

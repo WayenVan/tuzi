@@ -3,7 +3,7 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use crate::fs::{Cha, FsChange, SortPolicy};
+use crate::fs::{Cha, FsChange, SortPolicy, absolute_lexical};
 
 use super::Node;
 
@@ -13,10 +13,9 @@ pub struct Tree {
 
 impl Tree {
 	pub fn open(path: PathBuf) -> io::Result<Self> {
-		// Canonicalized once here, at the root: every descendant path is a
-		// plain join off of it, so the whole tree then agrees with whatever
-		// realpath-resolved form the OS filesystem watcher reports back.
-		let path = path.canonicalize()?;
+		// Keep the path the user navigated through, including a symlinked root.
+		// The watcher maintains its own canonical-to-visible mapping.
+		let path = absolute_lexical(&path)?;
 		let metadata = fs::metadata(&path)?;
 		if !metadata.is_dir() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a directory: {}", path.display())));
@@ -46,6 +45,20 @@ impl Tree {
 		let mut collapsed = Vec::new();
 		if let Some(node) = self.root.find_mut(path) {
 			node.collapse_subtree(&mut collapsed);
+		}
+		collapsed
+	}
+
+	/// Collapses every directory subtree beside `path`, including `path`
+	/// itself when it is a directory, without affecting any other level.
+	pub fn collapse_siblings(&mut self, path: &Path) -> Vec<PathBuf> {
+		let mut collapsed = Vec::new();
+		let Some(parent_path) = self.root.find_parent(path).map(|parent| parent.path.clone()) else { return collapsed };
+		let Some(parent) = self.root.find_mut(&parent_path) else { return collapsed };
+		if let Some(children) = &mut parent.children {
+			for child in children.iter_mut().filter(|child| child.cha.is_dir) {
+				child.collapse_subtree(&mut collapsed);
+			}
 		}
 		collapsed
 	}

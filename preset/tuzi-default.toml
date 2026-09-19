@@ -11,6 +11,8 @@ history_size = 60
 [preview]
 show = false
 ratio = 40
+layout = "auto"
+split_threshold = 100
 max_scan_bytes = 5242880
 max_line_bytes = 16384
 cache_bytes = 16777216
@@ -36,6 +38,7 @@ mouse = true
 popup_width = 50
 completion_max_items = 8
 which_key = true
+filename_peek = false
 
 [notify]
 info_timeout = 3
