@@ -4,6 +4,19 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-09-19
+
+### Added
+
+- Controller operations `get-tabs`, `switch-tab`, `get-state`, and `reveal` for listing and switching tabs, capturing a restorable session snapshot, and revealing a path in the active tab.
+- A `tuzi-exit` controller event carrying the final restorable session snapshot when a controlled Tuzi exits gracefully.
+
+### Changed
+
+- The controller protocol is now version 2: `set-state` is replaced by `update-tab`, whose request field is `update` instead of `state`.
+- Implicit state events from a controlled Tuzi are sent directly to its controlling parent; only kinds listed in `dds.broadcast` are broadcast publicly.
+- `hover` is no longer a default controller ability; pass it explicitly with `--abilities` to receive cursor movement events.
+
 ## [0.4.0] - 2026-09-18
 
 ### Added
@@ -65,6 +78,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.4.1]: https://github.com/WayenVan/tuzi/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/WayenVan/tuzi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/WayenVan/tuzi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/WayenVan/tuzi/compare/v0.1.0...v0.2.0
