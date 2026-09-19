@@ -172,6 +172,8 @@ history_size = 60
 [preview]
 show = false
 ratio = 40                # 10–90
+layout = "auto"           # auto, horizontal (side-by-side), vertical (stacked)
+split_threshold = 100     # auto stacks when the body is narrower than this
 max_scan_bytes = 5242880  # 64 KiB–1 GiB per viewport scan
 max_line_bytes = 16384    # 256 B–1 MiB; longer lines disable highlighting
 cache_bytes = 16777216    # 0 disables cache; maximum 1 GiB

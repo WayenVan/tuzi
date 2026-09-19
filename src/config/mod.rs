@@ -36,12 +36,18 @@ pub struct Manager {
 pub struct Preview {
 	pub show:             bool,
 	pub ratio:            u16,
+	pub layout:           PreviewLayout,
+	pub split_threshold:  u16,
 	pub max_scan_bytes:   usize,
 	pub max_line_bytes:   usize,
 	pub cache_bytes:      usize,
 	pub overscan_lines:   usize,
 	pub syntax_highlight: bool,
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewLayout { Auto, Horizontal, Vertical }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tasks {
@@ -134,6 +140,9 @@ impl Config {
 	fn validate(&self, path: &Path) -> Result<(), String> {
 		if !(10..=90).contains(&self.preview.ratio) {
 			return Err(format!("invalid {}: preview.ratio must be between 10 and 90", path.display()));
+		}
+		if !(40..=400).contains(&self.preview.split_threshold) {
+			return Err(format!("invalid {}: preview.split_threshold must be between 40 and 400", path.display()));
 		}
 		if !(64 * 1024..=1024 * 1024 * 1024).contains(&self.preview.max_scan_bytes) {
 			return Err(format!("invalid {}: preview.max_scan_bytes must be between 65536 and 1073741824", path.display()));
@@ -274,6 +283,8 @@ struct UserManager {
 struct UserPreview {
 	show:             Option<bool>,
 	ratio:            Option<u16>,
+	layout:           Option<PreviewLayout>,
+	split_threshold:  Option<u16>,
 	max_scan_bytes:   Option<usize>,
 	max_line_bytes:   Option<usize>,
 	cache_bytes:      Option<usize>,
@@ -332,6 +343,8 @@ struct PresetManager {
 struct PresetPreview {
 	show:             bool,
 	ratio:            u16,
+	layout:           PreviewLayout,
+	split_threshold:  u16,
 	max_scan_bytes:   usize,
 	max_line_bytes:   usize,
 	cache_bytes:      usize,
@@ -391,6 +404,8 @@ impl From<PresetConfig> for Config {
 			preview: Preview {
 				show: value.preview.show,
 				ratio: value.preview.ratio,
+				layout: value.preview.layout,
+				split_threshold: value.preview.split_threshold,
 				max_scan_bytes: value.preview.max_scan_bytes,
 				max_line_bytes: value.preview.max_line_bytes,
 				cache_bytes: value.preview.cache_bytes,
@@ -438,6 +453,8 @@ impl UserConfig {
 		if let Some(value) = self.mgr.history_size { config.mgr.history_size = value; }
 		if let Some(value) = self.preview.show { config.preview.show = value; }
 		if let Some(value) = self.preview.ratio { config.preview.ratio = value; }
+		if let Some(value) = self.preview.layout { config.preview.layout = value; }
+		if let Some(value) = self.preview.split_threshold { config.preview.split_threshold = value; }
 		if let Some(value) = self.preview.max_scan_bytes { config.preview.max_scan_bytes = value; }
 		if let Some(value) = self.preview.max_line_bytes { config.preview.max_line_bytes = value; }
 		if let Some(value) = self.preview.cache_bytes { config.preview.cache_bytes = value; }
@@ -478,12 +495,14 @@ mod tests {
 
 	#[test]
 	fn partial_user_config_overlays_defaults() {
-		let user: UserConfig = toml::from_str("[mgr]\nshow_hidden = true\nsort_by = 'size'\n[preview]\nratio = 55").unwrap();
+		let user: UserConfig = toml::from_str("[mgr]\nshow_hidden = true\nsort_by = 'size'\n[preview]\nratio = 55\nlayout = 'vertical'\nsplit_threshold = 120").unwrap();
 		let mut config = Config::default();
 		user.apply(&mut config);
 		assert!(config.mgr.show_hidden);
 		assert_eq!(config.mgr.sort, SortPolicy::new(SortBy::Size, false));
 		assert_eq!(config.preview.ratio, 55);
+		assert_eq!(config.preview.layout, PreviewLayout::Vertical);
+		assert_eq!(config.preview.split_threshold, 120);
 		assert_eq!(config.tasks.workers, 2);
 		assert!(config.confirm.trash);
 		assert_eq!(config.fs.paste_conflict, ConflictPolicy::Rename);
@@ -607,6 +626,9 @@ mod tests {
 		assert!(!config.preview.syntax_highlight);
 		config.validate(Path::new("test.toml")).unwrap();
 		config.preview.max_line_bytes = 131073;
+		assert!(config.validate(Path::new("test.toml")).is_err());
+		config.preview.max_line_bytes = 4096;
+		config.preview.split_threshold = 39;
 		assert!(config.validate(Path::new("test.toml")).is_err());
 	}
 

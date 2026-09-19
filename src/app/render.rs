@@ -3,7 +3,7 @@ use std::{cell::Cell, io};
 use edtui::EditorMode;
 use ratatui::{layout::{Constraint, Direction, Layout}, style::{Modifier, Style}};
 
-use crate::{event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, EntryDetailsPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
+use crate::{config::PreviewLayout, event::Event, preview::PreviewTarget, status::{Segment, permission_style, position_labels}, tui::{Raterm, widgets::{ClipboardBadge, CompletionPopup, ConfirmPopup, EntryDetailsPopup, OpenPopup, PreviewView, Prompt, StatusBar, TabBar, TaskPopup, Toast, TreeView, TreeViewState, WhichPopup, WinBar, WinBarState}}};
 
 use super::{App, app::MouseState};
 
@@ -21,6 +21,8 @@ impl App {
 		let cwd = self.active_tab().tree.root.path.clone();
 		let labels = self.tab_labels();
 		let preview_percent = self.mouse.preview_percent;
+		let preview_layout = self.config.preview.layout;
+		let preview_split_threshold = self.config.preview.split_threshold;
 		let terminal_focused = self.terminal_focused;
 		let clipboard_badge = (!self.clipboard.is_empty()).then(|| if self.clipboard_cut { ClipboardBadge::Cut(self.clipboard.len()) } else { ClipboardBadge::Copy(self.clipboard.len()) });
 		let geometry = Cell::new(self.mouse);
@@ -93,9 +95,11 @@ impl App {
 				.direction(Direction::Vertical)
 				.constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
 				.areas(frame.area());
+			let resolved_preview_layout = resolve_preview_layout(preview_layout, body_area.width, preview_split_threshold);
 			let (tree_area, preview_area) = if preview_visible {
+				let direction = if resolved_preview_layout == PreviewLayout::Vertical { Direction::Vertical } else { Direction::Horizontal };
 				let [tree, preview] = Layout::default()
-					.direction(Direction::Horizontal)
+					.direction(direction)
 					.constraints([Constraint::Percentage(100 - preview_percent), Constraint::Percentage(preview_percent)])
 					.areas(body_area);
 				(tree, Some(preview))
@@ -104,7 +108,7 @@ impl App {
 			};
 			tree_rows.set(tree_area.height as usize);
 			let range = crate::tui::widgets::viewport(visible_len, tab.cursor, scroll, tree_area.height as usize);
-			geometry.set(MouseState { tabs: tab_area, body: body_area, tree: tree_area, preview: preview_area, tree_row_offset: range.start, ..geometry.get() });
+			geometry.set(MouseState { tabs: tab_area, body: body_area, tree: tree_area, preview: preview_area, preview_layout: resolved_preview_layout, tree_row_offset: range.start, ..geometry.get() });
 			let rows = tab.visible_range(range.clone());
 
 			WinBar::render(frame, win_area, WinBarState { path: &cwd, finder: finder_query, filter: filter_query, badge: clipboard_badge }, theme);
@@ -131,8 +135,9 @@ impl App {
 				},
 			);
 			if let Some(area) = preview_area {
-				preview_size.set((area.width.saturating_sub(1), area.height));
-				PreviewView::render(frame, area, selected_node, &tab.preview.state, tab.preview.skip, theme);
+				let size = if resolved_preview_layout == PreviewLayout::Vertical { (area.width, area.height.saturating_sub(1)) } else { (area.width.saturating_sub(1), area.height) };
+				preview_size.set(size);
+				PreviewView::render(frame, area, selected_node, &tab.preview.state, tab.preview.skip, resolved_preview_layout, theme);
 			}
 			StatusBar::render(frame, status_area, &status_left, &status_right);
 			WhichPopup::render(frame, frame.area(), &which, theme);
@@ -174,5 +179,27 @@ impl App {
 		self.tree_rows = tree_rows.get();
 		self.mouse = geometry.get();
 		Ok(())
+	}
+}
+
+fn resolve_preview_layout(layout: PreviewLayout, width: u16, threshold: u16) -> PreviewLayout {
+	match layout {
+		PreviewLayout::Auto if width < threshold => PreviewLayout::Vertical,
+		PreviewLayout::Auto => PreviewLayout::Horizontal,
+		layout => layout,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::resolve_preview_layout;
+	use crate::config::PreviewLayout;
+
+	#[test]
+	fn auto_preview_stacks_only_below_the_configured_width() {
+		assert_eq!(resolve_preview_layout(PreviewLayout::Auto, 99, 100), PreviewLayout::Vertical);
+		assert_eq!(resolve_preview_layout(PreviewLayout::Auto, 100, 100), PreviewLayout::Horizontal);
+		assert_eq!(resolve_preview_layout(PreviewLayout::Horizontal, 20, 100), PreviewLayout::Horizontal);
+		assert_eq!(resolve_preview_layout(PreviewLayout::Vertical, 200, 100), PreviewLayout::Vertical);
 	}
 }

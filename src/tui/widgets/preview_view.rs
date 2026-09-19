@@ -6,13 +6,14 @@ use ratatui::{
 	widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::{core::Node, fs::format_size, preview::PreviewState, theme::Theme};
+use crate::{config::PreviewLayout, core::Node, fs::format_size, preview::PreviewState, theme::Theme};
 
 pub struct PreviewView;
 
 impl PreviewView {
-	pub fn render(frame: &mut Frame, area: Rect, node: Option<&Node>, state: &PreviewState, skip: usize, theme: &Theme) {
-		let block = Block::new().borders(Borders::LEFT).title(" Preview ").title_style(theme.style("preview.border"));
+	pub fn render(frame: &mut Frame, area: Rect, node: Option<&Node>, state: &PreviewState, skip: usize, layout: PreviewLayout, theme: &Theme) {
+		let border = if layout == PreviewLayout::Vertical { Borders::TOP } else { Borders::LEFT };
+		let block = Block::new().borders(border).title(" Preview ").title_style(theme.style("preview.border"));
 		let lines = match node {
 			Some(node) if node.cha.is_dir => directory_lines(node),
 			Some(_) => text_lines(state, theme),
