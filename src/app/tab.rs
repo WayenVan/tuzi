@@ -1,5 +1,5 @@
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet, VecDeque},
 	io,
 	os::unix::ffi::OsStrExt,
 	path::{Path, PathBuf},
@@ -73,6 +73,7 @@ pub struct Tab {
 	pub(super) pending_notice: Option<(NoticeLevel, String)>,
 	pending_reveal: Option<RevealState>,
 	pending_cursor: Option<PathBuf>,
+	pending_history_restore: Option<HistoryRestore>,
 	pub(super) input: Option<InputSession>,
 	input_seq: u64,
 	tx: UnboundedSender<Event>,
@@ -81,6 +82,12 @@ pub struct Tab {
 struct RevealState {
 	target: PathBuf,
 	refreshed_parent: bool,
+}
+
+struct HistoryRestore {
+	expanded: VecDeque<PathBuf>,
+	waiting:  HashSet<PathBuf>,
+	cursor:   Option<PathBuf>,
 }
 
 enum PendingListing {
@@ -169,6 +176,7 @@ impl Tab {
 			pending_notice: None,
 			pending_reveal: None,
 			pending_cursor: None,
+			pending_history_restore: None,
 			input: None,
 			input_seq: 0,
 			tx,
@@ -833,10 +841,11 @@ impl Tab {
 	}
 
 	pub fn cd(&mut self, path: PathBuf) -> io::Result<()> {
-		self.cd_inner(path, true)
+		self.remember_history_view();
+		self.cd_inner(path, true, None)
 	}
 
-	fn cd_inner(&mut self, path: PathBuf, record: bool) -> io::Result<()> {
+	fn cd_inner(&mut self, path: PathBuf, record: bool, history_view: Option<(Option<PathBuf>, Vec<PathBuf>)>) -> io::Result<()> {
 		if !std::fs::metadata(&path)?.is_dir() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "target is not a directory"));
 		}
@@ -845,7 +854,11 @@ impl Tab {
 		}
 		let previous_root = self.tree.root.path.clone();
 		let mut replacement = Self::open_configured(self.id, path, self.tx.clone(), self.config.clone())?;
-		replacement.pending_cursor = child_below(&replacement.tree.root.path, &previous_root);
+		if let Some((cursor, expanded)) = history_view {
+			replacement.pending_history_restore = Some(HistoryRestore { expanded: expanded.into(), waiting: HashSet::new(), cursor });
+		} else {
+			replacement.pending_cursor = child_below(&replacement.tree.root.path, &previous_root);
+		}
 		let _ = self.tx.send(Event::Visited(replacement.tree.root.path.clone()));
 		let _ = self.tx.send(Event::DdsPublish(Body::Cd { path: replacement.tree.root.path.clone() }));
 		replacement.input_seq = self.input_seq;
@@ -862,23 +875,30 @@ impl Tab {
 	}
 
 	pub fn history_back(&mut self) {
-		let Some(path) = self.path_history.back().map(Path::to_path_buf) else {
+		self.remember_history_view();
+		let Some(entry) = self.path_history.back() else {
 			return;
 		};
-		if let Err(error) = self.cd_inner(path, false) {
+		if let Err(error) = self.cd_inner(entry.path, false, Some((entry.cursor, entry.expanded))) {
 			self.path_history.forward();
 			self.raise(NoticeLevel::Error, error.to_string());
 		}
 	}
 
 	pub fn history_forward(&mut self) {
-		let Some(path) = self.path_history.forward().map(Path::to_path_buf) else {
+		self.remember_history_view();
+		let Some(entry) = self.path_history.forward() else {
 			return;
 		};
-		if let Err(error) = self.cd_inner(path, false) {
+		if let Err(error) = self.cd_inner(entry.path, false, Some((entry.cursor, entry.expanded))) {
 			self.path_history.back();
 			self.raise(NoticeLevel::Error, error.to_string());
 		}
+	}
+
+	fn remember_history_view(&mut self) {
+		let state = self.snapshot_state();
+		self.path_history.remember_view(state.cursor, state.expanded);
 	}
 
 	pub fn cd_selected(&mut self) {
@@ -1101,6 +1121,7 @@ impl Tab {
 			_ => return,
 		}
 		self.continue_reveal();
+		self.continue_history_restore();
 		self.continue_pending_cursor();
 		self.clamp_cursor();
 	}
@@ -1143,11 +1164,51 @@ impl Tab {
 			}
 		}
 		self.continue_reveal();
+		if let Some(restore) = &mut self.pending_history_restore {
+			restore.waiting.remove(&path);
+		}
+		self.continue_history_restore();
 		self.continue_pending_cursor();
 		if path == self.tree.root.path && self.tree.is_loaded(&path) {
 			self.pending_cursor = None;
 		}
 		self.clamp_cursor();
+	}
+
+	/// Replays a history entry's expanded paths as their parents become
+	/// available. Unlike session restore this is intentionally best-effort:
+	/// filesystem changes made while away from a location are skipped rather
+	/// than turning ordinary back/forward navigation into an error.
+	fn continue_history_restore(&mut self) {
+		loop {
+			let Some(path) = self.pending_history_restore.as_ref().and_then(|restore| restore.expanded.front()).cloned() else {
+				break;
+			};
+			if self.tree.root.find(&path).is_some() {
+				self.pending_history_restore.as_mut().unwrap().expanded.pop_front();
+				if self.restore_expand(&path).unwrap_or(false) {
+					self.pending_history_restore.as_mut().unwrap().waiting.insert(path);
+				}
+				continue;
+			}
+			if path_is_settled_missing(&self.tree, &path) {
+				self.pending_history_restore.as_mut().unwrap().expanded.pop_front();
+				continue;
+			}
+			return;
+		}
+
+		if self.pending_history_restore.as_ref().is_some_and(|restore| !restore.waiting.is_empty()) {
+			return;
+		}
+		let cursor = self.pending_history_restore.as_ref().and_then(|restore| restore.cursor.clone());
+		let Some(cursor) = cursor else {
+			self.pending_history_restore = None;
+			return;
+		};
+		if self.restore_cursor(&cursor) || path_is_settled_missing(&self.tree, &cursor) {
+			self.pending_history_restore = None;
+		}
 	}
 
 	fn continue_pending_cursor(&mut self) {
@@ -1377,6 +1438,18 @@ fn trash_dirs() -> Vec<PathBuf> {
 	{
 		Vec::new()
 	}
+}
+
+fn path_is_settled_missing(tree: &Tree, path: &Path) -> bool {
+	if tree.root.find(path).is_some() { return false }
+	let mut ancestor = path.parent();
+	while let Some(path) = ancestor {
+		if let Some(node) = tree.root.find(path) {
+			return !node.loading;
+		}
+		ancestor = path.parent();
+	}
+	true
 }
 
 fn ancestor_directories(root: &Path, parent: &Path) -> Vec<PathBuf> {
@@ -1619,6 +1692,46 @@ mod tests {
 		tab.cd(root.clone()).unwrap();
 		tab.history_forward();
 		assert_eq!(tab.tree.root.path, root, "a new navigation discards the old forward branch");
+
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn directory_history_restores_each_locations_cursor() {
+		let root = std::env::temp_dir().join("tuzi-tab-test-history-cursor");
+		let _ = fs::remove_dir_all(&root);
+		for path in ["a/one", "a/two", "a/open/leaf", "b/one", "b/two", "b/open/leaf"] {
+			let path = root.join(path);
+			fs::create_dir_all(path.parent().unwrap()).unwrap();
+			fs::write(path, b"hi").unwrap();
+		}
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+
+		tab.cd(root.join("a")).unwrap();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("a/open"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("a/two"));
+		tab.cd(root.join("b")).unwrap();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("b/open"));
+		tab.expand_selected();
+		pump(&mut tab, &mut rx).await;
+		tab.select(&root.join("b/two"));
+
+		tab.history_back();
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("a/two"));
+		assert!(tab.tree.root.find(&root.join("a/open")).unwrap().expanded);
+
+		tab.history_forward();
+		pump(&mut tab, &mut rx).await;
+		pump(&mut tab, &mut rx).await;
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("b/two"));
+		assert!(tab.tree.root.find(&root.join("b/open")).unwrap().expanded);
 
 		fs::remove_dir_all(root).unwrap();
 	}

@@ -4,6 +4,25 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-09-19
+
+### Added
+
+- An entry-details popup on `K` that shows the complete selected name, path, metadata, and symbolic-link target.
+- An optional filename peek on `I` that shows the truncated remainder of the selected name below its row.
+- Adaptive preview layouts that stack below the tree in narrow terminals and remain side by side at wider widths, with configurable layout and split threshold.
+- `zm` to collapse all directory subtrees at the current sibling level; global subtree collapse now uses `zM`.
+
+### Changed
+
+- Directory history navigation with `<C-o>` and `<C-i>` now restores each location's cursor and expanded tree state.
+- Returning to a parent or ancestor directory focuses the child that was just exited.
+
+### Fixed
+
+- Long symbolic-link targets no longer displace filenames when the tree pane is narrow.
+- Entering a symbolic-link directory preserves its logical path, so parent and history navigation return to the link instead of its canonical target.
+
 ## [0.4.1] - 2026-09-19
 
 ### Added
@@ -78,6 +97,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.4.2]: https://github.com/WayenVan/tuzi/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/WayenVan/tuzi/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/WayenVan/tuzi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/WayenVan/tuzi/compare/v0.2.0...v0.3.0
