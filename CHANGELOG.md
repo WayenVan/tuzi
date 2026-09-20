@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The tab bar no longer squeezes every tab into an equal share of the width. Tabs that fit keep their full names; when space is short, only the long names are truncated; and when even that leaves fewer than 8 columns per tab, the bar scrolls around the active tab and shows `‹` / `›` on the side that hides more. It is stateless, so no scroll position is stored, and clicking a tab uses the same layout as drawing it.
+- The number in front of a tab name is drawn quieter than the name. It uses the new `tabs.index_active` and `tabs.index_inactive` styles, which are patched onto the tab's own style so the number always keeps the tab's background and boldness. Existing `theme.toml` files need no change.
 - `gh` goes to the parent directory again; the session home moved to `g=`.
 - `emit` now rejects a kind that starts with `-`, so a mistyped flag cannot become an event kind.
 

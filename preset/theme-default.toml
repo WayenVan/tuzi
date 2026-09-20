@@ -30,6 +30,10 @@ exts = []
 "tabs.inactive"        = { fg = "#89b4fa", bg = "#313244" }
 "tabs.separator"       = { fg = "#89b4fa", bg = "#313244" }
 "tabs.outer"           = { fg = "#313244" }
+# The tab number is patched onto its tab's style, so it keeps that tab's
+# background and boldness; only the foreground is quieter than the name.
+"tabs.index_active"    = { fg = "#45475a" }
+"tabs.index_inactive"  = { fg = "#7f849c" }
 "status.normal"        = { fg = "#1e1e2e", bg = "#89b4fa" }
 "status.select"        = { fg = "#1e1e2e", bg = "#94e2d5" }
 "status.unset"         = { fg = "#1e1e2e", bg = "#f2cdcd" }

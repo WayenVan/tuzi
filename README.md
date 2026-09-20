@@ -430,6 +430,14 @@ Style properties are `fg`, `bg`, `bold`, `italic`, `underline`, and
 `reverse`. Unknown style names and properties are rejected instead of being
 silently ignored.
 
+The number in front of a tab name is drawn quieter than the name, with
+`tabs.index_active` and `tabs.index_inactive`. These are patched onto the
+tab's own style, so they usually set only `fg`: the number keeps whatever
+background and boldness you give `tabs.active` / `tabs.inactive`. If you recolor those
+backgrounds, pick an index color that still contrasts with them. The defaults
+are `#45475a` on the active tab and `#7f849c` on the others, about 4.3:1 and
+3.4:1 against the default backgrounds.
+
 ## Keybindings
 
 | Key | Action |
