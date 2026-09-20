@@ -293,8 +293,10 @@ polling backend/fallback and does not replace native watching where available.
 Native watching cannot see changes made from another machine on a network
 filesystem such as NFS; press `R` (`:refresh`) to read the open directories
 again. Tuzi also does this by itself when the OS reports that it dropped file
-events, and it re-registers a directory's watch when the directory was deleted
-or moved away.
+events, and it registers a directory's watch again when the directory was
+deleted or moved away and came back. If the native backend cannot be used at
+all, for instance because the per-user limit on inotify instances or watches
+is reached, Tuzi says so and polls every `poll_interval_ms` instead.
 
 ### Keymap
 

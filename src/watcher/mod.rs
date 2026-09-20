@@ -2,15 +2,12 @@ use std::{
 	collections::{HashMap, HashSet},
 	io,
 	path::{Path, PathBuf},
-	sync::{
-		Arc, Mutex,
-		mpsc::{self, SyncSender},
-	},
+	sync::{Arc, Mutex, mpsc},
 	thread,
 	time::Duration,
 };
 
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{Config, EventKind, RecursiveMode, Watcher as NotifyWatcher, event::ModifyKind};
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::AbortHandle, time::Instant};
 
 use crate::{
@@ -28,41 +25,115 @@ pub enum WatchIssue {
 	/// The backend failed to read events.
 	BackendError(String),
 	/// A watch could not be registered, so that directory will not update on
-	/// its own. Directories that no longer exist are not reported.
+	/// its own. Directories that no longer exist, or that cannot be read, are
+	/// not reported: their own listing already shows that.
 	RegisterFailed { path: PathBuf, error: String },
+	/// The native backend could not be used (typically the OS limit on inotify
+	/// instances or watches), so watching switched to polling. Anything may have
+	/// changed while switching.
+	FellBackToPolling(String),
 }
 
-type IssueReporter = Arc<dyn Fn(WatchIssue) + Send + Sync>;
-
+/// Watches the directories an app says it wants watched, and keeps that true.
+///
+/// The interface is one declaration, [`Watcher::sync`]: *this* is the set of
+/// directories to watch. Everything else follows from it inside the worker
+/// thread: registering what is missing, dropping what is not wanted, and
+/// noticing when a watch has been lost (the kernel drops a watch when its
+/// directory is deleted or moved away, and does not say so) and arming it
+/// again. Callers never track individual watches, so they cannot get out of
+/// step with the OS.
 pub struct Watcher {
-	commands: mpsc::Sender<WatchCommand>,
+	commands: mpsc::Sender<Command>,
 	worker: Option<thread::JoinHandle<()>>,
 	pending: PendingChanges,
+	#[cfg(test)]
+	registry: Arc<Mutex<Registry>>,
 }
 
-enum WatchCommand {
-	Watch { path: PathBuf, reply: Option<SyncSender<io::Result<()>>> },
-	Unwatch(PathBuf),
+enum Command {
+	/// The complete set of directories that should be watched. `done` is
+	/// signalled once it has been applied (used by tests).
+	Sync { wanted: HashSet<PathBuf>, done: Option<mpsc::SyncSender<()>> },
+	/// A hint that a wanted directory may need its watch registered again.
+	/// `force` says the watch is known to be dead (the directory itself was
+	/// deleted or moved, which is the kernel's cue to drop it): register again
+	/// without checking identity, which cannot be trusted after a reused inode.
+	Heal { path: PathBuf, force: bool },
 	Shutdown,
+}
+
+type Handler = Box<dyn FnMut(notify::Result<notify::Event>) + Send + 'static>;
+type Backend = Box<dyn NotifyWatcher + Send>;
+/// Builds a backend around an event handler.
+type BackendCtor = Box<dyn FnOnce(Handler) -> notify::Result<Backend> + Send>;
+
+/// Tells the app what the watcher found out.
+#[derive(Clone)]
+struct Notifier {
+	tab: usize,
+	tx: UnboundedSender<Event>,
+}
+
+impl Notifier {
+	fn issue(&self, issue: WatchIssue) {
+		let _ = self.tx.send(Event::WatchIssue { tab: self.tab, issue });
+	}
+
+	/// A directory should be read again: its watch was lost and is back, so
+	/// changes made in between were never reported.
+	fn changed(&self, path: PathBuf) {
+		let _ = self.tx.send(Event::Changed { tab: self.tab, path });
+	}
 }
 
 /// `notify` needs the canonical (symlink-resolved) path to actually register
 /// an OS-level watch, and its backends sometimes report that resolved form
-/// back in events too — but the tree indexes nodes by their own, possibly
-/// symlinked, path. This keeps both directions so raw events can be matched
-/// in canonical space while everything handed back to the app (and `unwatch`)
-/// stays in the tree's own path space.
+/// back in events too, but the tree indexes nodes by their own, possibly
+/// symlinked, path. This keeps both directions so raw events can be matched in
+/// canonical space while everything handed back to the app stays in the tree's
+/// own path space. Shared by the worker (which writes it) and the event
+/// handler (which reads it).
 #[derive(Default)]
-struct WatchIndex {
+struct Registry {
 	by_canonical: HashMap<PathBuf, PathBuf>,
-	by_original: HashMap<PathBuf, PathBuf>,
+	by_original: HashMap<PathBuf, Registration>,
+	/// What the app last said it wants watched.
+	wanted: HashSet<PathBuf>,
 }
 
-const MAX_CHANGE_BATCH: usize = 1000;
+/// What is known about a registered directory, enough to tell later whether
+/// the watch still belongs to the directory now found at that path.
+struct Registration {
+	canonical: PathBuf,
+	identity: Option<Identity>,
+}
+
+/// (device, inode, creation time): a directory deleted and recreated at the
+/// same path is a different one, and the watch on the old one is dead. The
+/// inode number alone cannot tell them apart: filesystems reuse a freed inode
+/// at once (ext4 did, every time it was tried), so the creation time, where
+/// the OS reports one, is part of the identity. This is only a fallback for a
+/// loss the events did not announce; see `Command::Heal`.
+type Identity = (u64, u64, Option<std::time::SystemTime>);
+
+fn identity(path: &Path) -> Option<Identity> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		std::fs::metadata(path).ok().map(|metadata| (metadata.dev(), metadata.ino(), metadata.created().ok()))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = path;
+		None
+	}
+}
+
 /// Caps how long a directory under nonstop churn (e.g. a log file being
 /// appended to faster than the configured debounce apart) can be starved of an
-/// update — the sliding debounce below would otherwise keep resetting
-/// forever.
+/// update: the sliding debounce below would otherwise keep resetting forever.
+const MAX_CHANGE_BATCH: usize = 1000;
 
 type PendingChanges = Arc<Mutex<HashMap<PathBuf, PendingChange>>>;
 
@@ -81,97 +152,109 @@ struct ChangeSet {
 }
 
 impl Watcher {
+	/// Never fails because of the backend: if the native one cannot be created
+	/// (say the per-user limit on inotify instances is used up) it falls back to
+	/// polling and says so, and if even that fails it watches nothing and says
+	/// so. A view that cannot update itself is still a view.
 	pub fn new(tab: usize, tx: UnboundedSender<Event>, debounce: Duration, max_wait: Duration, poll_interval: Duration) -> io::Result<Self> {
-		let watched = Arc::new(Mutex::new(WatchIndex::default()));
-		let pending = Arc::new(Mutex::new(HashMap::new()));
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
-		let notify_config = Config::default().with_poll_interval(poll_interval).with_compare_contents(true);
-		let report = issue_reporter(tab, tx.clone());
-		let inner = RecommendedWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime, debounce, max_wait), notify_config).map_err(io::Error::other)?;
-		Ok(Self::with_inner(Box::new(inner), watched, pending, report))
+		let native: BackendCtor = Box::new(move |handler| Ok(Box::new(notify::RecommendedWatcher::new(handler, Config::default().with_poll_interval(poll_interval))?)));
+		let polling: BackendCtor = Box::new(move |handler| Ok(Box::new(notify::PollWatcher::new(handler, Config::default().with_poll_interval(poll_interval))?)));
+		Ok(Self::with_backends(tab, tx, runtime, debounce, max_wait, native, polling))
 	}
 
 	#[cfg(test)]
-	fn new_polling(tab: usize, tx: UnboundedSender<Event>, interval: std::time::Duration) -> io::Result<Self> {
-		let watched = Arc::new(Mutex::new(WatchIndex::default()));
-		let pending = Arc::new(Mutex::new(HashMap::new()));
+	fn new_polling(tab: usize, tx: UnboundedSender<Event>, interval: Duration) -> io::Result<Self> {
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
-		let config = Config::default().with_poll_interval(interval).with_compare_contents(true);
-		let report = issue_reporter(tab, tx.clone());
-		let inner = notify::PollWatcher::new(event_handler(tab, tx, watched.clone(), pending.clone(), runtime, Duration::from_millis(250), Duration::from_secs(1)), config).map_err(io::Error::other)?;
-		Ok(Self::with_inner(Box::new(inner), watched, pending, report))
+		let polling = move || -> BackendCtor { Box::new(move |handler| Ok(Box::new(notify::PollWatcher::new(handler, Config::default().with_poll_interval(interval).with_compare_contents(true))?))) };
+		Ok(Self::with_backends(tab, tx, runtime, Duration::from_millis(250), Duration::from_secs(1), polling(), polling()))
 	}
 
-	fn with_inner(mut inner: Box<dyn NotifyWatcher + Send>, watched: Arc<Mutex<WatchIndex>>, pending: PendingChanges, report: IssueReporter) -> Self {
+	fn with_backends(tab: usize, tx: UnboundedSender<Event>, runtime: Handle, debounce: Duration, max_wait: Duration, native: BackendCtor, polling: BackendCtor) -> Self {
+		let registry = Arc::new(Mutex::new(Registry::default()));
+		let pending: PendingChanges = Arc::new(Mutex::new(HashMap::new()));
+		let notifier = Notifier { tab, tx };
 		let (commands, rx) = mpsc::channel();
-		let worker_watched = watched.clone();
-		let worker = thread::Builder::new()
-			.name("tuzi-watcher".into())
-			.spawn(move || {
-				while let Ok(command) = rx.recv() {
-					match command {
-						WatchCommand::Watch { path, reply } => {
-							let result = register_watch(inner.as_mut(), &worker_watched, &path);
-							match reply {
-								Some(reply) => {
-									let _ = reply.send(result);
-								}
-								// Nobody is waiting for this result, so a failure
-								// would otherwise leave the directory silently
-								// stale. But a directory that is gone, or that we
-								// may not read, is that directory's own problem and
-								// its listing already shows it; only a failure that
-								// says something about watching itself is worth
-								// interrupting the user for (e.g. the OS limit on
-								// watches).
-								None => {
-									if let Err(error) = result
-										&& !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
-									{
-										report(WatchIssue::RegisterFailed { path, error: error.to_string() });
-									}
-								}
-							}
-						}
-						WatchCommand::Unwatch(path) => unregister_watch(inner.as_mut(), &worker_watched, &path),
-						WatchCommand::Shutdown => break,
-					}
+
+		let context = HandlerContext {
+			notifier: notifier.clone(),
+			registry: registry.clone(),
+			pending: pending.clone(),
+			commands: commands.clone(),
+			runtime,
+			debounce,
+			max_wait,
+			gate: Arc::new(IssueGate::default()),
+		};
+		let make_handler: Arc<dyn Fn() -> Handler + Send + Sync> = Arc::new(move || event_handler(context.clone()));
+
+		let mut polling = Some(polling);
+		let backend = match native(make_handler()) {
+			Ok(backend) => backend,
+			Err(error) => match polling.take().expect("set just above")(make_handler()) {
+				Ok(backend) => {
+					notifier.issue(WatchIssue::FellBackToPolling(error.to_string()));
+					backend
 				}
-			})
-			.expect("watcher worker thread");
-		Self { commands, worker: Some(worker), pending }
-	}
+				Err(second) => {
+					notifier.issue(WatchIssue::BackendError(format!("file watching is unavailable ({error}); polling failed too ({second})")));
+					Box::new(notify::NullWatcher::new(make_handler(), Config::default()).expect("a null watcher cannot fail"))
+				}
+			},
+		};
 
-	/// Watches one directory level, non-recursively — nodes watch themselves
-	/// only while expanded, mirroring what's actually visible on screen.
-	pub fn watch(&self, path: &Path) -> io::Result<()> {
-		let (tx, rx) = mpsc::sync_channel(1);
-		self.commands.send(WatchCommand::Watch { path: path.to_path_buf(), reply: Some(tx) }).map_err(io::Error::other)?;
-		rx.recv().map_err(io::Error::other)?
-	}
-
-	/// Queues the complete canonicalize-and-register operation. Expanding a
-	/// node therefore never waits on a slow symlink target or network mount.
-	pub fn watch_async(&self, path: PathBuf) {
-		let _ = self.commands.send(WatchCommand::Watch { path, reply: None });
-	}
-
-	/// Takes the same (tree-space) path `watch` was given — not re-derived
-	/// from the filesystem, so this still works even if whatever the path
-	/// pointed at has already vanished.
-	pub fn unwatch(&self, path: &Path) {
-		let _ = self.commands.send(WatchCommand::Unwatch(path.to_path_buf()));
-		if let Some(change) = self.pending.lock().unwrap().remove(path)
-			&& let Some(abort) = change.abort
-		{
-			abort.abort();
+		let worker = Worker {
+			backend,
+			polling,
+			registry: registry.clone(),
+			pending: pending.clone(),
+			notifier,
+			make_handler,
+			failed: HashSet::new(),
+			lost: HashSet::new(),
+		};
+		let worker = thread::Builder::new().name("tuzi-watcher".into()).spawn(move || worker.run(rx)).expect("watcher worker thread");
+		Self {
+			commands,
+			worker: Some(worker),
+			pending,
+			#[cfg(test)]
+			registry,
 		}
+	}
+
+	/// Declares the complete set of directories to watch, each one level and
+	/// not recursively, the way nodes are open on screen. Applied on the
+	/// worker thread, so it never waits on a slow symlink target or network
+	/// mount.
+	///
+	/// A directory's parent should be in the set too (the tree only ever asks
+	/// for expanded directories, whose parents are open): the parent's watch is
+	/// how a directory that came back after being deleted is noticed.
+	pub fn sync(&self, wanted: HashSet<PathBuf>) {
+		let _ = self.commands.send(Command::Sync { wanted, done: None });
+	}
+
+	/// Like [`Watcher::sync`], but returns once it has been applied. For when
+	/// something must not happen before the watches are in place: a directory
+	/// listing read before its watch exists can miss a change made in between,
+	/// and nothing would ever report it.
+	pub(crate) fn sync_wait(&self, wanted: HashSet<PathBuf>) {
+		let (done, applied) = mpsc::sync_channel(1);
+		self.commands.send(Command::Sync { wanted, done: Some(done) }).unwrap();
+		applied.recv().unwrap();
+	}
+
+	/// The tree paths currently registered with the backend.
+	#[cfg(test)]
+	pub(crate) fn registered(&self) -> HashSet<PathBuf> {
+		self.registry.lock().unwrap().by_original.keys().cloned().collect()
 	}
 }
 
 impl Drop for Watcher {
 	fn drop(&mut self) {
-		let _ = self.commands.send(WatchCommand::Shutdown);
+		let _ = self.commands.send(Command::Shutdown);
 		if let Some(worker) = self.worker.take() {
 			let _ = worker.join();
 		}
@@ -183,33 +266,191 @@ impl Drop for Watcher {
 	}
 }
 
-/// Registers, or re-registers, the watch for one directory.
-///
-/// A path we already know is *not* skipped: the kernel drops a watch when its
-/// directory is deleted or moved away, without telling us. If the path then
-/// comes back as a new directory, skipping it here would leave that directory
-/// unwatched for good, so a known path is unwatched and armed again.
-fn register_watch(inner: &mut dyn NotifyWatcher, watched: &Mutex<WatchIndex>, path: &Path) -> io::Result<()> {
-	let canonical = path.canonicalize()?;
-	let (known, moved_from) = {
-		let watched = watched.lock().unwrap();
-		let known = watched.by_canonical.contains_key(&canonical);
-		// The same tree path may now resolve elsewhere (a retargeted symlink).
-		let moved_from = watched.by_original.get(path).filter(|old| **old != canonical).cloned();
-		(known, moved_from)
-	};
-	if known {
-		let _ = inner.unwatch(&canonical);
+/// The thread that owns the backend and makes the registered watches match
+/// what is wanted.
+struct Worker {
+	backend: Backend,
+	/// Still unused: the polling backend to switch to if the native one runs
+	/// out of room.
+	polling: Option<BackendCtor>,
+	registry: Arc<Mutex<Registry>>,
+	pending: PendingChanges,
+	notifier: Notifier,
+	make_handler: Arc<dyn Fn() -> Handler + Send + Sync>,
+	/// Directories whose registration failure was already reported, so that
+	/// asking again does not report it again.
+	failed: HashSet<PathBuf>,
+	/// Wanted directories whose watch was lost. When one is registered again,
+	/// what changed in the meantime was never reported, so it is read again.
+	lost: HashSet<PathBuf>,
+}
+
+impl Worker {
+	fn run(mut self, commands: mpsc::Receiver<Command>) {
+		while let Ok(command) = commands.recv() {
+			match command {
+				Command::Sync { wanted, done } => {
+					self.sync(wanted);
+					if let Some(done) = done {
+						let _ = done.send(());
+					}
+				}
+				Command::Heal { path, force } => {
+					if self.registry.lock().unwrap().wanted.contains(&path) {
+						self.reconcile_with(&path, force);
+					}
+				}
+				Command::Shutdown => break,
+			}
+		}
 	}
-	if let Some(old) = moved_from {
-		let _ = inner.unwatch(&old);
-		watched.lock().unwrap().by_canonical.remove(&old);
+
+	fn sync(&mut self, wanted: HashSet<PathBuf>) {
+		let dropped: Vec<PathBuf> = self.registry.lock().unwrap().by_original.keys().filter(|path| !wanted.contains(*path)).cloned().collect();
+		for path in &dropped {
+			self.unregister(path);
+			// Nobody is looking at that directory any more.
+			if let Some(change) = self.pending.lock().unwrap().remove(path)
+				&& let Some(abort) = change.abort
+			{
+				abort.abort();
+			}
+		}
+		self.failed.retain(|path| wanted.contains(path));
+		self.lost.retain(|path| wanted.contains(path));
+		self.registry.lock().unwrap().wanted = wanted.clone();
+		for path in &wanted {
+			self.reconcile(path);
+		}
 	}
-	inner.watch(&canonical, RecursiveMode::NonRecursive).map_err(notify_to_io)?;
-	let mut watched = watched.lock().unwrap();
-	watched.by_canonical.insert(canonical.clone(), path.to_path_buf());
-	watched.by_original.insert(path.to_path_buf(), canonical);
-	Ok(())
+
+	/// Makes one wanted directory's registration correct: present, and
+	/// belonging to the directory that is at that path now.
+	fn reconcile(&mut self, path: &Path) {
+		self.reconcile_with(path, false);
+	}
+
+	/// With `force`, a registration that looks current is replaced anyway.
+	fn reconcile_with(&mut self, path: &Path, force: bool) {
+		let Ok(canonical) = path.canonicalize() else {
+			// Gone, or out of reach. Whatever was registered is dead; remember
+			// that, so that when it comes back it is registered and re-read.
+			if self.unregister(path) {
+				self.lost.insert(path.to_path_buf());
+			}
+			return;
+		};
+		let now = identity(&canonical);
+		let current = self.registry.lock().unwrap().by_original.get(path).map(|registered| (registered.canonical.clone(), registered.identity));
+		match current {
+			Some((old_canonical, old_identity)) if !force && old_canonical == canonical && now.is_some() && old_identity == now => return,
+			Some(_) => {
+				// Registered, but for a directory that is no longer the one here.
+				self.unregister(path);
+				self.lost.insert(path.to_path_buf());
+			}
+			None => {}
+		}
+		self.register(path, canonical, now);
+	}
+
+	fn register(&mut self, path: &Path, canonical: PathBuf, identity: Option<Identity>) {
+		{
+			// Two tree paths can resolve to one directory (a symlink); the first
+			// to register keeps the events.
+			let registry = self.registry.lock().unwrap();
+			if let Some(owner) = registry.by_canonical.get(&canonical)
+				&& owner != path
+				&& registry.by_original.contains_key(owner)
+			{
+				return;
+			}
+		}
+		match self.backend.watch(&canonical, RecursiveMode::NonRecursive) {
+			Ok(()) => {
+				{
+					let mut registry = self.registry.lock().unwrap();
+					registry.by_canonical.insert(canonical.clone(), path.to_path_buf());
+					registry.by_original.insert(path.to_path_buf(), Registration { canonical, identity });
+				}
+				self.failed.remove(path);
+				if self.lost.remove(path) {
+					self.notifier.changed(path.to_path_buf());
+				}
+			}
+			Err(error) => self.registration_failed(path, error),
+		}
+	}
+
+	/// Returns whether the path was registered.
+	fn unregister(&mut self, path: &Path) -> bool {
+		let removed = {
+			let mut registry = self.registry.lock().unwrap();
+			let removed = registry.by_original.remove(path);
+			if let Some(registration) = &removed {
+				registry.by_canonical.remove(&registration.canonical);
+			}
+			removed
+		};
+		match removed {
+			Some(registration) => {
+				let _ = self.backend.unwatch(&registration.canonical);
+				true
+			}
+			None => false,
+		}
+	}
+
+	fn registration_failed(&mut self, path: &Path, error: notify::Error) {
+		if is_limit(&error) && self.polling.is_some() {
+			self.fall_back(error);
+			return;
+		}
+		let error = notify_to_io(error);
+		// A directory that is gone, or that we may not read, is that
+		// directory's own problem and its listing already shows it. Only a
+		// failure that says something about watching itself is worth
+		// interrupting the user for.
+		if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) {
+			return;
+		}
+		if self.failed.insert(path.to_path_buf()) {
+			self.notifier.issue(WatchIssue::RegisterFailed { path: path.to_path_buf(), error: error.to_string() });
+		}
+	}
+
+	/// The native backend has no room left: watch by polling instead.
+	fn fall_back(&mut self, reason: notify::Error) {
+		let Some(polling) = self.polling.take() else { return };
+		match polling((self.make_handler)()) {
+			Ok(backend) => {
+				// Dropping the old backend closes it, and its watches with it.
+				self.backend = backend;
+				{
+					let mut registry = self.registry.lock().unwrap();
+					registry.by_canonical.clear();
+					registry.by_original.clear();
+				}
+				self.notifier.issue(WatchIssue::FellBackToPolling(reason.to_string()));
+				let wanted: Vec<PathBuf> = self.registry.lock().unwrap().wanted.iter().cloned().collect();
+				for path in &wanted {
+					self.reconcile(path);
+				}
+			}
+			Err(error) => self.notifier.issue(WatchIssue::BackendError(format!("polling fallback failed: {error}"))),
+		}
+	}
+}
+
+/// Whether the backend refused because it is out of room, as opposed to
+/// something being wrong with one directory.
+fn is_limit(error: &notify::Error) -> bool {
+	match &error.kind {
+		notify::ErrorKind::MaxFilesWatch => true,
+		#[cfg(unix)]
+		notify::ErrorKind::Io(source) => matches!(source.raw_os_error(), Some(libc::EMFILE | libc::ENFILE | libc::ENOSPC)),
+		_ => false,
+	}
 }
 
 /// Converts a notify error without losing what an I/O error was (so that
@@ -220,12 +461,6 @@ fn notify_to_io(error: notify::Error) -> io::Error {
 		notify::ErrorKind::PathNotFound => io::Error::new(io::ErrorKind::NotFound, error.to_string()),
 		_ => io::Error::other(error),
 	}
-}
-
-fn issue_reporter(tab: usize, tx: UnboundedSender<Event>) -> IssueReporter {
-	Arc::new(move |issue| {
-		let _ = tx.send(Event::WatchIssue { tab, issue });
-	})
 }
 
 /// How long after reporting one issue the next may be reported. Shortened
@@ -249,19 +484,20 @@ struct GateState {
 	queued: Option<WatchIssue>,
 }
 
-fn raise_issue(tab: usize, tx: &UnboundedSender<Event>, runtime: &Handle, gate: &Arc<IssueGate>, delay: Duration, issue: WatchIssue) {
+fn raise_issue(context: &HandlerContext, issue: WatchIssue) {
 	{
-		let mut state = gate.state.lock().unwrap();
+		let mut state = context.gate.state.lock().unwrap();
 		if state.running {
 			state.queued = Some(issue);
 			return;
 		}
 		state.running = true;
 	}
-	let (tx, gate) = (tx.clone(), gate.clone());
-	runtime.spawn(async move {
+	let (notifier, gate) = (context.notifier.clone(), context.gate.clone());
+	let delay = context.debounce.max(Duration::from_millis(200));
+	context.runtime.spawn(async move {
 		tokio::time::sleep(delay).await;
-		let _ = tx.send(Event::WatchIssue { tab, issue });
+		notifier.issue(issue);
 		loop {
 			tokio::time::sleep(ISSUE_COOLDOWN).await;
 			let next = {
@@ -271,73 +507,96 @@ fn raise_issue(tab: usize, tx: &UnboundedSender<Event>, runtime: &Handle, gate: 
 				next
 			};
 			match next {
-				Some(issue) => {
-					let _ = tx.send(Event::WatchIssue { tab, issue });
-				}
+				Some(issue) => notifier.issue(issue),
 				None => break,
 			}
 		}
 	});
 }
 
-fn unregister_watch(inner: &mut dyn NotifyWatcher, watched: &Mutex<WatchIndex>, path: &Path) {
-	let mut watched = watched.lock().unwrap();
-	let Some(canonical) = watched.by_original.remove(path) else {
-		return;
-	};
-	watched.by_canonical.remove(&canonical);
-	drop(watched);
-	let _ = inner.unwatch(&canonical);
+/// Everything an event handler needs; cloned for each backend it is built for.
+#[derive(Clone)]
+struct HandlerContext {
+	notifier: Notifier,
+	registry: Arc<Mutex<Registry>>,
+	pending: PendingChanges,
+	commands: mpsc::Sender<Command>,
+	runtime: Handle,
+	debounce: Duration,
+	max_wait: Duration,
+	gate: Arc<IssueGate>,
 }
 
 // The backend (FSEvents/inotify/...) doesn't consistently report a changed
 // child's path vs. its watched parent, and may resolve symlinks along the
-// way — so the ancestor walk below matches in canonical space. Everything
+// way, so the ancestor walk below matches in canonical space. Everything
 // downstream of that match (the `changed` map, debounce bookkeeping, the
 // event finally sent out) is then translated back to the tree's own path,
 // which is what `Tab` actually indexes its nodes by.
-fn event_handler(tab: usize, tx: UnboundedSender<Event>, matched: Arc<Mutex<WatchIndex>>, pending: PendingChanges, runtime: Handle, debounce: Duration, max_wait: Duration) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
-	let issue_gate = Arc::new(IssueGate::default());
-	let issue_delay = debounce.max(Duration::from_millis(200));
-	move |res| {
+fn event_handler(context: HandlerContext) -> Handler {
+	Box::new(move |res| {
 		let event = match res {
 			Ok(event) => event,
 			// A path that vanished mid-flight is the parent directory's news
 			// to report; anything else means we may have missed changes.
 			Err(error) if matches!(error.kind, notify::ErrorKind::PathNotFound | notify::ErrorKind::WatchNotFound) => return,
 			Err(error) => {
-				raise_issue(tab, &tx, &runtime, &issue_gate, issue_delay, WatchIssue::BackendError(error.to_string()));
+				raise_issue(&context, WatchIssue::BackendError(error.to_string()));
 				return;
 			}
 		};
 		if event.need_rescan() {
-			raise_issue(tab, &tx, &runtime, &issue_gate, issue_delay, WatchIssue::EventsDropped);
+			raise_issue(&context, WatchIssue::EventsDropped);
 		}
 		if event.kind.is_access() {
 			return;
 		}
-		let watched = matched.lock().unwrap();
+		let directory_itself_left = event.kind.is_remove() || matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
 		let mut changed: HashMap<PathBuf, (HashSet<PathBuf>, bool)> = HashMap::new();
-		for path in event.paths {
-			if let Some(canonical_dir) = nearest_watched(&watched.by_canonical, &path) {
-				let Some(original_dir) = watched.by_canonical.get(&canonical_dir) else {
+		let mut heal: Vec<(PathBuf, bool)> = Vec::new();
+		{
+			let registry = context.registry.lock().unwrap();
+			for path in event.paths {
+				// A path can be two things at once. If it is a directory we watch,
+				// this is news about that directory itself: it changed, or it was
+				// deleted or moved, which the kernel answers by dropping its watch.
+				if let Some(original_dir) = registry.by_canonical.get(&path) {
+					changed.entry(original_dir.clone()).or_default().1 = true;
+					if directory_itself_left {
+						heal.push((original_dir.clone(), true));
+					}
+				}
+				// And it is an entry of the nearest watched directory above it. That
+				// matters even for a watched directory: its parent's listing has to
+				// hear that it appeared, was renamed, or is gone. Attributing the
+				// path only to itself, as this once did, left a deleted directory in
+				// its parent's listing for good.
+				let Some(canonical_dir) = path.parent().and_then(|parent| nearest_watched(&registry.by_canonical, parent)) else {
 					continue;
 				};
-				let entry = changed.entry(original_dir.clone()).or_default();
-				if path == canonical_dir {
-					entry.1 = true;
-				} else if let Ok(relative) = path.strip_prefix(&canonical_dir)
+				let Some(original_dir) = registry.by_canonical.get(&canonical_dir) else {
+					continue;
+				};
+				if let Ok(relative) = path.strip_prefix(&canonical_dir)
 					&& let Some(component) = relative.components().next()
 				{
-					entry.0.insert(original_dir.join(component.as_os_str()));
+					let child = original_dir.join(component.as_os_str());
+					// A directory that is still wanted but was lost has just been
+					// mentioned by its parent: it is back.
+					if registry.wanted.contains(&child) && !registry.by_original.contains_key(&child) {
+						heal.push((child.clone(), false));
+					}
+					changed.entry(original_dir.clone()).or_default().0.insert(child);
 				}
 			}
 		}
-		drop(watched);
-		for (parent, (paths, refresh)) in changed {
-			debounce_changes(tab, tx.clone(), pending.clone(), &runtime, ChangeSet { parent, paths, refresh }, debounce, max_wait);
+		for (path, force) in heal {
+			let _ = context.commands.send(Command::Heal { path, force });
 		}
-	}
+		for (parent, (paths, refresh)) in changed {
+			debounce_changes(context.notifier.tab, context.notifier.tx.clone(), context.pending.clone(), &context.runtime, ChangeSet { parent, paths, refresh }, context.debounce, context.max_wait);
+		}
+	})
 }
 
 fn debounce_changes(tab: usize, tx: UnboundedSender<Event>, pending: PendingChanges, runtime: &Handle, change_set: ChangeSet, delay: Duration, max_wait: Duration) {
@@ -494,7 +753,7 @@ mod tests {
 		// `max_wait` (120ms) must force a flush well inside this timeout,
 		// even though the churner above never lets the idle debounce go
 		// quiet for the whole run.
-		let event = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await.expect("max_wait did not force a flush").unwrap();
+		let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.expect("max_wait did not force a flush").unwrap();
 		assert!(matches!(event, Event::FilesChanged { tab: 9, .. }));
 	}
 
@@ -507,18 +766,16 @@ mod tests {
 
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let watcher = Watcher::new_polling(7, tx, Duration::from_millis(25)).unwrap();
-		watcher.watch(&dir).unwrap();
+		watcher.sync_wait(HashSet::from([dir.clone()]));
 		fs::write(dir.join("new.txt"), b"hi").unwrap();
 
 		let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("channel closed");
-		match event {
-			Event::FilesChanged { tab, parent, changes } => {
-				assert_eq!(tab, 7);
-				assert_eq!(parent, dir);
-				assert!(matches!(changes.as_slice(), [FsChange::Upsert { path, .. }] if path == &dir.join("new.txt")));
-			}
+		match &event {
+			Event::FilesChanged { tab: 7, parent, .. } => assert_eq!(parent, &dir),
+			Event::Changed { tab: 7, path } => assert_eq!(path, &dir),
 			_ => panic!("unexpected event"),
 		}
+		assert!(reports_new_file(&event, &dir, &dir.join("new.txt")));
 
 		fs::remove_dir_all(&dir).unwrap();
 	}
@@ -538,18 +795,16 @@ mod tests {
 		// The tree only ever knows about `link` — it never sees `real`, the
 		// canonicalized form `watch` resolves internally to register the OS
 		// watch.
-		watcher.watch(&link).unwrap();
+		watcher.sync_wait(HashSet::from([link.clone()]));
 		fs::write(real.join("new.txt"), b"hi").unwrap();
 
 		let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("timed out").expect("channel closed");
-		match event {
-			Event::FilesChanged { tab, parent, changes } => {
-				assert_eq!(tab, 11);
-				assert_eq!(parent, link, "must be tagged with the tree's own path, not the symlink-resolved one");
-				assert!(matches!(changes.as_slice(), [FsChange::Upsert { path, .. }] if path == &link.join("new.txt")));
-			}
+		match &event {
+			Event::FilesChanged { tab: 11, parent, .. } => assert_eq!(parent, &link, "must be tagged with the tree's own path, not the symlink-resolved one"),
+			Event::Changed { tab: 11, path } => assert_eq!(path, &link, "must be tagged with the tree's own path, not the symlink-resolved one"),
 			_ => panic!("unexpected event"),
 		}
+		assert!(reports_new_file(&event, &link, &link.join("new.txt")));
 
 		fs::remove_dir_all(&base).unwrap();
 	}
@@ -571,10 +826,33 @@ mod tests {
 		fs::remove_dir_all(&root).unwrap();
 	}
 
-	fn probe_handler(tx: mpsc::UnboundedSender<Event>) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
-		let watched = Arc::new(Mutex::new(WatchIndex::default()));
-		let pending = Arc::new(Mutex::new(HashMap::new()));
-		event_handler(1, tx, watched, pending, Handle::current(), Duration::from_millis(20), Duration::from_millis(200))
+	fn probe_handler(tx: mpsc::UnboundedSender<Event>) -> Handler {
+		let (commands, _unread) = std::sync::mpsc::channel();
+		event_handler(HandlerContext {
+			notifier: Notifier { tab: 1, tx },
+			registry: Arc::default(),
+			pending: Arc::default(),
+			commands,
+			runtime: Handle::current(),
+			debounce: Duration::from_millis(20),
+			max_wait: Duration::from_millis(200),
+			gate: Arc::default(),
+		})
+	}
+
+	fn native_watcher(tx: mpsc::UnboundedSender<Event>) -> Watcher {
+		Watcher::new(1, tx, Duration::from_millis(20), Duration::from_millis(200), Duration::from_millis(50)).unwrap()
+	}
+
+	fn temp_dir(name: &str) -> PathBuf {
+		let root = std::env::temp_dir().join(format!("tuzi-{name}-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		root.canonicalize().unwrap()
+	}
+
+	fn set(paths: &[&Path]) -> HashSet<PathBuf> {
+		paths.iter().map(|path| path.to_path_buf()).collect()
 	}
 
 	async fn next_issue(rx: &mut mpsc::UnboundedReceiver<Event>, within: Duration) -> Option<WatchIssue> {
@@ -583,6 +861,40 @@ mod tests {
 			Ok(Some(_)) => panic!("unexpected event"),
 			_ => None,
 		}
+	}
+
+	/// Drains events for `window`, returning what arrived.
+	async fn events_for(rx: &mut mpsc::UnboundedReceiver<Event>, window: Duration) -> Vec<Event> {
+		let mut seen = Vec::new();
+		while let Ok(Some(event)) = tokio::time::timeout(window, rx.recv()).await {
+			seen.push(event);
+		}
+		seen
+	}
+
+	/// What a watcher must report for a file created in `dir`: that file's
+	/// upsert or, when the backend also saw the directory itself change, that
+	/// the whole directory changed. Polling does the latter once the
+	/// directory's mtime has moved on, and mtimes are coarse, so which one
+	/// arrives depends on timing. Either one gets the view right.
+	fn reports_new_file(event: &Event, dir: &Path, file: &Path) -> bool {
+		is_upsert_of(event, file) || matches!(event, Event::Changed { path, .. } if path == dir)
+	}
+
+	fn is_upsert_of(event: &Event, path: &Path) -> bool {
+		matches!(event, Event::FilesChanged { changes, .. } if changes.iter().any(|change| matches!(change, FsChange::Upsert { path: changed, .. } if changed == path)))
+	}
+
+	/// Waits, up to `within`, for `check` to hold.
+	async fn eventually(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+		let deadline = std::time::Instant::now() + within;
+		while std::time::Instant::now() < deadline {
+			if check() {
+				return true;
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		check()
 	}
 
 	fn rescan() -> notify::Result<notify::Event> {
@@ -632,63 +944,157 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_directory_that_was_deleted_and_recreated_is_watched_again() {
-		let root = std::env::temp_dir().join(format!("tuzi-watch-rearm-{}", std::process::id()));
-		let _ = fs::remove_dir_all(&root);
-		fs::create_dir_all(root.join("sub")).unwrap();
-		let root = root.canonicalize().unwrap();
-		let sub = root.join("sub");
-
+	async fn sync_registers_what_is_wanted_and_drops_what_is_not() {
+		let root = temp_dir("watch-sync");
+		fs::create_dir_all(root.join("a")).unwrap();
+		fs::create_dir_all(root.join("b")).unwrap();
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let watcher = Watcher::new(1, tx, Duration::from_millis(20), Duration::from_millis(200), Duration::from_millis(50)).unwrap();
-		watcher.watch(&sub).unwrap();
+		let watcher = native_watcher(tx);
+		let (a, b) = (root.join("a"), root.join("b"));
 
-		// The kernel drops the watch with the directory, and nothing tells us.
-		fs::remove_dir_all(&sub).unwrap();
-		fs::create_dir(&sub).unwrap();
-		while tokio::time::timeout(Duration::from_millis(400), rx.recv()).await.is_ok() {}
+		watcher.sync_wait(set(&[&a, &b]));
+		assert_eq!(watcher.registered(), set(&[&a, &b]));
+		watcher.sync_wait(set(&[&a]));
+		assert_eq!(watcher.registered(), set(&[&a]), "b is not wanted any more");
 
-		watcher.watch(&sub).unwrap();
-		fs::write(sub.join("after"), b"").unwrap();
-		let mut heard = false;
-		while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-			if matches!(&event, Event::FilesChanged { changes, .. } if changes.iter().any(|change| matches!(change, FsChange::Upsert { path, .. } if path == &sub.join("after")))) {
-				heard = true;
-				break;
-			}
-		}
-		assert!(heard, "the recreated directory must deliver events again");
+		fs::write(b.join("ignored"), b"").unwrap();
+		fs::write(a.join("heard"), b"").unwrap();
+		let seen = events_for(&mut rx, Duration::from_millis(600)).await;
+		assert!(seen.iter().any(|event| is_upsert_of(event, &a.join("heard"))));
+		assert!(!seen.iter().any(|event| is_upsert_of(event, &b.join("ignored"))), "a directory that was dropped must not report");
+
+		watcher.sync_wait(HashSet::new());
+		assert!(watcher.registered().is_empty());
 		drop(watcher);
 		fs::remove_dir_all(&root).unwrap();
 	}
 
 	#[tokio::test]
-	async fn arming_a_watch_again_does_not_raise_events_of_its_own() {
-		let root = std::env::temp_dir().join(format!("tuzi-watch-quiet-{}", std::process::id()));
-		let _ = fs::remove_dir_all(&root);
-		fs::create_dir_all(&root).unwrap();
-		let root = root.canonicalize().unwrap();
+	async fn declaring_the_same_set_again_changes_nothing() {
+		let root = temp_dir("watch-same");
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let watcher = Watcher::new(1, tx, Duration::from_millis(20), Duration::from_millis(200), Duration::from_millis(50)).unwrap();
+		let watcher = native_watcher(tx);
+		watcher.sync_wait(set(&[&root]));
+		let before = watcher.registered();
 		for _ in 0..5 {
-			watcher.watch(&root).unwrap();
+			watcher.sync_wait(set(&[&root]));
 		}
-		assert!(tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.is_err(), "re-arming alone must not look like a change");
+		assert_eq!(watcher.registered(), before);
+		assert!(events_for(&mut rx, Duration::from_millis(500)).await.is_empty(), "declaring the same set must not look like a change");
 		fs::write(root.join("real"), b"").unwrap();
-		assert!(matches!(tokio::time::timeout(Duration::from_secs(3), rx.recv()).await, Ok(Some(Event::FilesChanged { .. }))), "and the watch still works afterwards");
+		assert!(events_for(&mut rx, Duration::from_secs(3)).await.iter().any(|event| is_upsert_of(event, &root.join("real"))), "and the watch still works afterwards");
 		drop(watcher);
 		fs::remove_dir_all(&root).unwrap();
 	}
 
-	/// A backend whose every `watch` fails the way hitting the OS limit does.
-	struct RefusingWatcher;
+	/// The caller only ever declares the set. That a deleted and recreated
+	/// directory is watched again is the watcher's own doing.
+	#[tokio::test]
+	async fn a_directory_deleted_and_recreated_is_watched_again_without_being_asked() {
+		let root = temp_dir("watch-heal");
+		let sub = root.join("sub");
+		fs::create_dir_all(&sub).unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = native_watcher(tx);
+		watcher.sync_wait(set(&[&root, &sub]));
+
+		// On most filesystems the new directory gets the old one's inode number,
+		// which is what makes a dead watch look current. To make sure the
+		// watcher looks at the directory only once it is back, whatever its
+		// timing, it is kept from acting while this happens (the event handler
+		// needs the registry to act). Were it to look in between it would just
+		// drop the watch, and the parent's news that the directory returned
+		// would register it again: the other recovery path, which would hide a
+		// fault in this one.
+		{
+			let _held = watcher.registry.lock().unwrap();
+			fs::remove_dir_all(&sub).unwrap();
+			fs::create_dir(&sub).unwrap();
+		}
+		assert!(eventually(Duration::from_secs(3), || watcher.registered().contains(&sub)).await);
+		events_for(&mut rx, Duration::from_millis(800)).await;
+
+		fs::write(sub.join("after"), b"").unwrap();
+		assert!(events_for(&mut rx, Duration::from_secs(3)).await.iter().any(|event| is_upsert_of(event, &sub.join("after"))), "the recreated directory must deliver events again");
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_watch_that_was_lost_is_reported_back_so_what_was_missed_is_read() {
+		let root = temp_dir("watch-lost");
+		let sub = root.join("sub");
+		fs::create_dir_all(&sub).unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = native_watcher(tx);
+		watcher.sync_wait(set(&[&root, &sub]));
+		events_for(&mut rx, Duration::from_millis(300)).await;
+
+		fs::rename(&sub, root.join("sub.old")).unwrap();
+		fs::create_dir(&sub).unwrap();
+		fs::write(sub.join("made_before_the_watch_was_back"), b"").unwrap();
+		let seen = events_for(&mut rx, Duration::from_secs(2)).await;
+		assert!(seen.iter().any(|event| matches!(event, Event::Changed { path, .. } if path == &sub)), "the directory must be reported as changed so its listing is read again");
+		assert!(watcher.registered().contains(&sub));
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_directory_that_comes_back_later_is_found_through_its_parent() {
+		let root = temp_dir("watch-later");
+		let sub = root.join("sub");
+		fs::create_dir_all(&sub).unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = native_watcher(tx);
+		watcher.sync_wait(set(&[&root, &sub]));
+
+		fs::remove_dir_all(&sub).unwrap();
+		assert!(eventually(Duration::from_secs(3), || !watcher.registered().contains(&sub)).await, "while it is gone there is nothing to watch");
+		events_for(&mut rx, Duration::from_millis(400)).await;
+
+		// Much later: nobody asks again, and the deleted directory's own watch is long dead.
+		fs::create_dir(&sub).unwrap();
+		assert!(eventually(Duration::from_secs(3), || watcher.registered().contains(&sub)).await, "the parent reports the new directory, which is wanted, so it is watched");
+		fs::write(sub.join("later"), b"").unwrap();
+		assert!(events_for(&mut rx, Duration::from_secs(3)).await.iter().any(|event| is_upsert_of(event, &sub.join("later"))));
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// Deleting or renaming a directory we watch is news for its parent too: the
+	/// parent's listing has to lose the entry. The path used to be attributed to
+	/// the watched directory alone, so the parent never heard.
+	#[tokio::test]
+	async fn a_watched_directory_that_is_deleted_or_renamed_is_reported_to_its_parent() {
+		let root = temp_dir("watch-parent");
+		let (gone, moved) = (root.join("gone"), root.join("moved"));
+		fs::create_dir_all(&gone).unwrap();
+		fs::create_dir_all(&moved).unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = native_watcher(tx);
+		watcher.sync_wait(set(&[&root, &gone, &moved]));
+
+		fs::remove_dir_all(&gone).unwrap();
+		fs::rename(&moved, root.join("renamed")).unwrap();
+		let seen = events_for(&mut rx, Duration::from_millis(900)).await;
+		let told_root = |wanted: &dyn Fn(&FsChange) -> bool| seen.iter().any(|event| matches!(event, Event::FilesChanged { parent, changes, .. } if parent == &root && changes.iter().any(wanted)));
+		assert!(told_root(&|change| matches!(change, FsChange::Delete { path } if path == &gone)), "the parent must hear that `gone` is gone");
+		assert!(told_root(&|change| matches!(change, FsChange::Delete { path } if path == &moved)), "and that `moved` is no longer there");
+		assert!(told_root(&|change| matches!(change, FsChange::Upsert { path, .. } if path == &root.join("renamed"))), "and that `renamed` is");
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// A backend whose every `watch` fails with the given error.
+	struct RefusingWatcher(fn() -> notify::Error);
 
 	impl NotifyWatcher for RefusingWatcher {
 		fn new<F: notify::EventHandler>(_: F, _: Config) -> notify::Result<Self> {
-			Ok(Self)
+			Ok(Self(|| notify::Error::generic("unused")))
 		}
 		fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
-			Err(notify::Error::new(notify::ErrorKind::MaxFilesWatch))
+			Err((self.0)())
 		}
 		fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
 			Ok(())
@@ -698,23 +1104,40 @@ mod tests {
 		}
 	}
 
-	#[tokio::test]
-	async fn a_failure_of_watching_itself_is_reported() {
-		let root = std::env::temp_dir().join(format!("tuzi-watch-limit-{}", std::process::id()));
-		let _ = fs::remove_dir_all(&root);
-		fs::create_dir_all(&root).unwrap();
-		let root = root.canonicalize().unwrap();
-		let (tx, mut rx) = mpsc::unbounded_channel();
-		let watcher = Watcher::with_inner(Box::new(RefusingWatcher), Arc::default(), Arc::default(), issue_reporter(1, tx));
+	fn refusing(error: fn() -> notify::Error) -> BackendCtor {
+		Box::new(move |_| Ok(Box::new(RefusingWatcher(error)) as Backend))
+	}
 
-		watcher.watch_async(root.clone());
+	fn failing_to_start() -> BackendCtor {
+		Box::new(|_| Err(notify::Error::new(notify::ErrorKind::Io(io::Error::from_raw_os_error(libc::EMFILE)))))
+	}
+
+	fn polling(interval_ms: u64) -> BackendCtor {
+		Box::new(move |handler| Ok(Box::new(notify::PollWatcher::new(handler, Config::default().with_poll_interval(Duration::from_millis(interval_ms)))?) as Backend))
+	}
+
+	fn watcher_with(tx: mpsc::UnboundedSender<Event>, native: BackendCtor, polling: BackendCtor) -> Watcher {
+		Watcher::with_backends(1, tx, Handle::current(), Duration::from_millis(20), Duration::from_millis(200), native, polling)
+	}
+
+	#[tokio::test]
+	async fn a_failure_of_watching_itself_is_reported_once() {
+		let root = temp_dir("watch-refused");
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = watcher_with(tx, refusing(|| notify::Error::generic("the backend rejected this watch")), polling(50));
+
+		watcher.sync_wait(set(&[&root]));
 		match next_issue(&mut rx, Duration::from_secs(2)).await {
 			Some(WatchIssue::RegisterFailed { path, error }) => {
 				assert_eq!(path, root);
-				assert!(error.to_lowercase().contains("limit"), "the reason must survive: {error}");
+				assert!(error.contains("rejected"), "the reason must survive: {error}");
 			}
 			other => panic!("expected RegisterFailed, got {other:?}"),
 		}
+		// Declaring it again does not make the same complaint again.
+		watcher.sync_wait(set(&[&root]));
+		watcher.sync_wait(set(&[&root]));
+		assert_eq!(next_issue(&mut rx, Duration::from_millis(400)).await, None);
 		drop(watcher);
 		fs::remove_dir_all(&root).unwrap();
 	}
@@ -723,14 +1146,11 @@ mod tests {
 	async fn a_directorys_own_access_problems_are_left_to_its_listing() {
 		use std::os::unix::fs::PermissionsExt;
 
-		let root = std::env::temp_dir().join(format!("tuzi-watch-own-{}", std::process::id()));
-		let _ = fs::remove_dir_all(&root);
-		fs::create_dir_all(&root).unwrap();
-		let root = root.canonicalize().unwrap();
+		let root = temp_dir("watch-own");
 		let (tx, mut rx) = mpsc::unbounded_channel();
-		let watcher = Watcher::new(1, tx, Duration::from_millis(20), Duration::from_millis(200), Duration::from_millis(50)).unwrap();
+		let watcher = native_watcher(tx);
 
-		watcher.watch_async(root.join("does-not-exist"));
+		watcher.sync_wait(set(&[&root.join("does-not-exist")]));
 		assert_eq!(next_issue(&mut rx, Duration::from_millis(500)).await, None, "a directory that is gone is not a watching failure");
 
 		let locked = root.join("locked");
@@ -739,10 +1159,54 @@ mod tests {
 		if fs::read_dir(&locked).is_err() {
 			// Not root, so the permission really applies: the listing shows the
 			// error on the node, and a second message here would be noise.
-			watcher.watch_async(locked.clone());
+			watcher.sync_wait(set(&[&locked]));
 			assert_eq!(next_issue(&mut rx, Duration::from_millis(500)).await, None, "unreadable is not a watching failure either");
 		}
 		fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn running_out_of_watches_falls_back_to_polling_and_keeps_working() {
+		let root = temp_dir("watch-fallback");
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = watcher_with(tx, refusing(|| notify::Error::new(notify::ErrorKind::MaxFilesWatch)), polling(25));
+
+		watcher.sync_wait(set(&[&root]));
+		match next_issue(&mut rx, Duration::from_secs(2)).await {
+			Some(WatchIssue::FellBackToPolling(reason)) => assert!(reason.to_lowercase().contains("limit"), "{reason}"),
+			other => panic!("expected FellBackToPolling, got {other:?}"),
+		}
+		assert!(watcher.registered().contains(&root), "what was wanted is watched on the new backend");
+
+		fs::write(root.join("seen_by_polling"), b"").unwrap();
+		assert!(events_for(&mut rx, Duration::from_secs(5)).await.iter().any(|event| reports_new_file(event, &root, &root.join("seen_by_polling"))));
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_native_backend_that_cannot_start_falls_back_to_polling() {
+		let root = temp_dir("watch-nostart");
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = watcher_with(tx, failing_to_start(), polling(25));
+		assert!(matches!(next_issue(&mut rx, Duration::from_secs(1)).await, Some(WatchIssue::FellBackToPolling(_))), "the user is told at once");
+
+		watcher.sync_wait(set(&[&root]));
+		fs::write(root.join("still_works"), b"").unwrap();
+		assert!(events_for(&mut rx, Duration::from_secs(5)).await.iter().any(|event| reports_new_file(event, &root, &root.join("still_works"))));
+		drop(watcher);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn with_no_working_backend_watching_is_off_but_nothing_fails() {
+		let root = temp_dir("watch-none");
+		let (tx, mut rx) = mpsc::unbounded_channel();
+		let watcher = watcher_with(tx, failing_to_start(), failing_to_start());
+		assert!(matches!(next_issue(&mut rx, Duration::from_secs(1)).await, Some(WatchIssue::BackendError(text)) if text.contains("unavailable")));
+		watcher.sync_wait(set(&[&root])); // must not panic or hang
 		drop(watcher);
 		fs::remove_dir_all(&root).unwrap();
 	}

@@ -67,7 +67,7 @@ impl App {
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
 			Command::Refresh => {
-				let count = self.active_tab_mut().refresh_all(true);
+				let count = self.active_tab_mut().refresh_all();
 				let noun = if count == 1 { "directory" } else { "directories" };
 				self.push_notice(crate::notice::NoticeLevel::Info, format!("Refreshing {count} {noun}"));
 			}
@@ -105,15 +105,17 @@ impl Dispatcher {
 				let (level, message, refresh) = match issue {
 					WatchIssue::EventsDropped => (NoticeLevel::Info, "File events were dropped; refreshing the open directories".to_owned(), true),
 					WatchIssue::BackendError(error) => (NoticeLevel::Warn, format!("File watching error: {error}"), true),
+					WatchIssue::FellBackToPolling(reason) => (NoticeLevel::Warn, format!("File watching fell back to polling ({reason}); changes may take a moment to show"), true),
 					// Nothing was lost, one directory just will not update by
 					// itself; refreshing would only try to watch it again.
 					WatchIssue::RegisterFailed { path, error } => (NoticeLevel::Warn, format!("Cannot watch {}: {error}", path.display()), false),
 				};
-				// Events may have been lost, so trust nothing on screen. Watches
-				// are not re-registered: if watching is what fails, that would
-				// only raise the same issue again.
+				// Events may have been lost, so trust nothing on screen. This also has
+				// the watcher re-check every watch; that is safe to repeat, since a
+				// watch that is fine is left alone and one that fails is reported
+				// once, not again each time it is asked for.
 				if refresh && let Some(t) = app.tab_mut(tab) {
-					t.refresh_all(false);
+					t.refresh_all();
 				}
 				// A persistent fault repeats; show each message once at a time.
 				if !app.notices.iter().any(|notice| notice.message == message) {

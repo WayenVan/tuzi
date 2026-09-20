@@ -142,6 +142,15 @@ impl Tree {
 		self.root.find_parent(path).map(|node| node.path.clone())
 	}
 
+	/// The directories that should be watched: every one that is open on
+	/// screen. This is a pure function of the tree, so whatever watches the
+	/// filesystem can be made to match it at any time.
+	pub fn watch_set(&self) -> std::collections::HashSet<PathBuf> {
+		let mut set = std::collections::HashSet::new();
+		self.root.collect_watched(&mut set);
+		set
+	}
+
 	/// The root and every expanded directory below it whose listing is loaded:
 	/// what is on screen, and so what is worth reading again.
 	pub fn open_dirs(&self) -> Vec<PathBuf> {

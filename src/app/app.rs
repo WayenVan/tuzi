@@ -2549,6 +2549,21 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn falling_back_to_polling_is_reported_and_the_open_directories_are_read_again() {
+		let root = std::env::temp_dir().join(format!("tuzi-app-test-issue-polling-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		while loaded_within(&mut rx, 300).await {}
+
+		Dispatcher::dispatch_event(&mut app, Event::WatchIssue { tab: 0, issue: crate::watcher::WatchIssue::FellBackToPolling("too many open files".into()) });
+		let notice = app.notices.last().unwrap();
+		assert!(notice.message.contains("polling") && notice.message.contains("too many open files") && notice.level == NoticeLevel::Warn, "{}", notice.message);
+		assert!(loaded_within(&mut rx, 1000).await, "events may have been lost while switching, so the directories are read again");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn a_watch_that_could_not_be_registered_is_reported_without_refreshing() {
 		let root = std::env::temp_dir().join(format!("tuzi-app-test-issue-register-{}", std::process::id()));
 		let _ = fs::remove_dir_all(&root);
