@@ -4,37 +4,32 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.3] - 2026-09-21
 
 ### Added
 
-- `emit --parent KIND [JSON]` sends a custom event directly to the controlling parent instead of broadcasting it. It needs no controller ability and never falls back to a broadcast when the parent is missing or offline.
-
-- A global session home. `g=` goes to it in every tab, `--home DIR` sets it at startup, and it is an optional top-level `home` in session snapshots (`get-state`, `restore-state`, `tuzi-exit`, startup state). Priority at startup is `--home`, then the snapshot's `home`, then `PATH`.
-- A `set-home` controller operation that changes the session home of a running Tuzi without moving any tab.
-- `R` (`:refresh`) reads every open directory of the active tab again, keeping the cursor, selection and expansion, and has the watcher re-check every watch. It is the way out when something on screen is stale.
-
-- Info notices now disappear after 2 seconds by default instead of 3 (`notify.info_timeout`). Warnings (5 s) and errors (8 s) are unchanged, and a value you set yourself is respected.
-
-### Changed (file watching)
-
-- Watching is now driven by the tree, not by a `watch`/`unwatch` call at every place a directory is opened or closed. Tuzi declares which directories are open and the watcher makes it so, so the two cannot drift apart: a directory is watched exactly while it is expanded, and one that becomes watched again is read again.
-- A watcher that cannot use the native backend (typically the per-user limit on inotify instances or watches) now falls back to polling every `watcher.poll_interval_ms` and says so, where it used to make the tab fail to open. A root directory that cannot be watched no longer stops a tab from opening.
-
-### Fixed
-
-- A directory that was deleted and recreated (`rm -rf build && mkdir build`, switching git branches, `mv dir dir.old && mkdir dir`) was never watched again, so its contents stopped updating for good. The watcher now notices a lost watch itself, including when the directory comes back later, registers it again and has the directory read again. Filesystems reuse a freed inode number at once (ext4 did every time it was tried), so it does not trust inode numbers to tell the two directories apart.
-- Deleting or renaming a directory that was expanded left it in its parent's listing, shown as an error, for good: the event was attributed to the directory alone and its parent never heard. The parent now hears too.
-- Expanding a directory you had collapsed showed its cached listing even if it had changed meanwhile, because collapsing stops watching it. Expanding now reads it again; the old listing stays on screen until the new one arrives.
-- When the OS dropped file events (for inotify, its queue overflowed) or the watcher backend failed, Tuzi ignored it and every open directory could stay stale. It now reads the open directories again and says so; repeated reports are folded together and a persistent fault is shown once at a time.
-- A watch that cannot be registered for a reason about watching itself, such as the OS limit on watches, is now reported instead of leaving that directory silently stale. A directory that is gone or unreadable is still left to its own listing.
+- `R` (`:refresh`) reads every open directory of the active tab again, keeping the cursor, selection and expansion. It is the way out when something on screen is stale.
+- A session home shared by every tab: `g=` goes to it, `--home DIR` sets it at startup, and it is an optional top-level `home` in session snapshots (`get-state`, `restore-state`, `tuzi-exit`, startup state). At startup `--home` wins over the snapshot's `home`, which wins over `PATH`.
+- A `set-home` controller operation that changes a running Tuzi's home without moving any tab. The controller protocol stays at version 2.
+- `emit --parent KIND [JSON]` sends a custom event straight to the controlling parent instead of broadcasting it. It needs no controller ability and never falls back to a broadcast.
+- `tabs.index_active` and `tabs.index_inactive` theme styles for the number in front of a tab name.
 
 ### Changed
 
-- The tab bar no longer squeezes every tab into an equal share of the width. Tabs that fit keep their full names; when space is short, only the long names are truncated; and when even that leaves fewer than 8 columns per tab, the bar scrolls around the active tab and shows `‹` / `›` on the side that hides more. It is stateless, so no scroll position is stored, and clicking a tab uses the same layout as drawing it.
-- The number in front of a tab name is drawn quieter than the name. It uses the new `tabs.index_active` and `tabs.index_inactive` styles, which are patched onto the tab's own style so the number always keeps the tab's background and boldness. Existing `theme.toml` files need no change.
-- `gh` goes to the parent directory again; the session home moved to `g=`.
-- `emit` now rejects a kind that starts with `-`, so a mistyped flag cannot become an event kind.
+- The tab bar no longer gives every tab an equal share of the width. Tabs that fit keep their full names; when space is short only the long names are truncated; and when fewer than 8 columns per tab would remain, the bar scrolls around the active tab and marks the hidden side with `‹` / `›`. A click always lands on the tab that was drawn there.
+- The number in front of a tab name is drawn quieter than the name. Existing `theme.toml` files need no change.
+- Info notices disappear after 2 seconds by default instead of 3 (`notify.info_timeout`).
+- File watching is driven by the tree: Tuzi declares which directories are open and the watcher keeps its watches matching, so a directory is watched exactly while it is expanded.
+- If the native watcher cannot be used (typically the per-user limit on inotify instances or watches), Tuzi falls back to polling every `watcher.poll_interval_ms` and says so, instead of failing to open the tab. A root directory that cannot be watched no longer stops a tab from opening.
+- `emit` rejects a kind that starts with `-`, so a mistyped flag cannot become an event kind.
+
+### Fixed
+
+- A directory that was deleted and recreated (`rm -rf build && mkdir build`, a git branch switch, `mv dir dir.old && mkdir dir`) stopped updating for good. The watcher now notices the lost watch itself, also when the directory comes back later, and reads the directory again.
+- Deleting or renaming an expanded directory left it in its parent's listing, shown as an error, for good. The parent now hears about it.
+- Expanding a collapsed directory showed its stale cached listing. It is now read again, with the old rows on screen until the new ones arrive.
+- When the OS dropped file events or the watcher backend failed, open directories could stay stale unnoticed. Tuzi now reads them again and says so.
+- A watch that cannot be registered because of a limit on watching itself is reported instead of silently leaving that directory stale.
 
 ## [0.4.2] - 2026-09-19
 
@@ -129,6 +124,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.4.3]: https://github.com/WayenVan/tuzi/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/WayenVan/tuzi/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/WayenVan/tuzi/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/WayenVan/tuzi/compare/v0.3.0...v0.4.0
