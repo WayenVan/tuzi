@@ -74,10 +74,11 @@ impl App {
 			Command::ToggleFilenamePeek => self.filename_peek = !self.filename_peek,
 			Command::UpdateTab { path, selection } => self.update_tab(path, selection),
 			Command::Reveal(path) => self.reveal_path(path),
+			Command::SetHome(path) => self.set_home(path),
 			Command::RestoreState(state) => self.restore_state(state),
 			Command::GetState { query_id } => self.reply_state(query_id),
 			Command::GetTabs { query_id } => self.reply_tabs(query_id),
-			Command::Emit { kind, data } => self.emit(Body::Custom { kind, data }),
+			Command::Emit { kind, data, parent } => self.emit(Body::Custom { kind, data }, parent),
 		}
 		self.drain_tab_notices();
 	}

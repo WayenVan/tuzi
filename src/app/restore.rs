@@ -39,15 +39,23 @@ pub(super) enum SessionRestoreStep {
 pub(super) struct StagedSession {
 	tabs: Vec<StagedTab>,
 	active_tab: usize,
+	home: Option<PathBuf>,
 }
 
 impl StagedSession {
 	pub fn open(first_id: usize, state: SessionState, tx: UnboundedSender<Event>, config: Arc<Config>) -> Result<Self, String> {
-		let active_tab = state.active_tab;
+		let (active_tab, home) = (state.active_tab, state.home);
 		let tabs = state.tabs.into_iter().enumerate()
 			.map(|(offset, tab)| StagedTab::open(first_id + offset, tab, tx.clone(), config.clone()))
 			.collect::<Result<_, _>>()?;
-		Ok(Self { tabs, active_tab })
+		Ok(Self { tabs, active_tab, home })
+	}
+
+	/// The snapshot's session home, if it carried one. Applied by the caller
+	/// in the same step that commits the tabs so a failed restore changes
+	/// nothing.
+	pub fn take_home(&mut self) -> Option<PathBuf> {
+		self.home.take()
 	}
 
 	pub fn contains(&self, id: usize) -> bool {
@@ -171,7 +179,7 @@ mod tests {
 	}
 
 	async fn restore(state: TabState) -> Result<StagedTab, String> {
-		let normalized = validate_and_normalize(SessionState { version: SESSION_STATE_VERSION, active_tab: 0, tabs: vec![state] }).unwrap();
+		let normalized = validate_and_normalize(SessionState { version: SESSION_STATE_VERSION, active_tab: 0, home: None, tabs: vec![state] }).unwrap();
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let mut staged = StagedTab::open(42, normalized.tabs.into_iter().next().unwrap(), tx, Arc::new(Config::default()))?;
 		loop {
@@ -226,7 +234,7 @@ mod tests {
 		fs::create_dir(root.join("gone")).unwrap();
 		let normalized = validate_and_normalize(SessionState {
 			version: SESSION_STATE_VERSION,
-			active_tab: 0,
+			active_tab: 0, home: None,
 			tabs: vec![TabState {
 				cwd: root.clone(), cursor: None, selection: Vec::new(), expanded: vec![root.join("gone")],
 			}],

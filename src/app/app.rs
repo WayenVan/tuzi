@@ -97,6 +97,12 @@ struct IncomingReveal {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct IncomingSetHome {
+	path: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IncomingSwitchTab {
 	tab_id: usize,
 }
@@ -123,15 +129,25 @@ impl Default for MouseState {
 }
 
 impl App {
-	pub async fn serve(path: PathBuf, home: PathBuf, config: Config, keymap: Keymap, theme: Theme, state: Option<crate::session_state::SessionState>, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
-		let home = crate::fs::absolute_lexical(&home)?;
+	/// Picks the session home: an explicit `--home` wins over the startup
+	/// snapshot's `home`, which wins over the start PATH. The snapshot's home
+	/// is always removed so the restore that follows cannot override an
+	/// explicit choice.
+	fn resolve_startup_home(explicit: Option<PathBuf>, state: &mut Option<crate::session_state::SessionState>, path: &std::path::Path) -> io::Result<PathBuf> {
+		let snapshot = state.as_mut().and_then(|state| state.home.take());
+		let home = crate::fs::absolute_lexical(&explicit.or(snapshot).unwrap_or_else(|| path.to_path_buf()))?;
 		if !std::fs::metadata(&home)?.is_dir() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "home is not a directory"));
 		}
+		Ok(home)
+	}
+
+	pub async fn serve(path: PathBuf, home: Option<PathBuf>, config: Config, keymap: Keymap, theme: Theme, state: Option<crate::session_state::SessionState>, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let config = Arc::new(config);
-		let state = state.map(crate::session_state::validate_and_normalize).transpose()
+		let mut state = state.map(crate::session_state::validate_and_normalize).transpose()
 			.map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid startup session state: {error}")))?;
+		let home = Self::resolve_startup_home(home, &mut state, &path)?;
 		let pubsub = Self::new_registry();
 		if dds_launch.is_some() && !config.dds.enabled {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "controlled launch requires DDS, but dds.enabled is false"));
@@ -264,7 +280,7 @@ impl App {
 
 	fn validate_dds_message(parent: Option<dds::PeerId>, self_id: dds::PeerId, supported: &HashSet<String>, payload: &dds::Payload) -> Result<(), String> {
 		let Some(parent) = parent else { return Ok(()) };
-		let is_control = payload.receiver == self_id || matches!(payload.body.kind(), "update-tab" | "switch-tab" | "restore-state" | "reveal" | "get-state" | "get-tabs");
+		let is_control = payload.receiver == self_id || matches!(payload.body.kind(), "update-tab" | "switch-tab" | "restore-state" | "reveal" | "set-home" | "get-state" | "get-tabs");
 		if !is_control { return Ok(()) }
 		if payload.sender != parent {
 			return Err(format!("rejected DDS control message from unauthorized peer {}", payload.sender));
@@ -273,7 +289,7 @@ impl App {
 		if !supported.contains(kind) && !supported.contains(dds::WILDCARD_ABILITY) {
 			return Err(format!("rejected unsupported DDS control operation '{kind}'"));
 		}
-		if matches!(kind, "update-tab" | "switch-tab" | "restore-state" | "reveal" | "get-state" | "get-tabs") && payload.receiver != self_id {
+		if matches!(kind, "update-tab" | "switch-tab" | "restore-state" | "reveal" | "set-home" | "get-state" | "get-tabs") && payload.receiver != self_id {
 			return Err(format!("rejected broadcast DDS {kind} request"));
 		}
 		if kind == "update-tab" {
@@ -296,6 +312,15 @@ impl App {
 				.map_err(|error| format!("rejected invalid DDS reveal content: {error}"))?;
 			if !reveal.path.is_absolute() {
 				return Err("rejected invalid DDS reveal content: path must be absolute".into());
+			}
+		} else if kind == "set-home" {
+			let Body::Custom { data, .. } = &payload.body else {
+				return Err("rejected malformed DDS set-home message".into());
+			};
+			let set_home = serde_json::from_value::<IncomingSetHome>(data.clone())
+				.map_err(|error| format!("rejected invalid DDS set-home content: {error}"))?;
+			if !set_home.path.is_absolute() {
+				return Err("rejected invalid DDS set-home content: path must be absolute".into());
 			}
 		} else if kind == "restore-state" {
 			let Body::Custom { data, .. } = &payload.body else {
@@ -366,6 +391,15 @@ impl App {
 				let Body::Custom { data, .. } = body else { return Vec::new() };
 				let Ok(reveal) = serde_json::from_value::<IncomingReveal>(data.clone()) else { return Vec::new() };
 				vec![crate::command::Command::Reveal(reveal.path)]
+			}),
+		);
+		registry.sub(
+			"core",
+			"set-home",
+			Box::new(|body| {
+				let Body::Custom { data, .. } = body else { return Vec::new() };
+				let Ok(set_home) = serde_json::from_value::<IncomingSetHome>(data.clone()) else { return Vec::new() };
+				vec![crate::command::Command::SetHome(set_home.path)]
 			}),
 		);
 		registry.sub(
@@ -687,7 +721,13 @@ impl App {
 		match step {
 			SessionRestoreStep::Pending => {}
 			SessionRestoreStep::Complete => {
-				let (tabs, active) = self.staged_session.take().unwrap().into_tabs();
+				let mut staged = self.staged_session.take().unwrap();
+				// Home and tabs are one atomic commit: nothing above this
+				// point has touched App state, so a failed restore keeps both.
+				if let Some(home) = staged.take_home() {
+					self.home = home;
+				}
+				let (tabs, active) = staged.into_tabs();
 				self.tabs = tabs;
 				self.active = active;
 			}
@@ -810,10 +850,27 @@ impl App {
 
 	/// An `emit` command is an explicit request to publish, so it bypasses
 	/// the implicit-event allowlist while still respecting `dds.enabled`.
-	pub(super) fn emit(&self, body: Body) {
+	/// Local subscribers always see it. Externally it is either a public
+	/// broadcast or, with `parent`, a direct message to the controlling
+	/// parent that never falls back to broadcasting.
+	pub(super) fn emit(&mut self, body: Body, parent: bool) {
 		let _ = self.tx.send(Event::DdsDeliver(body.clone()));
+		if !parent {
+			if let Some(client) = &self.dds_client {
+				client.publish(body);
+			}
+			return;
+		}
+		let Some(controller) = &self.controller else {
+			self.active_tab_mut().raise(NoticeLevel::Error, "emit --parent requires a controlling parent");
+			return;
+		};
+		if !controller.online {
+			self.active_tab_mut().raise(NoticeLevel::Error, "controller unavailable");
+			return;
+		}
 		if let Some(client) = &self.dds_client {
-			client.publish(body);
+			client.publish_to(controller.launch.parent, body);
 		}
 	}
 
@@ -829,6 +886,24 @@ impl App {
 			return;
 		}
 		self.active_tab_mut().set_selection(selection);
+	}
+
+	/// Changes the session home used by `g=` in every tab. An invalid target
+	/// leaves the current home untouched and reports why.
+	pub(super) fn set_home(&mut self, path: PathBuf) {
+		let checked = crate::fs::absolute_lexical(&path).and_then(|home| match std::fs::metadata(&home) {
+			Ok(metadata) if metadata.is_dir() => Ok(home),
+			Ok(_) => Err(io::Error::other("not a directory")),
+			Err(error) => Err(error),
+		});
+		match checked {
+			Ok(home) => self.home = home,
+			Err(error) => self.notices.push(Notice::new(
+				NoticeLevel::Warn,
+				format!("Cannot set home to {}: {error}", path.display()),
+				std::time::Duration::from_secs(8),
+			)),
+		}
 	}
 
 	pub(super) fn reveal_path(&mut self, path: PathBuf) {
@@ -853,6 +928,9 @@ impl App {
 		let state = crate::session_state::SessionState {
 			version: crate::session_state::SESSION_STATE_VERSION,
 			active_tab,
+			// A home that has since vanished is left out rather than making
+			// the whole snapshot (and `tuzi-exit`) fail.
+			home: self.home.is_dir().then(|| self.home.clone()),
 			tabs: self.tabs.iter().map(Tab::snapshot_state).collect(),
 		};
 		crate::session_state::validate_and_normalize(state)
@@ -1104,7 +1182,7 @@ mod tests {
 	}
 
 	fn session(active_tab: usize, tabs: Vec<TabState>) -> SessionState {
-		SessionState { version: SESSION_STATE_VERSION, active_tab, tabs }
+		SessionState { version: SESSION_STATE_VERSION, active_tab, home: None, tabs }
 	}
 
 	#[tokio::test]
@@ -2019,6 +2097,68 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn emit_parent_is_sent_only_to_the_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-emit-parent");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let socket_path = root.join("dds.sock");
+
+		let (parent, mut parent_inbox) = dds::Client::connect(&socket_path, Vec::new()).await.unwrap();
+		let (_observer, mut observer_inbox) = dds::Client::connect(&socket_path, vec![dds::WILDCARD_ABILITY.into()]).await.unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(parent.id(), "emit-test".into()).unwrap(), online: true, abilities: HashSet::new() });
+
+		app.execute(r#"emit --parent tuzi-hide '{"a":1}'"#.parse().unwrap());
+		let received = loop {
+			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), parent_inbox.recv()).await.unwrap().unwrap();
+			if matches!(payload.body, Body::Custom { .. }) {
+				break payload;
+			}
+		};
+		assert_eq!(received.receiver, parent.id());
+		assert_eq!(received.body, Body::Custom { kind: "tuzi-hide".into(), data: serde_json::json!({"a": 1}) });
+		loop {
+			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
+				Err(_) | Ok(None) => break,
+				Ok(Some(payload)) if matches!(payload.body, Body::Sync { .. }) => continue,
+				Ok(Some(payload)) => panic!("observer unexpectedly received parent emit: {:?}", payload.body),
+			}
+		}
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn emit_parent_never_falls_back_to_broadcast_without_a_parent() {
+		let root = std::env::temp_dir().join("tuzi-app-test-emit-parent-unavailable");
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let socket_path = root.join("dds.sock");
+
+		let (_observer, mut observer_inbox) = dds::Client::connect(&socket_path, vec![dds::WILDCARD_ABILITY.into()]).await.unwrap();
+		let (mut app, _rx) = app(&root).await;
+		app.dds_client = Some(App::connect_dds_at(app.tx.clone(), &socket_path, app.pubsub.abilities(), None).await.unwrap());
+
+		app.execute("emit --parent tuzi-hide".parse().unwrap());
+		assert_eq!(app.notices.last().map(|notice| notice.message.as_str()), Some("emit --parent requires a controlling parent"));
+
+		app.controller = Some(ControllerLink { launch: dds::DdsLaunch::new(99, "offline".into()).unwrap(), online: false, abilities: HashSet::new() });
+		app.execute("emit --parent tuzi-hide".parse().unwrap());
+		assert_eq!(app.notices.last().map(|notice| notice.message.as_str()), Some("controller unavailable"));
+
+		loop {
+			match tokio::time::timeout(std::time::Duration::from_millis(200), observer_inbox.recv()).await {
+				Err(_) | Ok(None) => break,
+				Ok(Some(payload)) if matches!(payload.body, Body::Sync { .. }) => continue,
+				Ok(Some(payload)) => panic!("observer unexpectedly received {:?}", payload.body),
+			}
+		}
+
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
 	async fn strict_parent_open_never_falls_back_when_controller_is_unavailable() {
 		let root = std::env::temp_dir().join("tuzi-app-test-parent-open-unavailable");
 		let _ = fs::remove_dir_all(&root);
@@ -2226,9 +2366,153 @@ mod tests {
 		for path in [old, replacement] { fs::remove_dir_all(path).unwrap(); }
 	}
 
+	fn tmp_dirs(names: &[&str]) -> Vec<PathBuf> {
+		names.iter().map(|name| {
+			let path = std::env::temp_dir().join(format!("tuzi-home-{name}-{}", std::process::id()));
+			let _ = fs::remove_dir_all(&path);
+			fs::create_dir_all(&path).unwrap();
+			path.canonicalize().unwrap()
+		}).collect()
+	}
+
+	fn tab_at(cwd: &Path) -> TabState {
+		TabState { cwd: cwd.to_path_buf(), cursor: None, selection: Vec::new(), expanded: Vec::new() }
+	}
+
+	#[tokio::test]
+	async fn restore_state_home_replaces_the_shared_session_home() {
+		let dirs = tmp_dirs(&["restore-old", "restore-new", "restore-home"]);
+		let (old, new, home) = (&dirs[0], &dirs[1], &dirs[2]);
+		let (mut app, mut rx) = app(old).await;
+		assert_eq!(app.home, *old);
+
+		let mut state = session(0, vec![tab_at(new)]);
+		state.home = Some(home.clone());
+		app.begin_restore(state).unwrap();
+		assert_eq!(app.home, *old, "home does not change while the session is only staged");
+		pump_restore(&mut app, &mut rx).await;
+		assert_eq!(app.home, *home);
+		assert_eq!(app.active_tab().tree.root.path, *new, "tabs restore independently of home");
+
+		app.begin_restore(session(0, vec![tab_at(old)])).unwrap();
+		pump_restore(&mut app, &mut rx).await;
+		assert_eq!(app.home, *home, "a snapshot without home keeps the current one");
+		for path in dirs { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[tokio::test]
+	async fn failed_restore_keeps_the_old_home_and_tabs() {
+		let dirs = tmp_dirs(&["failed-old", "failed-new", "failed-home"]);
+		let (old, new, home) = (&dirs[0], &dirs[1], &dirs[2]);
+		let (mut app, mut rx) = app(old).await;
+
+		// A home that is not a directory is refused before anything is staged.
+		let mut invalid = session(0, vec![tab_at(new)]);
+		invalid.home = Some(new.join("missing"));
+		assert!(app.begin_restore(invalid).is_err());
+		assert!(app.staged_session.is_none());
+
+		// A listing that fails while staging must not leak the snapshot's home.
+		let staged_id = app.next_tab_id;
+		let mut state = session(0, vec![tab_at(new)]);
+		state.home = Some(home.clone());
+		app.begin_restore(state).unwrap();
+		Dispatcher::dispatch_event(&mut app, Event::Loaded {
+			tab: staged_id, path: new.clone(), ticket: 0, result: Err(io::Error::other("listing failed")), done: true,
+		});
+		assert!(app.staged_session.is_none());
+		assert_eq!(app.home, *old);
+		assert_eq!(app.active_tab().tree.root.path, *old);
+		let _ = &mut rx;
+		for path in dirs { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[test]
+	fn startup_home_prefers_explicit_then_snapshot_then_path() {
+		let dirs = tmp_dirs(&["startup-path", "startup-explicit", "startup-snapshot"]);
+		let (path, explicit, snapshot) = (&dirs[0], &dirs[1], &dirs[2]);
+		let with_home = || {
+			let mut state = session(0, vec![tab_at(path)]);
+			state.home = Some(snapshot.clone());
+			Some(state)
+		};
+
+		let mut state = with_home();
+		assert_eq!(App::resolve_startup_home(Some(explicit.clone()), &mut state, path).unwrap(), *explicit);
+		assert_eq!(state.unwrap().home, None, "the snapshot home is consumed so the restore cannot override --home");
+
+		let mut state = with_home();
+		assert_eq!(App::resolve_startup_home(None, &mut state, path).unwrap(), *snapshot);
+
+		let mut state = Some(session(0, vec![tab_at(path)]));
+		assert_eq!(App::resolve_startup_home(None, &mut state, path).unwrap(), *path);
+		assert_eq!(App::resolve_startup_home(None, &mut None, path).unwrap(), *path);
+
+		assert!(App::resolve_startup_home(Some(path.join("missing")), &mut None, path).is_err());
+		fs::write(path.join("file"), "").unwrap();
+		assert!(App::resolve_startup_home(Some(path.join("file")), &mut None, path).is_err());
+		for path in dirs { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[tokio::test]
+	async fn snapshots_carry_the_home_unless_it_has_vanished() {
+		let dirs = tmp_dirs(&["snap-root", "snap-home"]);
+		let (root, home) = (&dirs[0], &dirs[1]);
+		let (mut app, _rx) = app(root).await;
+		app.home = home.clone();
+		assert_eq!(app.snapshot_state().unwrap().home.as_deref(), Some(home.as_path()));
+
+		fs::remove_dir(home).unwrap();
+		let state = app.snapshot_state().expect("a vanished home must not fail the snapshot");
+		assert_eq!(state.home, None);
+		fs::remove_dir_all(root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn set_home_changes_the_shared_home_and_rejects_bad_targets() {
+		let dirs = tmp_dirs(&["set-root", "set-target"]);
+		let (root, target) = (&dirs[0], &dirs[1]);
+		fs::write(root.join("file"), "").unwrap();
+		let (mut app, _rx) = app(root).await;
+		let tab_count = app.tabs.len();
+
+		app.execute(Command::SetHome(target.clone()));
+		assert_eq!(app.home, *target);
+		assert_eq!(app.tabs.len(), tab_count);
+		assert_eq!(app.active_tab().tree.root.path, *root, "set-home never moves the current tab");
+
+		for bad in [root.join("missing"), root.join("file")] {
+			app.execute(Command::SetHome(bad));
+			assert_eq!(app.home, *target, "an invalid target keeps the previous home");
+			assert!(app.notices.last().is_some_and(|notice| notice.message.starts_with("Cannot set home")));
+		}
+
+		app.execute("cd @home".parse().unwrap());
+		assert_eq!(app.active_tab().tree.root.path, *target, "g= now goes to the new home");
+		for path in dirs { fs::remove_dir_all(path).unwrap(); }
+	}
+
+	#[test]
+	fn controlled_tuzi_validates_set_home_from_its_parent() {
+		let supported = HashSet::from(["set-home".into()]);
+		let payload = |sender, receiver, data| dds::Payload {
+			receiver,
+			sender,
+			body: Body::Custom { kind: "set-home".into(), data },
+		};
+		let valid = serde_json::json!({ "path": "/project" });
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 7, valid.clone())).is_ok());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(42, 7, valid.clone())).is_err(), "only the parent may set home");
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 0, valid.clone())).is_err(), "broadcasts are rejected");
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 7, serde_json::json!({ "path": "relative" }))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 7, serde_json::json!({ "path": "/x", "extra": 1 }))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &supported, &payload(41, 7, serde_json::json!({}))).is_err());
+		assert!(App::validate_dds_message(Some(41), 7, &HashSet::new(), &payload(41, 7, valid)).is_err(), "an unsupported ability is refused");
+	}
+
 	#[test]
 	fn app_advertises_its_control_operations() {
-		assert_eq!(App::new_registry().abilities(), ["get-state", "get-tabs", "restore-state", "reveal", "switch-tab", "update-tab"]);
+		assert_eq!(App::new_registry().abilities(), ["get-state", "get-tabs", "restore-state", "reveal", "set-home", "switch-tab", "update-tab"]);
 	}
 
 	#[tokio::test]
@@ -2251,12 +2535,12 @@ mod tests {
 				&& peers.len() >= 2
 			{
 				let abilities = &peers.iter().find(|peer| peer.id == app_peer).unwrap().abilities;
-				assert_eq!(abilities.iter().map(String::as_str).collect::<HashSet<_>>(), HashSet::from(["get-state", "get-tabs", "restore-state", "reveal", "switch-tab", "update-tab"]), "the App advertises its Registry snapshot instead of '*'");
+				assert_eq!(abilities.iter().map(String::as_str).collect::<HashSet<_>>(), HashSet::from(["get-state", "get-tabs", "restore-state", "reveal", "set-home", "switch-tab", "update-tab"]), "the App advertises its Registry snapshot instead of '*'");
 				break;
 			}
 		}
 
-		app.emit(Body::Custom { kind: "from-app".into(), data: serde_json::Value::Null });
+		app.emit(Body::Custom { kind: "from-app".into(), data: serde_json::Value::Null }, false);
 		loop {
 			let payload = tokio::time::timeout(std::time::Duration::from_secs(2), remote_inbox.recv()).await.unwrap().unwrap();
 			if payload.body.kind() == "from-app" {

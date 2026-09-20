@@ -18,7 +18,7 @@ Arguments:
   [PATH]  Directory to open [default: current directory]
 
 Options:
-      --home <DIR>        Set the session home directory (gh)
+      --home <DIR>        Set the session home directory (g=)
       --config-dir <DIR>  Use a custom configuration directory
       --no-config         Ignore all user configuration
       --runtime-config <JSON>       Apply process-local config/keymap/state JSON (repeatable)
@@ -37,7 +37,7 @@ A directory literally named 'emit' or 'sub' can still be opened with
 'tuzi -- emit' / 'tuzi -- sub'.";
 
 enum Cli {
-	Run { path: PathBuf, home: PathBuf, config: LoadOptions, dds_launch: Option<dds::DdsLaunch> },
+	Run { path: PathBuf, home: Option<PathBuf>, config: LoadOptions, dds_launch: Option<dds::DdsLaunch> },
 	Help,
 	Version,
 	Emit { kind: String, data: serde_json::Value },
@@ -104,7 +104,7 @@ fn parse_args_with_env(
 	if config.no_config && config.config_dir.is_some() { return Err("--no-config and --config-dir cannot be used together".into()); }
 	let dds_launch = resolve_dds_launch(cli_parent, cli_token, env_parent, env_token)?;
 	let path = path.unwrap_or_else(|| PathBuf::from("."));
-	Ok(Cli::Run { home: home.unwrap_or_else(|| path.clone()), path, config, dds_launch })
+	Ok(Cli::Run { home, path, config, dds_launch })
 }
 
 fn resolve_dds_launch(
@@ -242,15 +242,17 @@ mod cli_tests {
 	#[test]
 	fn session_home_priority() {
 		for (args, expected_path, expected_home) in [
-			(vec![], ".", "."),
-			(vec!["project"], "project", "project"),
-			(vec!["--home", "base"], ".", "base"),
-			(vec!["--home", "base", "project"], "project", "base"),
-			(vec!["project", "--home", "base"], "project", "base"),
+			(vec![], ".", None),
+			(vec!["project"], "project", None),
+			(vec!["--home", "base"], ".", Some("base")),
+			(vec!["--home", "base", "project"], "project", Some("base")),
+			(vec!["project", "--home", "base"], "project", Some("base")),
 		] {
 			let Cli::Run { path, home, .. } = parse(&args).unwrap() else { panic!("expected Run") };
 			assert_eq!(path, PathBuf::from(expected_path));
-			assert_eq!(home, PathBuf::from(expected_home));
+			// `None` means "no explicit --home"; the App then falls back to a
+			// snapshot home and finally to PATH.
+			assert_eq!(home, expected_home.map(PathBuf::from));
 		}
 		assert!(parse(&["--home"]).is_err());
 	}

@@ -4,6 +4,20 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `emit --parent KIND [JSON]` sends a custom event directly to the controlling parent instead of broadcasting it. It needs no controller ability and never falls back to a broadcast when the parent is missing or offline.
+
+- A global session home. `g=` goes to it in every tab, `--home DIR` sets it at startup, and it is an optional top-level `home` in session snapshots (`get-state`, `restore-state`, `tuzi-exit`, startup state). Priority at startup is `--home`, then the snapshot's `home`, then `PATH`.
+- A `set-home` controller operation that changes the session home of a running Tuzi without moving any tab.
+
+### Changed
+
+- `gh` goes to the parent directory again; the session home moved to `g=`.
+- `emit` now rejects a kind that starts with `-`, so a mistyped flag cannot become an event kind.
+
 ## [0.4.2] - 2026-09-19
 
 ### Added

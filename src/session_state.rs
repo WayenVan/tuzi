@@ -23,6 +23,10 @@ pub const MAX_SESSION_PATH_DEPTH: usize = 64;
 pub struct SessionState {
 	pub version:    u32,
 	pub active_tab: usize,
+	/// Session-wide home directory (`g=`), shared by every tab. Optional so
+	/// older snapshots stay valid; absent means "leave the current home".
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub home:       Option<PathBuf>,
 	pub tabs:       Vec<TabState>,
 }
 
@@ -55,6 +59,14 @@ pub fn validate_and_normalize(mut state: SessionState) -> Result<SessionState, S
 		.ok_or_else(|| "session selection count overflowed".to_owned())?;
 	if selections > MAX_SELECTION_PATHS_PER_RESTORE {
 		return Err(format!("session state contains too many selection paths; maximum is {MAX_SELECTION_PATHS_PER_RESTORE}"));
+	}
+
+	if let Some(home) = &mut state.home {
+		let canonical = canonical_path(home, "home")?;
+		if !fs::metadata(&canonical).map_err(|error| format!("cannot inspect home {}: {error}", canonical.display()))?.is_dir() {
+			return Err(format!("home is not a directory: {}", canonical.display()));
+		}
+		*home = canonical;
 	}
 
 	for (index, tab) in state.tabs.iter_mut().enumerate() {
@@ -158,7 +170,7 @@ mod tests {
 	fn session_state_round_trips_through_json() {
 		let state = SessionState {
 			version: SESSION_STATE_VERSION,
-			active_tab: 0,
+			active_tab: 0, home: None,
 			tabs: vec![TabState {
 				cwd: PathBuf::from("/project"),
 				cursor: Some(PathBuf::from("/project/src/main.rs")),
@@ -203,7 +215,7 @@ mod tests {
 		fs::write(root.0.join("selected.txt"), "").unwrap();
 		let state = SessionState {
 			version: SESSION_STATE_VERSION,
-			active_tab: 0,
+			active_tab: 0, home: None,
 			tabs: vec![TabState {
 				cwd: root.0.clone(),
 				cursor: Some(root.0.join("src/app/main.rs")),
@@ -221,26 +233,26 @@ mod tests {
 	fn invalid_shape_resources_and_paths_are_rejected() {
 		let root = TestDir::new();
 		let tab = || TabState { cwd: root.0.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new() };
-		assert!(validate_and_normalize(SessionState { version: 2, active_tab: 0, tabs: vec![tab()] }).is_err());
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: Vec::new() }).is_err());
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 1, tabs: vec![tab()] }).is_err());
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: (0..=MAX_SESSION_TABS).map(|_| tab()).collect() }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 2, active_tab: 0, home: None, tabs: vec![tab()] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: Vec::new() }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 1, home: None, tabs: vec![tab()] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: (0..=MAX_SESSION_TABS).map(|_| tab()).collect() }).is_err());
 		let mut expanded_overflow = tab();
 		expanded_overflow.expanded = vec![root.0.clone(); MAX_EXPANDED_PATHS_PER_TAB + 1];
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: vec![expanded_overflow] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: vec![expanded_overflow] }).is_err());
 		let mut selection_overflow = tab();
 		selection_overflow.selection = vec![root.0.clone(); MAX_SELECTION_PATHS_PER_RESTORE + 1];
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: vec![selection_overflow] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: vec![selection_overflow] }).is_err());
 
 		let outside = TestDir::new();
 		fs::write(outside.0.join("file"), "").unwrap();
 		let mut outside_tab = tab();
 		outside_tab.cursor = Some(outside.0.join("file"));
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: vec![outside_tab] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: vec![outside_tab] }).is_err());
 
 		let mut missing_tab = tab();
 		missing_tab.selection.push(root.0.join("missing"));
-		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, tabs: vec![missing_tab] }).is_err());
+		assert!(validate_and_normalize(SessionState { version: 1, active_tab: 0, home: None, tabs: vec![missing_tab] }).is_err());
 	}
 
 	#[test]
@@ -250,7 +262,7 @@ mod tests {
 		fs::write(&file, "").unwrap();
 		let state = SessionState {
 			version: 1,
-			active_tab: 0,
+			active_tab: 0, home: None,
 			tabs: vec![TabState { cwd: root.0.clone(), cursor: None, selection: Vec::new(), expanded: vec![file] }],
 		};
 		assert!(validate_and_normalize(state).is_err());
@@ -260,9 +272,34 @@ mod tests {
 		fs::create_dir_all(&deep).unwrap();
 		let state = SessionState {
 			version: 1,
-			active_tab: 0,
+			active_tab: 0, home: None,
 			tabs: vec![TabState { cwd: root.0.clone(), cursor: Some(deep), selection: Vec::new(), expanded: Vec::new() }],
 		};
 		assert!(validate_and_normalize(state).is_err());
+	}
+
+	#[test]
+	fn home_is_optional_and_omitted_from_json_when_absent() {
+		let json = r#"{"version":1,"active_tab":0,"tabs":[]}"#;
+		let state: SessionState = serde_json::from_str(json).unwrap();
+		assert_eq!(state.home, None, "older snapshots without home stay valid");
+		assert!(!serde_json::to_string(&state).unwrap().contains("home"));
+		let with_home: SessionState = serde_json::from_str(r#"{"version":1,"active_tab":0,"home":"/x","tabs":[]}"#).unwrap();
+		assert!(serde_json::to_string(&with_home).unwrap().contains(r#""home":"/x""#));
+	}
+
+	#[test]
+	fn home_must_be_an_existing_absolute_directory() {
+		let dir = TestDir::new();
+		let file = dir.0.join("file");
+		fs::write(&file, "").unwrap();
+		let with_home = |home: PathBuf| SessionState { version: 1, active_tab: 0, home: Some(home), tabs: vec![TabState {
+			cwd: dir.0.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new(),
+		}] };
+		assert!(validate_and_normalize(with_home(PathBuf::from("relative"))).is_err());
+		assert!(validate_and_normalize(with_home(dir.0.join("missing"))).is_err());
+		assert!(validate_and_normalize(with_home(file)).is_err());
+		let normalized = validate_and_normalize(with_home(dir.0.join("."))).unwrap();
+		assert_eq!(normalized.home, Some(dir.0.canonicalize().unwrap()), "home is canonicalized like every other path");
 	}
 }

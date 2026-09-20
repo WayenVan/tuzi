@@ -99,8 +99,12 @@ pub enum Command {
 	GetTabs { query_id: u64 },
 	/// Publishes a custom event on the internal DDS bus (`.ai/dds-plan.md`
 	/// P2). `data` defaults to `Value::Null` when the command carries no
-	/// JSON argument.
-	Emit { kind: String, data: serde_json::Value },
+	/// JSON argument. With `parent`, the event goes only to the controlling
+	/// parent instead of being broadcast.
+	Emit { kind: String, data: serde_json::Value, parent: bool },
+	/// Changes the session home used by `cd @home`. Delivered by a
+	/// controlling parent through DDS; it has no command-line syntax.
+	SetHome(std::path::PathBuf),
 }
 
 impl FromStr for Command {
@@ -177,19 +181,32 @@ impl FromStr for Command {
 			["tasks", "toggle"] => Ok(Self::ToggleTasks),
 			["entry-details"] => Ok(Self::EntryDetails),
 			["filename-peek", "toggle"] => Ok(Self::ToggleFilenamePeek),
-			["emit", kind] => Ok(Self::Emit { kind: emit_kind(kind).map_err(|_| invalid())?, data: serde_json::Value::Null }),
-			["emit", kind, json] => Ok(Self::Emit {
-				kind: emit_kind(kind).map_err(|_| invalid())?,
-				data: serde_json::from_str(json).map_err(|_| format!("invalid json for emit: '{json}'"))?,
-			}),
+			["emit", "--parent", rest @ ..] => parse_emit(rest, true).ok_or_else(invalid)?,
+			["emit", rest @ ..] => parse_emit(rest, false).ok_or_else(invalid)?,
 			_ => Err(invalid()),
 		}
 	}
 }
 
-/// Rejects kinds that would let `emit` spoof a built-in DDS event.
+/// Parses the `KIND [JSON]` tail of `emit`. `None` means the shape is
+/// invalid; a malformed JSON payload is its own error.
+fn parse_emit(args: &[&str], parent: bool) -> Option<Result<Command, String>> {
+	let (kind, json) = match args {
+		[kind] => (kind, None),
+		[kind, json] => (kind, Some(json)),
+		_ => return None,
+	};
+	let kind = emit_kind(kind).ok()?;
+	Some(match json {
+		None => Ok(Command::Emit { kind, data: serde_json::Value::Null, parent }),
+		Some(json) => serde_json::from_str(json).map(|data| Command::Emit { kind, data, parent }).map_err(|_| format!("invalid json for emit: '{json}'")),
+	})
+}
+
+/// Rejects kinds that would let `emit` spoof a built-in DDS event, and
+/// anything shaped like a flag so a typo can't become a kind.
 fn emit_kind(kind: &str) -> Result<String, ()> {
-	if kind.is_empty() || BUILTIN_KINDS.contains(&kind) { return Err(()); }
+	if kind.is_empty() || kind.starts_with('-') || BUILTIN_KINDS.contains(&kind) { return Err(()); }
 	Ok(kind.to_string())
 }
 
@@ -212,7 +229,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "command", description: "Open the command prompt", usages: &["command"] },
 	CommandSpec { name: "copy", description: "Copy path information", usages: &["copy path", "copy url", "copy dirpath", "copy dirurl", "copy filename", "copy stem"] },
 	CommandSpec { name: "create", description: "Create a file or directory", usages: &["create"] },
-	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#] },
+	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#, "emit --parent my-kind"] },
 	CommandSpec { name: "entry-details", description: "Show details for the selected entry", usages: &["entry-details"] },
 	CommandSpec { name: "filename-peek", description: "Toggle truncated filename continuation", usages: &["filename-peek toggle"] },
 	CommandSpec { name: "escape", description: "Cancel the current mode", usages: &["escape"] },
@@ -303,11 +320,23 @@ mod tests {
 	fn emit_publishes_an_arbitrary_kind_with_optional_json() {
 		assert_eq!(
 			"emit my-kind".parse(),
-			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null })
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null, parent: false })
 		);
 		assert_eq!(
 			r#"emit my-kind '{"a":1}'"#.parse(),
-			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}) })
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}), parent: false })
+		);
+	}
+
+	#[test]
+	fn emit_parent_targets_only_the_controlling_parent() {
+		assert_eq!(
+			"emit --parent my-kind".parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null, parent: true })
+		);
+		assert_eq!(
+			r#"emit --parent my-kind '{"a":1}'"#.parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}), parent: true })
 		);
 	}
 
@@ -316,6 +345,15 @@ mod tests {
 		assert!("emit cd".parse::<Command>().is_err(), "cd is a built-in DDS kind");
 		assert!("emit ''".parse::<Command>().is_err(), "empty kind");
 		assert!(r#"emit my-kind 'not json'"#.parse::<Command>().is_err());
+		assert!(r#"emit --parent my-kind 'not json'"#.parse::<Command>().is_err());
+	}
+
+	#[test]
+	fn emit_never_treats_a_flag_as_a_kind() {
+		assert!("emit --parent".parse::<Command>().is_err());
+		assert!("emit --paren my-kind".parse::<Command>().is_err());
+		assert!("emit --parent --parent".parse::<Command>().is_err());
+		assert!("emit my-kind '1' extra".parse::<Command>().is_err());
 	}
 
 	#[test]

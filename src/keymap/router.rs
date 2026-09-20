@@ -173,7 +173,9 @@ mod tests {
 			Route::Commands(vec![Command::Cd(CdTarget::Interactive)])
 		);
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
-		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Commands(vec![Command::Cd(CdTarget::Home)]));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Commands(vec![Command::Cd(CdTarget::Path("..".into()))]));
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('=')), Route::Commands(vec![Command::Cd(CdTarget::Home)]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Commands(vec![Command::Cd(CdTarget::Selected)]));
 		assert_eq!(
