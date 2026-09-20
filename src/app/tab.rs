@@ -316,12 +316,29 @@ impl Tab {
 		let Some(path) = self.selected_dir() else {
 			return;
 		};
-		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
+		self.tree.mark_expanded(&path);
 		self.sync_projection(&path);
 		self.watcher.watch_async(path.clone());
-		if needs_fetch {
-			self.fs_scheduler.refresh(path);
+		// Read it again even when a listing is cached: collapsing stops watching
+		// a directory, so the cache may have gone stale in the meantime. The old
+		// listing stays on screen until the new one arrives.
+		self.fs_scheduler.refresh(path);
+	}
+
+	/// Reads every open directory again, keeping the cursor, selection and
+	/// expansion. With `rearm`, also registers each directory's watch afresh;
+	/// that is for an explicit refresh, whereas a refresh the watcher itself
+	/// asked for must not re-register (it may be failing, and would ask again).
+	/// Returns how many directories were refreshed.
+	pub fn refresh_all(&mut self, rearm: bool) -> usize {
+		let dirs = self.tree.open_dirs();
+		for dir in &dirs {
+			if rearm {
+				self.watcher.watch_async(dir.clone());
+			}
+			self.fs_scheduler.refresh(dir.clone());
 		}
+		dirs.len()
 	}
 
 	/// Expands an exact path while a staged session is being built. Unlike
@@ -1054,6 +1071,9 @@ impl Tab {
 	/// ever fires for ones we actually have cached.
 	pub fn on_changed(&mut self, path: PathBuf) {
 		if self.tree.is_loaded(&path) {
+			// The directory itself changed. If it was deleted or moved away the
+			// kernel has already dropped its watch, so arm it again.
+			self.watcher.watch_async(path.clone());
 			self.fs_scheduler.refresh(path);
 		}
 	}
@@ -1545,7 +1565,7 @@ mod tests {
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			// No App/Registry exists in these single-tab tests; DDS publication
 			// from `cd`/rename is a no-op here.
-			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_) => {}
+			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_) | Event::WatchIssue { .. } => {}
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}
@@ -2653,6 +2673,96 @@ mod tests {
 		tab.visual = Some(Visual::new(tab.cursor, true));
 		assert_eq!(tab.status_line().mode, StatusMode::Unset);
 
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// Applies events until nothing arrives for a while: enough for however many
+	/// directory listings a refresh started.
+	async fn settle(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
+		while let Ok(Some(event)) = tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv()).await {
+			apply(tab, event);
+		}
+	}
+
+	fn visible_names(tab: &Tab) -> Vec<String> {
+		tab.visible().iter().map(|(_, node)| node.path.file_name().unwrap().to_string_lossy().into_owned()).collect()
+	}
+
+	/// Stops watching, so that only an explicit read can notice later changes.
+	async fn go_deaf(tab: &Tab, paths: &[&Path]) {
+		for path in paths {
+			tab.watcher.unwatch(path);
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(150)).await; // the worker thread handles it
+	}
+
+	#[tokio::test]
+	async fn refresh_all_reads_open_directories_again_and_keeps_the_view() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-refresh-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		fs::write(root.join("sub/first"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		go_deaf(&tab, &[&root, &root.join("sub")]).await;
+
+		fs::write(root.join("sub/added"), b"").unwrap();
+		fs::remove_file(root.join("sub/first")).unwrap();
+		fs::write(root.join("top"), b"").unwrap();
+		settle(&mut tab, &mut rx).await;
+		assert!(!visible_names(&tab).contains(&"top".to_owned()), "control: with no watch nothing has noticed the changes");
+
+		assert_eq!(tab.refresh_all(false), 2, "the root and the one expanded directory");
+		settle(&mut tab, &mut rx).await;
+		let names = visible_names(&tab);
+		assert!(names.contains(&"top".to_owned()) && names.contains(&"added".to_owned()), "{names:?}");
+		assert!(!names.contains(&"first".to_owned()), "{names:?}");
+		assert!(tab.tree.root.find(&root.join("sub")).unwrap().expanded, "the expansion survives");
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("sub"), "and so does the cursor");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn refresh_all_leaves_out_collapsed_directories() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-refresh-collapsed-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		assert_eq!(tab.refresh_all(false), 2);
+		tab.collapse_selected();
+		settle(&mut tab, &mut rx).await;
+		assert_eq!(tab.refresh_all(false), 1, "a collapsed directory is not on screen, so it is not read");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn expanding_a_collapsed_directory_reads_it_again() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-reexpand-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		fs::write(root.join("sub/first"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		tab.collapse_selected(); // stops watching it, but keeps the cached listing
+		settle(&mut tab, &mut rx).await;
+
+		fs::write(root.join("sub/created_while_collapsed"), b"").unwrap();
+		fs::remove_file(root.join("sub/first")).unwrap();
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		let names = visible_names(&tab);
+		assert!(names.contains(&"created_while_collapsed".to_owned()), "{names:?}");
+		assert!(!names.contains(&"first".to_owned()), "the cached listing must not be shown as if it were current: {names:?}");
 		fs::remove_dir_all(&root).unwrap();
 	}
 }

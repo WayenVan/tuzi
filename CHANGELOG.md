@@ -12,6 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A global session home. `g=` goes to it in every tab, `--home DIR` sets it at startup, and it is an optional top-level `home` in session snapshots (`get-state`, `restore-state`, `tuzi-exit`, startup state). Priority at startup is `--home`, then the snapshot's `home`, then `PATH`.
 - A `set-home` controller operation that changes the session home of a running Tuzi without moving any tab.
+- `R` (`:refresh`) reads every open directory of the active tab again, keeping the cursor, selection and expansion, and registers each directory's watch afresh. It is the way out when something on screen is stale.
+
+### Fixed
+
+- A directory that was deleted and recreated (`rm -rf build && mkdir build`, switching git branches, `mv dir dir.old && mkdir dir`) was never watched again, so its contents stopped updating for good. Registering a watch now always arms it afresh, and a directory that changed itself has its watch re-armed.
+- Expanding a directory you had collapsed showed its cached listing even if it had changed meanwhile, because collapsing stops watching it. Expanding now reads it again; the old listing stays on screen until the new one arrives.
+- When the OS dropped file events (for inotify, its queue overflowed) or the watcher backend failed, Tuzi ignored it and every open directory could stay stale. It now reads the open directories again and says so; repeated reports are folded together and a persistent fault is shown once at a time.
+- A watch that cannot be registered for a reason about watching itself, such as the OS limit on watches, is now reported instead of leaving that directory silently stale. A directory that is gone or unreadable is still left to its own listing.
 
 ### Changed
 

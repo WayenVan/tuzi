@@ -185,6 +185,12 @@ mod tests {
 	}
 
 	#[test]
+	fn r_refreshes_the_open_directories() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char('R')), Route::Commands(vec![Command::Refresh]));
+	}
+
+	#[test]
 	fn m_prefix_selects_the_column_mode() {
 		let mut router = Router::default();
 		for (key, mode) in [

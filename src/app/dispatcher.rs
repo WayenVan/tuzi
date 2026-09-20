@@ -66,6 +66,11 @@ impl App {
 			Command::Fzf => self.start_fzf(),
 			Command::Zoxide => self.start_zoxide(),
 			Command::Open { interactive } => self.open_selected(interactive),
+			Command::Refresh => {
+				let count = self.active_tab_mut().refresh_all(true);
+				let noun = if count == 1 { "directory" } else { "directories" };
+				self.push_notice(crate::notice::NoticeLevel::Info, format!("Refreshing {count} {noun}"));
+			}
 			Command::ToggleTasks => self.tasks.visible = !self.tasks.visible,
 			Command::EntryDetails => {
 				self.entry_details = true;
@@ -93,6 +98,26 @@ impl Dispatcher {
 					t.on_changed(path);
 				} else if let Some(t) = app.tab_mut(tab) {
 					t.on_changed(path);
+				}
+			}
+			Event::WatchIssue { tab, issue } => {
+				use crate::{notice::NoticeLevel, watcher::WatchIssue};
+				let (level, message, refresh) = match issue {
+					WatchIssue::EventsDropped => (NoticeLevel::Info, "File events were dropped; refreshing the open directories".to_owned(), true),
+					WatchIssue::BackendError(error) => (NoticeLevel::Warn, format!("File watching error: {error}"), true),
+					// Nothing was lost, one directory just will not update by
+					// itself; refreshing would only try to watch it again.
+					WatchIssue::RegisterFailed { path, error } => (NoticeLevel::Warn, format!("Cannot watch {}: {error}", path.display()), false),
+				};
+				// Events may have been lost, so trust nothing on screen. Watches
+				// are not re-registered: if watching is what fails, that would
+				// only raise the same issue again.
+				if refresh && let Some(t) = app.tab_mut(tab) {
+					t.refresh_all(false);
+				}
+				// A persistent fault repeats; show each message once at a time.
+				if !app.notices.iter().any(|notice| notice.message == message) {
+					app.push_notice(level, message);
 				}
 			}
 			Event::FilesChanged { tab, parent, changes } => {

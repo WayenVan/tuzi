@@ -290,6 +290,11 @@ keymap sequences themselves continue to work.
 Watcher changes are grouped for `debounce_ms`; `max_wait_ms` forces a refresh
 during nonstop filesystem churn. `poll_interval_ms` configures notify's
 polling backend/fallback and does not replace native watching where available.
+Native watching cannot see changes made from another machine on a network
+filesystem such as NFS; press `R` (`:refresh`) to read the open directories
+again. Tuzi also does this by itself when the OS reports that it dropped file
+events, and it re-registers a directory's watch when the directory was deleted
+or moved away.
 
 ### Keymap
 
@@ -468,6 +473,7 @@ are `#45475a` on the active tab and `#7f849c` on the others, about 4.3:1 and
 | `g~` / `gc` | Go to home / config directory |
 | `gd` / `gD` | Go to Downloads / Desktop |
 | `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |
+| `R` | Refresh: read every open directory again (`:refresh`) |
 | `w` | Show task manager |
 | `Ctrl-p` | Toggle preview |
 | `tt` / `W` | Create / close tab |

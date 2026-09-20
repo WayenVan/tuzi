@@ -142,6 +142,14 @@ impl Tree {
 		self.root.find_parent(path).map(|node| node.path.clone())
 	}
 
+	/// The root and every expanded directory below it whose listing is loaded:
+	/// what is on screen, and so what is worth reading again.
+	pub fn open_dirs(&self) -> Vec<PathBuf> {
+		let mut dirs = vec![self.root.path.clone()];
+		self.root.collect_open_dirs(&mut dirs);
+		dirs
+	}
+
 	pub fn is_loaded(&self, path: &Path) -> bool {
 		self.root.find(path).is_some_and(|node| node.children.is_some())
 	}

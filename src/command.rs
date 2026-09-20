@@ -102,6 +102,8 @@ pub enum Command {
 	/// JSON argument. With `parent`, the event goes only to the controlling
 	/// parent instead of being broadcast.
 	Emit { kind: String, data: serde_json::Value, parent: bool },
+	/// Reads every open directory of the active tab again.
+	Refresh,
 	/// Changes the session home used by `cd @home`. Delivered by a
 	/// controlling parent through DDS; it has no command-line syntax.
 	SetHome(std::path::PathBuf),
@@ -178,6 +180,7 @@ impl FromStr for Command {
 			["zoxide"] => Ok(Self::Zoxide),
 			["open"] => Ok(Self::Open { interactive: false }),
 			["open", "--interactive"] => Ok(Self::Open { interactive: true }),
+			["refresh"] => Ok(Self::Refresh),
 			["tasks", "toggle"] => Ok(Self::ToggleTasks),
 			["entry-details"] => Ok(Self::EntryDetails),
 			["filename-peek", "toggle"] => Ok(Self::ToggleFilenamePeek),
@@ -245,6 +248,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "paste", description: "Paste yanked files", usages: &["paste"] },
 	CommandSpec { name: "preview", description: "Control the preview", usages: &["preview toggle", "preview seek 1", "preview seek -1"] },
 	CommandSpec { name: "quit", description: "Quit Tuzi", usages: &["quit"] },
+	CommandSpec { name: "refresh", description: "Read the open directories again", usages: &["refresh"] },
 	CommandSpec { name: "remove", description: "Remove selected files", usages: &["remove", "remove --permanently"] },
 	CommandSpec { name: "rename", description: "Rename the selected file", usages: &["rename"] },
 	CommandSpec { name: "select", description: "Toggle selection", usages: &["select toggle"] },
@@ -314,6 +318,13 @@ mod tests {
 		assert!("unknown".parse::<Command>().is_err());
 		assert!("arrow -2".parse::<Command>().is_err());
 		assert!("input cd".parse::<Command>().is_err());
+	}
+
+	#[test]
+	fn refresh_takes_no_arguments() {
+		assert_eq!("refresh".parse(), Ok(Command::Refresh));
+		assert!("refresh now".parse::<Command>().is_err());
+		assert!(completions("ref").iter().any(|candidate| candidate == "refresh"));
 	}
 
 	#[test]

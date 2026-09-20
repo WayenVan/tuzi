@@ -10,6 +10,7 @@ keymap = [
 	{ on = "k",       run = "cursor -1",                   desc = "Move up" },
 	{ on = "K",       run = "entry-details",               desc = "Show entry details" },
 	{ on = "I",       run = "filename-peek toggle",        desc = "Toggle filename peek" },
+	{ on = "R",       run = "refresh",                     desc = "Refresh the open directories" },
 	{ on = "<Up>",    run = "cursor -1",                   desc = "Move up" },
 	{ on = "<C-u>",   run = "page -50",                    desc = "Move up half page" },
 	{ on = "<C-d>",   run = "page 50",                     desc = "Move down half page" },

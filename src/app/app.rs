@@ -2510,6 +2510,74 @@ mod tests {
 		assert!(App::validate_dds_message(Some(41), 7, &HashSet::new(), &payload(41, 7, valid)).is_err(), "an unsupported ability is refused");
 	}
 
+	async fn loaded_within(rx: &mut mpsc::UnboundedReceiver<Event>, ms: u64) -> bool {
+		while let Ok(Some(event)) = tokio::time::timeout(std::time::Duration::from_millis(ms), rx.recv()).await {
+			if matches!(event, Event::Loaded { .. }) {
+				return true;
+			}
+		}
+		false
+	}
+
+	#[tokio::test]
+	async fn the_refresh_command_reads_the_open_directories_and_says_so() {
+		let root = std::env::temp_dir().join(format!("tuzi-app-test-refresh-cmd-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		while loaded_within(&mut rx, 300).await {} // the initial listing
+
+		app.execute("refresh".parse().unwrap());
+		assert!(app.notices.last().is_some_and(|notice| notice.message == "Refreshing 1 directory"), "{:?}", app.notices.last().map(|n| n.message.clone()));
+		assert!(loaded_within(&mut rx, 1000).await, "the directory must actually be listed again");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn dropped_events_refresh_the_tab_and_tell_the_user() {
+		let root = std::env::temp_dir().join(format!("tuzi-app-test-issue-dropped-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		while loaded_within(&mut rx, 300).await {}
+
+		Dispatcher::dispatch_event(&mut app, Event::WatchIssue { tab: 0, issue: crate::watcher::WatchIssue::EventsDropped });
+		let notice = app.notices.last().unwrap();
+		assert!(notice.message.contains("dropped") && notice.level == NoticeLevel::Info, "{}", notice.message);
+		assert!(loaded_within(&mut rx, 1000).await, "the open directories must be read again");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_watch_that_could_not_be_registered_is_reported_without_refreshing() {
+		let root = std::env::temp_dir().join(format!("tuzi-app-test-issue-register-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		while loaded_within(&mut rx, 300).await {}
+
+		let issue = crate::watcher::WatchIssue::RegisterFailed { path: root.join("sub"), error: "too many open files".into() };
+		Dispatcher::dispatch_event(&mut app, Event::WatchIssue { tab: 0, issue });
+		let notice = app.notices.last().unwrap();
+		assert!(notice.message.contains("Cannot watch") && notice.message.contains("too many open files") && notice.level == NoticeLevel::Warn, "{}", notice.message);
+		assert!(!loaded_within(&mut rx, 400).await, "nothing was lost, and refreshing would only try to register the watch again");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn a_repeating_watch_error_is_shown_once_at_a_time() {
+		let root = std::env::temp_dir().join(format!("tuzi-app-test-issue-repeat-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(&root).unwrap();
+		let (mut app, _rx) = app(&root).await;
+		for _ in 0..5 {
+			Dispatcher::dispatch_event(&mut app, Event::WatchIssue { tab: 0, issue: crate::watcher::WatchIssue::BackendError("bad fd".into()) });
+		}
+		let shown = app.notices.iter().filter(|notice| notice.message == "File watching error: bad fd").count();
+		assert_eq!(shown, 1);
+		fs::remove_dir_all(&root).unwrap();
+	}
+
 	#[test]
 	fn app_advertises_its_control_operations() {
 		assert_eq!(App::new_registry().abilities(), ["get-state", "get-tabs", "restore-state", "reveal", "set-home", "switch-tab", "update-tab"]);
