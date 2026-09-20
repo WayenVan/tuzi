@@ -208,7 +208,7 @@ which_key = true
 filename_peek = false      # Show truncated filename continuations near the cursor
 
 [notify]
-info_timeout = 3           # seconds, 1–3600
+info_timeout = 2           # seconds, 1–3600
 warn_timeout = 5
 error_timeout = 8
 

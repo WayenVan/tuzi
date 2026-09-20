@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A `set-home` controller operation that changes the session home of a running Tuzi without moving any tab.
 - `R` (`:refresh`) reads every open directory of the active tab again, keeping the cursor, selection and expansion, and registers each directory's watch afresh. It is the way out when something on screen is stale.
 
+- Info notices now disappear after 2 seconds by default instead of 3 (`notify.info_timeout`). Warnings (5 s) and errors (8 s) are unchanged, and a value you set yourself is respected.
+
 ### Fixed
 
 - A directory that was deleted and recreated (`rm -rf build && mkdir build`, switching git branches, `mv dir dir.old && mkdir dir`) was never watched again, so its contents stopped updating for good. Registering a watch now always arms it afresh, and a directory that changed itself has its watch re-armed.
