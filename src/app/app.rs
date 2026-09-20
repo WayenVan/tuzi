@@ -27,6 +27,8 @@ use super::{
 };
 
 pub struct App {
+	/// Fixed session home shared by all tabs.
+	pub(super) home: PathBuf,
 	pub(super) config: Arc<Config>,
 	pub tabs: Vec<Tab>,
 	pub active: usize,
@@ -121,7 +123,11 @@ impl Default for MouseState {
 }
 
 impl App {
-	pub async fn serve(path: PathBuf, config: Config, keymap: Keymap, theme: Theme, state: Option<crate::session_state::SessionState>, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
+	pub async fn serve(path: PathBuf, home: PathBuf, config: Config, keymap: Keymap, theme: Theme, state: Option<crate::session_state::SessionState>, dds_launch: Option<dds::DdsLaunch>) -> io::Result<()> {
+		let home = crate::fs::absolute_lexical(&home)?;
+		if !std::fs::metadata(&home)?.is_dir() {
+			return Err(io::Error::new(io::ErrorKind::InvalidInput, "home is not a directory"));
+		}
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let config = Arc::new(config);
 		let state = state.map(crate::session_state::validate_and_normalize).transpose()
@@ -143,6 +149,7 @@ impl App {
 		let first = Tab::open_configured(0, initial_path, tx.clone(), config.clone())?;
 		let controller = dds_launch.clone().map(|launch| ControllerLink { launch, online: true, abilities: HashSet::new() });
 		let mut app = Self {
+			home,
 			config: config.clone(),
 			tabs: vec![first],
 			active: 0,
@@ -1015,6 +1022,7 @@ mod tests {
 		let (tx, mut rx) = mpsc::unbounded_channel();
 		let first = Tab::open(0, root.to_path_buf(), tx.clone()).unwrap();
 		let mut app = App {
+			home: crate::fs::absolute_lexical(root).unwrap(),
 			config: Arc::new(Config::default()),
 			tabs: vec![first],
 			active: 0,
@@ -1049,6 +1057,24 @@ mod tests {
 		pump(&mut app, &mut rx).await;
 
 		(app, rx)
+	}
+
+	#[tokio::test]
+	async fn gh_returns_active_tab_to_fixed_session_home() {
+		let root = std::env::temp_dir().join(format!("tuzi-session-home-{}", std::process::id()));
+		fs::create_dir_all(root.join("child")).unwrap();
+		let (mut app, mut rx) = app(&root).await;
+		app.active_tab_mut().cd(root.join("child")).unwrap();
+		pump(&mut app, &mut rx).await;
+		app.new_tab();
+		pump(&mut app, &mut rx).await;
+		let mut router = Router::default();
+		app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &mut router);
+		app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &mut router);
+		pump(&mut app, &mut rx).await;
+		assert_eq!(app.active_tab().tree.root.path, app.home);
+		assert_eq!(app.tabs[0].tree.root.path, root.join("child"));
+		fs::remove_dir_all(root).unwrap();
 	}
 
 	async fn pump(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Event>) {

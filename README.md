@@ -50,10 +50,14 @@ For file icons, use a terminal font that includes Nerd Font symbols. `fzf` is op
 ## Usage
 
 ```sh
-tuzi [PATH]
+tuzi [--home DIR] [PATH]
 ```
 
 `PATH` must be a directory and defaults to the current directory.
+Press `gh` (or run `cd @home`) to return to the session home: `--home DIR`
+takes priority, followed by `PATH`, then the startup current directory.
+Relative home paths are resolved at startup and shared across tabs.
+For example, `tuzi --home /project /tmp` opens `/tmp`; `gh` returns to `/project`.
 
 ```sh
 tuzi --help
@@ -450,6 +454,7 @@ silently ignored.
 | `/` / `?` | Find next / previous |
 | `f` | Filter |
 | `.` | Toggle hidden files |
+| `gh` | Go to session home (`--home DIR`, otherwise startup PATH or current directory) |
 | `g~` / `gc` | Go to home / config directory |
 | `gd` / `gD` | Go to Downloads / Desktop |
 | `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |

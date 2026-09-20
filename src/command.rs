@@ -11,6 +11,7 @@ pub enum CursorTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CdTarget {
+	Home,
 	Interactive,
 	Path(String),
 	Trash,
@@ -117,6 +118,7 @@ impl FromStr for Command {
 			["cursor", amount] => amount.parse().map(|amount| Self::Cursor(CursorTarget::Relative(amount))).map_err(|_| invalid()),
 			["page", amount] => amount.parse().map(Self::MovePage).map_err(|_| invalid()),
 			["cd"] => Ok(Self::Cd(CdTarget::Interactive)),
+			["cd", "@home"] => Ok(Self::Cd(CdTarget::Home)),
 			["cd", "@trash"] => Ok(Self::Cd(CdTarget::Trash)),
 			["cd", "@config"] => Ok(Self::Cd(CdTarget::Config)),
 			["cd", "@selected"] => Ok(Self::Cd(CdTarget::Selected)),
@@ -203,7 +205,7 @@ pub struct CommandSpec {
 
 const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "cursor", description: "Move the cursor", usages: &["cursor 1", "cursor -1", "cursor top", "cursor bottom"] },
-	CommandSpec { name: "cd", description: "Change directory", usages: &["cd", "cd @selected", "cd @trash", "cd @config", "cd ..", "cd ~", "cd ~/Downloads", "cd ~/Desktop"] },
+	CommandSpec { name: "cd", description: "Change directory", usages: &["cd", "cd @selected", "cd @home", "cd @trash", "cd @config", "cd ..", "cd ~", "cd ~/Downloads", "cd ~/Desktop"] },
 	CommandSpec { name: "center", description: "Center the cursor", usages: &["center"] },
 	CommandSpec { name: "collapse", description: "Collapse directories", usages: &["collapse", "collapse subtree", "collapse siblings", "collapse all"] },
 	CommandSpec { name: "column", description: "Set the metadata column", usages: &["column none", "column size", "column permissions", "column modified"] },

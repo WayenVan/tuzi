@@ -18,6 +18,12 @@ impl App {
 			Command::MovePage(percent) => self.move_page(percent),
 			Command::Cursor(CursorTarget::Top) => self.active_tab_mut().move_to_top(),
 			Command::Cursor(CursorTarget::Bottom) => self.active_tab_mut().move_to_bottom(),
+			Command::Cd(CdTarget::Home) => {
+				let home = self.home.clone();
+				if let Err(error) = self.active_tab_mut().cd(home) {
+					self.active_tab_mut().raise(crate::notice::NoticeLevel::Error, error.to_string());
+				}
+			}
 			Command::Cd(CdTarget::Interactive) => self.active_tab_mut().start_cd(),
 			Command::Cd(CdTarget::Selected) => self.active_tab_mut().cd_selected(),
 			Command::Cd(CdTarget::Trash) => self.active_tab_mut().cd_trash(),

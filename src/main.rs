@@ -18,6 +18,7 @@ Arguments:
   [PATH]  Directory to open [default: current directory]
 
 Options:
+      --home <DIR>        Set the session home directory (gh)
       --config-dir <DIR>  Use a custom configuration directory
       --no-config         Ignore all user configuration
       --runtime-config <JSON>       Apply process-local config/keymap/state JSON (repeatable)
@@ -36,7 +37,7 @@ A directory literally named 'emit' or 'sub' can still be opened with
 'tuzi -- emit' / 'tuzi -- sub'.";
 
 enum Cli {
-	Run { path: PathBuf, config: LoadOptions, dds_launch: Option<dds::DdsLaunch> },
+	Run { path: PathBuf, home: PathBuf, config: LoadOptions, dds_launch: Option<dds::DdsLaunch> },
 	Help,
 	Version,
 	Emit { kind: String, data: serde_json::Value },
@@ -67,6 +68,7 @@ fn parse_args_with_env(
 	}
 
 	let mut path = None;
+	let mut home = None;
 	let mut config = LoadOptions::default();
 	let mut cli_parent = None;
 	let mut cli_token = None;
@@ -74,6 +76,7 @@ fn parse_args_with_env(
 		match arg.to_string_lossy().as_ref() {
 			"-h" | "--help" => return no_extra_args(args, Cli::Help),
 			"-V" | "--version" => return no_extra_args(args, Cli::Version),
+			"--home" => home = Some(PathBuf::from(args.next().ok_or("expected DIR after '--home'")?)),
 			"--no-config" => config.no_config = true,
 			"--config-dir" => config.config_dir = Some(args.next().ok_or("expected DIR after '--config-dir'")?.into()),
 			"--runtime-config" => config.runtime_config.push(RuntimeConfigSource::Inline(args.next().ok_or("expected JSON after '--runtime-config'")?.into_string().map_err(|_| "--runtime-config value must be valid UTF-8")?)),
@@ -100,7 +103,8 @@ fn parse_args_with_env(
 	}
 	if config.no_config && config.config_dir.is_some() { return Err("--no-config and --config-dir cannot be used together".into()); }
 	let dds_launch = resolve_dds_launch(cli_parent, cli_token, env_parent, env_token)?;
-	Ok(Cli::Run { path: path.unwrap_or_else(|| PathBuf::from(".")), config, dds_launch })
+	let path = path.unwrap_or_else(|| PathBuf::from("."));
+	Ok(Cli::Run { home: home.unwrap_or_else(|| path.clone()), path, config, dds_launch })
 }
 
 fn resolve_dds_launch(
@@ -162,7 +166,7 @@ async fn main() -> ExitCode {
 			println!("tuzi {}", env!("CARGO_PKG_VERSION"));
 			ExitCode::SUCCESS
 		}
-		Ok(Cli::Run { path, config, dds_launch }) => match Config::load(&config).and_then(|behavior| Keymap::load(&config).and_then(|keymap| Theme::load(&config).and_then(|theme| load_runtime_state(&config).map(|state| (behavior, keymap, theme, state))))) {
+		Ok(Cli::Run { path, home, config, dds_launch }) => match Config::load(&config).and_then(|behavior| Keymap::load(&config).and_then(|keymap| Theme::load(&config).and_then(|theme| load_runtime_state(&config).map(|state| (behavior, keymap, theme, state))))) {
 			Err(error) => {
 				eprintln!("tuzi: {error}");
 				ExitCode::FAILURE
@@ -171,7 +175,7 @@ async fn main() -> ExitCode {
 				eprintln!("tuzi: dds.open=parent requires a controlled DDS launch");
 				ExitCode::FAILURE
 			}
-			Ok((config, keymap, theme, state)) => match app::App::serve(path, config, keymap, theme, state, dds_launch).await {
+			Ok((config, keymap, theme, state)) => match app::App::serve(path, home, config, keymap, theme, state, dds_launch).await {
 			Ok(()) => ExitCode::SUCCESS,
 			Err(error) => {
 				eprintln!("tuzi: {error}");
@@ -233,6 +237,22 @@ mod cli_tests {
 	fn defaults_to_the_current_directory_and_accepts_one_path() {
 		assert!(matches!(parse(&[]).unwrap(), Cli::Run { path, .. } if path.as_path() == std::path::Path::new(".")));
 		assert!(matches!(parse(&["somewhere"]).unwrap(), Cli::Run { path, .. } if path.as_path() == std::path::Path::new("somewhere")));
+	}
+
+	#[test]
+	fn session_home_priority() {
+		for (args, expected_path, expected_home) in [
+			(vec![], ".", "."),
+			(vec!["project"], "project", "project"),
+			(vec!["--home", "base"], ".", "base"),
+			(vec!["--home", "base", "project"], "project", "base"),
+			(vec!["project", "--home", "base"], "project", "base"),
+		] {
+			let Cli::Run { path, home, .. } = parse(&args).unwrap() else { panic!("expected Run") };
+			assert_eq!(path, PathBuf::from(expected_path));
+			assert_eq!(home, PathBuf::from(expected_home));
+		}
+		assert!(parse(&["--home"]).is_err());
 	}
 
 	#[test]
