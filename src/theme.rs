@@ -8,7 +8,7 @@ use crate::config::{LoadOptions, read_user_file};
 const PRESET: &str = include_str!("../preset/theme-default.toml");
 const REQUIRED_STYLES: &[&str] = &[
 	"mgr.cursor_unfocused", "mgr.error", "mgr.loading", "mgr.symlink", "mgr.find_match", "mgr.marker_visual", "mgr.marker_selected", "mgr.marker_cut", "mgr.marker_copy",
-	"win.cwd", "win.badge_copy", "win.badge_cut", "tabs.active", "tabs.inactive", "tabs.separator", "tabs.outer",
+	"win.cwd", "win.badge_copy", "win.badge_cut", "tabs.active", "tabs.inactive", "tabs.separator", "tabs.outer", "tabs.index_active", "tabs.index_inactive",
 	"status.normal", "status.select", "status.unset", "status.normal_alt", "status.select_alt", "status.unset_alt", "status.perm_none", "status.perm_read", "status.perm_write", "status.perm_exec", "status.perm_type", "status.task",
 	"popup.border", "popup.selected", "popup.muted", "popup.warning", "popup.danger", "popup.cancel", "which.key", "which.separator", "which.description",
 	"preview.border", "preview.error", "prompt.insert", "prompt.normal", "prompt.visual", "prompt.search", "tasks.normal", "tasks.selected", "tasks.failed", "tasks.progress", "notify.info", "notify.warn", "notify.error",

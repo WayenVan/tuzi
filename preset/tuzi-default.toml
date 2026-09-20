@@ -41,7 +41,7 @@ which_key = true
 filename_peek = false
 
 [notify]
-info_timeout = 3
+info_timeout = 2
 warn_timeout = 5
 error_timeout = 8
 

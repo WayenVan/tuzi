@@ -27,6 +27,7 @@ messages that claim another sender ID.
 | `state` / `state-error` | Tuzi → parent | direct | no | reply to one `get-state` request |
 | `session-end` | Tuzi → parent | direct | no | send a restorable snapshot during graceful exit |
 | `reveal` | parent → Tuzi | direct | `reveal` | reveal a path in the active tab |
+| `set-home` | parent → Tuzi | direct | `set-home` | change the session home used by `cd @home` |
 | `restore-state` | parent → Tuzi | direct | `restore-state` | replace the complete session atomically |
 | `cd` | Tuzi → parent/subscribers | parent direct or public broadcast | `cd` | active tab root changed |
 | `hover` | Tuzi → parent/subscribers | parent direct or public broadcast | `hover` | cursor path changed |
@@ -48,14 +49,14 @@ require a matching receiver ability.
 ## Handshake messages
 
 ```json
-{"Join":{"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}}
+{"Join":{"abilities":["get-state","get-tabs","restore-state","reveal","set-home","switch-tab","update-tab"]}}
 ```
 
 `Join` must be the first message on a connection. A second `Join`, a duplicate peer
 ID, or a later message with a different sender ID closes that connection.
 
 ```json
-{"Sync":{"peers":[{"id":701,"abilities":["cd","yank","renamed","task-done"]},{"id":902,"abilities":["get-state","get-tabs","restore-state","reveal","switch-tab","update-tab"]}]}}
+{"Sync":{"peers":[{"id":701,"abilities":["cd","yank","renamed","task-done"]},{"id":902,"abilities":["get-state","get-tabs","restore-state","reveal","set-home","switch-tab","update-tab"]}]}}
 ```
 
 `Sync` is emitted whenever the connected peer table changes.
@@ -105,6 +106,18 @@ failure locally. The controller does not receive an execution result.
 Tuzi tries to expand the active tab's tree and place the cursor on the path.
 Failures appear only in the Tuzi UI; there is no execution acknowledgement.
 
+`set-home` is another reserved custom body. It changes the session home, the
+single global directory `cd @home` (`g=`) goes to in every tab. `path` must be
+absolute:
+
+```json
+{"Custom":{"kind":"set-home","data":{"path":"/project"}}}
+```
+
+It changes only the home. No tab moves. If the path is missing or is not a
+directory, Tuzi keeps the previous home and shows a local warning; there is no
+execution acknowledgement.
+
 `restore-state` is also encoded as a reserved custom body:
 
 ```json
@@ -112,7 +125,10 @@ Failures appear only in the Tuzi UI; there is no execution acknowledgement.
 ```
 
 The snapshot is the sole source of truth for tab count, order, active tab,
-roots, cursors, selections, and expanded directories. Tuzi fully validates it,
+roots, cursors, selections, and expanded directories. It may also carry a
+top-level `home` (an absolute existing directory, shared by all tabs and never
+stored inside `tabs`); when present it replaces the session home in the same
+commit as the tabs, and when absent the current home is kept. Tuzi fully validates it,
 builds the replacement trees off-screen, and atomically swaps sessions only
 after every lazy listing succeeds. Failure leaves the visible session intact.
 
@@ -175,11 +191,20 @@ an explicit broadcast rule, the event stays local.
 ```
 
 Custom `data` may be any JSON value. Explicit `emit`/`pub` commands bypass the
-implicit broadcast allowlist but still require DDS to be enabled. The built-in
+implicit broadcast allowlist but still require DDS to be enabled.
+
+Inside Tuzi, `emit KIND [JSON]` (usable from a keymap `run` or the `:` prompt)
+broadcasts publicly, so a receiver must declare `KIND` or `*` as an ability.
+`emit --parent KIND [JSON]` instead sends one direct message to the
+controlling parent, which needs no ability. It never falls back to a
+broadcast: without a parent it shows `emit --parent requires a controlling
+parent`, and with an offline parent it shows `controller unavailable`. Both
+forms also reach local subscribers, and neither accepts a reserved kind or a
+kind starting with `-`. The built-in
 names `join`, `sync`, `attach`, `open`, `cd`, `hover`, `yank`, `renamed`, and
 `task-done`, plus `get-state`, `get-tabs`, `state`, `state-error`, `tabs`, and
 `session-end` are reserved. Controller additionally reserves `update-tab`,
-`switch-tab`, `restore-state`, and `reveal` for their controller operations.
+`switch-tab`, `restore-state`, `reveal`, and `set-home` for their controller operations.
 
 ## Privacy and authentication
 

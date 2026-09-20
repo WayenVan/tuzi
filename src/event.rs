@@ -11,6 +11,9 @@ pub enum Event {
 	Redraw,
 
 	Changed { tab: usize, path: PathBuf },
+	/// File watching lost track of changes or failed to start watching a
+	/// directory; see `WatchIssue`.
+	WatchIssue { tab: usize, issue: crate::watcher::WatchIssue },
 	FilesChanged { tab: usize, parent: PathBuf, changes: Vec<FsChange> },
 	Loaded { tab: usize, path: PathBuf, ticket: u64, result: io::Result<Vec<(PathBuf, Cha)>>, done: bool },
 	Created { tab: usize, base: PathBuf, value: String, target: PathBuf, result: io::Result<()> },

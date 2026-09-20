@@ -27,7 +27,7 @@ are no longer accepted. `get-state`, `restore-state`, and `tuzi-exit` continue
 to use `state` for a complete session snapshot.
 
 Implemented operations are `register`, `cancel-register`, `list`, `detach`,
-`update-tab`, `get-tabs`, `switch-tab`, `get-state`, `reveal`, `restore-state`,
+`update-tab`, `get-tabs`, `switch-tab`, `get-state`, `reveal`, `set-home`, `restore-state`,
 `publish`, and `ping`.
 
 ## Command reference
@@ -43,6 +43,7 @@ Implemented operations are `register`, `cancel-register`, `list`, `detach`,
 | `switch-tab` | controlled Tuzi | `peer_id`, `tab_id` | `status: "queued"` |
 | `get-state` | controlled Tuzi | `peer_id` | complete `state` snapshot |
 | `reveal` | controlled Tuzi | `peer_id`, absolute `path` | `status: "queued"` |
+| `set-home` | controlled Tuzi | `peer_id`, absolute `path` | `status: "queued"` |
 | `restore-state` | controlled Tuzi | `peer_id`, `state` | `status: "queued"` |
 | `publish` | controlled Tuzi | `peer_id`, `kind`, optional `data` | `status: "queued"` |
 | `ping` | controller | none | protocol version and controller peer ID |
@@ -61,6 +62,7 @@ Request shapes:
 {"request_id":5,"op":"update-tab","peer_id":902,"update":{"path":"/project","selection":["README.md"]}}
 {"request_id":6,"op":"get-state","peer_id":902}
 {"request_id":7,"op":"reveal","peer_id":902,"path":"/project/src/main.rs"}
+{"request_id":13,"op":"set-home","peer_id":902,"path":"/project"}
 {"request_id":8,"op":"restore-state","peer_id":902,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/project","cursor":"/project/README.md","selection":[],"expanded":["/project/src"]}]}}
 {"request_id":9,"op":"publish","peer_id":902,"kind":"plugin-event","data":{"value":1}}
 {"request_id":10,"op":"ping"}
@@ -131,6 +133,11 @@ to the controller in the same event envelope:
 {"event":"message","peer_id":902,"kind":"open","body":{"Open":{"paths":["/project/src/main.rs"]}}}
 ```
 
+A keymap entry such as `{ "on": "q", "run": "emit --parent tuzi-hide" }` sends
+`{"event":"message","peer_id":902,"kind":"tuzi-hide","body":{"Custom":{"kind":"tuzi-hide","data":null}}}`
+to the controller without declaring the kind in `--abilities`. Plain `emit`
+is a public broadcast and does need the ability.
+
 The default abilities are `cd,yank,renamed,task-done`. Cursor movement can
 produce frequent `hover` events, so subscribe explicitly when needed.
 `--abilities` replaces the full default list:
@@ -165,7 +172,7 @@ directory and selection with the typed `update-tab` operation:
 {"request_id":2,"ok":true,"status":"queued"}
 ```
 
-For `update-tab`, `switch-tab`, `reveal`, `restore-state`, and `publish`,
+For `update-tab`, `switch-tab`, `reveal`, `set-home`, `restore-state`, and `publish`,
 `status: "queued"` means the target was controlled, online, declared the
 requested ability, and the message was queued for DDS delivery. It does not
 claim that Tuzi has already applied the action. An error response has
@@ -182,6 +189,16 @@ Both fields in `update` are optional. `path` changes the active tab's root.
 `selection` replaces its selection and defaults to an empty list, so omitting
 it clears the current selection. Relative selection paths are resolved against
 the tab root; missing paths and paths outside that root are ignored.
+
+`set-home` changes the session home: the single directory `g=` (`cd @home`)
+goes to in every tab. It is global state, not part of any tab, and it moves no
+tab. `path` must be absolute; a path that is missing or not a directory leaves
+the previous home in place and produces a local warning, with no completion
+event:
+
+```json
+{"request_id":13,"op":"set-home","peer_id":902,"path":"/project"}
+```
 
 Use `get-tabs` to read live tab IDs and their order without building a
 restorable session snapshot:
@@ -217,7 +234,9 @@ with the same `request_id`:
 ```
 
 The snapshot uses the same schema as `restore-state`, including all tabs and
-their roots, cursors, selections, and expanded directories. It excludes a
+their roots, cursors, selections, and expanded directories. It also carries
+the session `home` as a top-level field next to `active_tab`. A home that has
+since been deleted is omitted instead of failing the snapshot. It excludes a
 replacement session still being restored off-screen. Tuzi validates the
 snapshot before replying so it can be submitted to `restore-state` while its
 paths still exist. If a path has vanished or a restore limit is exceeded,
@@ -255,7 +274,10 @@ Use `restore-state` to replace the whole session:
 }
 ```
 
-All snapshot paths are absolute. `version` must be `1`, `tabs` must contain
+All snapshot paths are absolute. The optional top-level `home` is the session
+home shared by every tab; it must be an existing directory and, when present,
+replaces the current home in the same commit as the tabs (omit it to keep the
+current home). `version` must be `1`, `tabs` must contain
 1–32 entries, and `active_tab` is a zero-based array index. Each cwd must be
 an existing directory; cursor, selection, and expanded paths must exist inside
 that cwd, and expanded paths must be directories. Tuzi automatically adds the
@@ -350,7 +372,7 @@ so it cannot be mistaken for the first request's final response.
 
 The launch token authorizes only the initial handshake. Runtime operations use
 one `peer_id` at a time. Tuzi accepts `update-tab`, `switch-tab`, `get-tabs`,
-`get-state`, `reveal`, and `restore-state` from its saved parent peer only, and
+`get-state`, `reveal`, `set-home`, and `restore-state` from its saved parent peer only, and
 the DDS server binds every sender ID to the connection that completed the
 `Join` handshake so another client cannot spoof the parent ID. Tuzi also
 checks that a directed control operation is supported and that its JSON schema

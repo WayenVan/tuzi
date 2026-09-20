@@ -48,6 +48,30 @@ impl Node {
 		self.loading = false;
 	}
 
+	/// Adds this directory, if it is expanded, and every expanded directory
+	/// below it that can be reached through expanded ones: the directories that
+	/// are open on screen, whether or not their listing has arrived yet.
+	pub fn collect_watched(&self, out: &mut std::collections::HashSet<PathBuf>) {
+		if !self.expanded {
+			return;
+		}
+		out.insert(self.path.clone());
+		for child in self.children.iter().flatten() {
+			child.collect_watched(out);
+		}
+	}
+
+	/// Appends every expanded, loaded directory below this node, following
+	/// only expanded ones, which are the ones actually on screen.
+	pub fn collect_open_dirs(&self, out: &mut Vec<PathBuf>) {
+		for child in self.children.iter().flatten() {
+			if child.expanded && child.children.is_some() {
+				out.push(child.path.clone());
+				child.collect_open_dirs(out);
+			}
+		}
+	}
+
 	pub fn collapse_subtree(&mut self, collapsed: &mut Vec<PathBuf>) {
 		if let Some(children) = &mut self.children {
 			for child in children {

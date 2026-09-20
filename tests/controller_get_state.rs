@@ -45,6 +45,7 @@ async fn controller_get_state_waits_for_the_target_peers_snapshot() {
 	let state = SessionState {
 		version: 1,
 		active_tab: 0,
+		home: None,
 		tabs: vec![TabState { cwd: root.clone(), cursor: None, selection: Vec::new(), expanded: Vec::new() }],
 	};
 	peer.publish_to(controller_id, Body::State { query_id, state: state.clone() });

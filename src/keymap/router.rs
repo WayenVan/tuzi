@@ -175,11 +175,19 @@ mod tests {
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('h')), Route::Commands(vec![Command::Cd(CdTarget::Path("..".into()))]));
 		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
+		assert_eq!(router.route(KeyContext::Manager, Key::char('=')), Route::Commands(vec![Command::Cd(CdTarget::Home)]));
+		assert!(matches!(router.route(KeyContext::Manager, Key::char('g')), Route::Pending(_)));
 		assert_eq!(router.route(KeyContext::Manager, Key::char('l')), Route::Commands(vec![Command::Cd(CdTarget::Selected)]));
 		assert_eq!(
 			router.route(KeyContext::Manager, Key::char('G')),
 			Route::Commands(vec![Command::Cursor(CursorTarget::Bottom)])
 		);
+	}
+
+	#[test]
+	fn r_refreshes_the_open_directories() {
+		let mut router = Router::default();
+		assert_eq!(router.route(KeyContext::Manager, Key::char('R')), Route::Commands(vec![Command::Refresh]));
 	}
 
 	#[test]

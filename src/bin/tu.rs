@@ -157,6 +157,7 @@ enum ControllerRequest {
 	GetTabs { request_id: u64, peer_id: u64 },
 	SwitchTab { request_id: u64, peer_id: u64, tab_id: usize },
 	Reveal { request_id: u64, peer_id: u64, path: PathBuf },
+	SetHome { request_id: u64, peer_id: u64, path: PathBuf },
 	RestoreState { request_id: u64, peer_id: u64, state: SessionState },
 	Publish {
 		request_id: u64,
@@ -180,6 +181,7 @@ impl ControllerRequest {
 			| Self::GetTabs { request_id, .. }
 			| Self::SwitchTab { request_id, .. }
 			| Self::Reveal { request_id, .. }
+			| Self::SetHome { request_id, .. }
 			| Self::RestoreState { request_id, .. }
 			| Self::Publish { request_id, .. }
 			| Self::Ping { request_id } => *request_id,
@@ -486,6 +488,16 @@ async fn handle_controller_request(
 			client.publish_to(peer_id, Body::Custom { kind: "reveal".into(), data: serde_json::json!({ "path": path }) });
 			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
 		}
+		ControllerRequest::SetHome { request_id, peer_id, path } => {
+			if let Err(error) = state.validate_target(peer_id, "set-home") {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
+			}
+			if !path.is_absolute() {
+				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "path must be absolute" })).await;
+			}
+			client.publish_to(peer_id, Body::Custom { kind: "set-home".into(), data: serde_json::json!({ "path": path }) });
+			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
+		}
 		ControllerRequest::RestoreState { request_id, peer_id, state: snapshot } => {
 			if let Err(error) = state.validate_target(peer_id, "restore-state") {
 				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": error })).await;
@@ -497,7 +509,7 @@ async fn handle_controller_request(
 			write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": true, "status": "queued" })).await
 		}
 		ControllerRequest::Publish { request_id, peer_id, kind, data } => {
-			if kind.is_empty() || matches!(kind.as_str(), "update-tab" | "switch-tab" | "restore-state" | "reveal") || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
+			if kind.is_empty() || matches!(kind.as_str(), "update-tab" | "switch-tab" | "restore-state" | "reveal" | "set-home") || dds::BUILTIN_KINDS.contains(&kind.as_str()) {
 				return write_json_line(output, &serde_json::json!({ "request_id": request_id, "ok": false, "error": "kind is empty or reserved" })).await;
 			}
 			if let Err(error) = state.validate_target(peer_id, &kind) {
@@ -792,6 +804,8 @@ mod tests {
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":17,"op":"get-tabs","peer_id":42}"#).unwrap(), ControllerRequest::GetTabs { request_id: 17, peer_id: 42 }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":18,"op":"switch-tab","peer_id":42,"tab_id":3}"#).unwrap(), ControllerRequest::SwitchTab { request_id: 18, peer_id: 42, tab_id: 3 }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":15,"op":"reveal","peer_id":42,"path":"/tmp/file"}"#).unwrap(), ControllerRequest::Reveal { request_id: 15, peer_id: 42, path } if path == PathBuf::from("/tmp/file")));
+		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":16,"op":"set-home","peer_id":42,"path":"/project"}"#).unwrap(), ControllerRequest::SetHome { request_id: 16, peer_id: 42, path } if path == PathBuf::from("/project")));
+		assert!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":17,"op":"set-home","peer_id":42}"#).is_err(), "path is required");
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":14,"op":"restore-state","peer_id":42,"state":{"version":1,"active_tab":0,"tabs":[{"cwd":"/tmp","cursor":null,"selection":[],"expanded":[]}]}}"#).unwrap(), ControllerRequest::RestoreState { request_id: 14, peer_id: 42, .. }));
 		assert!(matches!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":13,"op":"publish","peer_id":42,"kind":"event","data":null}"#).unwrap(), ControllerRequest::Publish { request_id: 13, peer_id: 42, .. }));
 		assert!(serde_json::from_str::<ControllerRequest>(r#"{"request_id":10,"op":"publish","token":"known","kind":"event"}"#).is_err());

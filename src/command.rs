@@ -11,6 +11,7 @@ pub enum CursorTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CdTarget {
+	Home,
 	Interactive,
 	Path(String),
 	Trash,
@@ -98,8 +99,14 @@ pub enum Command {
 	GetTabs { query_id: u64 },
 	/// Publishes a custom event on the internal DDS bus (`.ai/dds-plan.md`
 	/// P2). `data` defaults to `Value::Null` when the command carries no
-	/// JSON argument.
-	Emit { kind: String, data: serde_json::Value },
+	/// JSON argument. With `parent`, the event goes only to the controlling
+	/// parent instead of being broadcast.
+	Emit { kind: String, data: serde_json::Value, parent: bool },
+	/// Reads every open directory of the active tab again.
+	Refresh,
+	/// Changes the session home used by `cd @home`. Delivered by a
+	/// controlling parent through DDS; it has no command-line syntax.
+	SetHome(std::path::PathBuf),
 }
 
 impl FromStr for Command {
@@ -117,6 +124,7 @@ impl FromStr for Command {
 			["cursor", amount] => amount.parse().map(|amount| Self::Cursor(CursorTarget::Relative(amount))).map_err(|_| invalid()),
 			["page", amount] => amount.parse().map(Self::MovePage).map_err(|_| invalid()),
 			["cd"] => Ok(Self::Cd(CdTarget::Interactive)),
+			["cd", "@home"] => Ok(Self::Cd(CdTarget::Home)),
 			["cd", "@trash"] => Ok(Self::Cd(CdTarget::Trash)),
 			["cd", "@config"] => Ok(Self::Cd(CdTarget::Config)),
 			["cd", "@selected"] => Ok(Self::Cd(CdTarget::Selected)),
@@ -172,22 +180,36 @@ impl FromStr for Command {
 			["zoxide"] => Ok(Self::Zoxide),
 			["open"] => Ok(Self::Open { interactive: false }),
 			["open", "--interactive"] => Ok(Self::Open { interactive: true }),
+			["refresh"] => Ok(Self::Refresh),
 			["tasks", "toggle"] => Ok(Self::ToggleTasks),
 			["entry-details"] => Ok(Self::EntryDetails),
 			["filename-peek", "toggle"] => Ok(Self::ToggleFilenamePeek),
-			["emit", kind] => Ok(Self::Emit { kind: emit_kind(kind).map_err(|_| invalid())?, data: serde_json::Value::Null }),
-			["emit", kind, json] => Ok(Self::Emit {
-				kind: emit_kind(kind).map_err(|_| invalid())?,
-				data: serde_json::from_str(json).map_err(|_| format!("invalid json for emit: '{json}'"))?,
-			}),
+			["emit", "--parent", rest @ ..] => parse_emit(rest, true).ok_or_else(invalid)?,
+			["emit", rest @ ..] => parse_emit(rest, false).ok_or_else(invalid)?,
 			_ => Err(invalid()),
 		}
 	}
 }
 
-/// Rejects kinds that would let `emit` spoof a built-in DDS event.
+/// Parses the `KIND [JSON]` tail of `emit`. `None` means the shape is
+/// invalid; a malformed JSON payload is its own error.
+fn parse_emit(args: &[&str], parent: bool) -> Option<Result<Command, String>> {
+	let (kind, json) = match args {
+		[kind] => (kind, None),
+		[kind, json] => (kind, Some(json)),
+		_ => return None,
+	};
+	let kind = emit_kind(kind).ok()?;
+	Some(match json {
+		None => Ok(Command::Emit { kind, data: serde_json::Value::Null, parent }),
+		Some(json) => serde_json::from_str(json).map(|data| Command::Emit { kind, data, parent }).map_err(|_| format!("invalid json for emit: '{json}'")),
+	})
+}
+
+/// Rejects kinds that would let `emit` spoof a built-in DDS event, and
+/// anything shaped like a flag so a typo can't become a kind.
 fn emit_kind(kind: &str) -> Result<String, ()> {
-	if kind.is_empty() || BUILTIN_KINDS.contains(&kind) { return Err(()); }
+	if kind.is_empty() || kind.starts_with('-') || BUILTIN_KINDS.contains(&kind) { return Err(()); }
 	Ok(kind.to_string())
 }
 
@@ -203,14 +225,14 @@ pub struct CommandSpec {
 
 const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "cursor", description: "Move the cursor", usages: &["cursor 1", "cursor -1", "cursor top", "cursor bottom"] },
-	CommandSpec { name: "cd", description: "Change directory", usages: &["cd", "cd @selected", "cd @trash", "cd @config", "cd ..", "cd ~", "cd ~/Downloads", "cd ~/Desktop"] },
+	CommandSpec { name: "cd", description: "Change directory", usages: &["cd", "cd @selected", "cd @home", "cd @trash", "cd @config", "cd ..", "cd ~", "cd ~/Downloads", "cd ~/Desktop"] },
 	CommandSpec { name: "center", description: "Center the cursor", usages: &["center"] },
 	CommandSpec { name: "collapse", description: "Collapse directories", usages: &["collapse", "collapse subtree", "collapse siblings", "collapse all"] },
 	CommandSpec { name: "column", description: "Set the metadata column", usages: &["column none", "column size", "column permissions", "column modified"] },
 	CommandSpec { name: "command", description: "Open the command prompt", usages: &["command"] },
 	CommandSpec { name: "copy", description: "Copy path information", usages: &["copy path", "copy url", "copy dirpath", "copy dirurl", "copy filename", "copy stem"] },
 	CommandSpec { name: "create", description: "Create a file or directory", usages: &["create"] },
-	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#] },
+	CommandSpec { name: "emit", description: "Publish a custom DDS event", usages: &["emit my-kind", r#"emit my-kind '{"a":1}'"#, "emit --parent my-kind"] },
 	CommandSpec { name: "entry-details", description: "Show details for the selected entry", usages: &["entry-details"] },
 	CommandSpec { name: "filename-peek", description: "Toggle truncated filename continuation", usages: &["filename-peek toggle"] },
 	CommandSpec { name: "escape", description: "Cancel the current mode", usages: &["escape"] },
@@ -226,6 +248,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
 	CommandSpec { name: "paste", description: "Paste yanked files", usages: &["paste"] },
 	CommandSpec { name: "preview", description: "Control the preview", usages: &["preview toggle", "preview seek 1", "preview seek -1"] },
 	CommandSpec { name: "quit", description: "Quit Tuzi", usages: &["quit"] },
+	CommandSpec { name: "refresh", description: "Read the open directories again", usages: &["refresh"] },
 	CommandSpec { name: "remove", description: "Remove selected files", usages: &["remove", "remove --permanently"] },
 	CommandSpec { name: "rename", description: "Rename the selected file", usages: &["rename"] },
 	CommandSpec { name: "select", description: "Toggle selection", usages: &["select toggle"] },
@@ -298,14 +321,33 @@ mod tests {
 	}
 
 	#[test]
+	fn refresh_takes_no_arguments() {
+		assert_eq!("refresh".parse(), Ok(Command::Refresh));
+		assert!("refresh now".parse::<Command>().is_err());
+		assert!(completions("ref").iter().any(|candidate| candidate == "refresh"));
+	}
+
+	#[test]
 	fn emit_publishes_an_arbitrary_kind_with_optional_json() {
 		assert_eq!(
 			"emit my-kind".parse(),
-			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null })
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null, parent: false })
 		);
 		assert_eq!(
 			r#"emit my-kind '{"a":1}'"#.parse(),
-			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}) })
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}), parent: false })
+		);
+	}
+
+	#[test]
+	fn emit_parent_targets_only_the_controlling_parent() {
+		assert_eq!(
+			"emit --parent my-kind".parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::Value::Null, parent: true })
+		);
+		assert_eq!(
+			r#"emit --parent my-kind '{"a":1}'"#.parse(),
+			Ok(Command::Emit { kind: "my-kind".into(), data: serde_json::json!({"a": 1}), parent: true })
 		);
 	}
 
@@ -314,6 +356,15 @@ mod tests {
 		assert!("emit cd".parse::<Command>().is_err(), "cd is a built-in DDS kind");
 		assert!("emit ''".parse::<Command>().is_err(), "empty kind");
 		assert!(r#"emit my-kind 'not json'"#.parse::<Command>().is_err());
+		assert!(r#"emit --parent my-kind 'not json'"#.parse::<Command>().is_err());
+	}
+
+	#[test]
+	fn emit_never_treats_a_flag_as_a_kind() {
+		assert!("emit --parent".parse::<Command>().is_err());
+		assert!("emit --paren my-kind".parse::<Command>().is_err());
+		assert!("emit --parent --parent".parse::<Command>().is_err());
+		assert!("emit my-kind '1' extra".parse::<Command>().is_err());
 	}
 
 	#[test]

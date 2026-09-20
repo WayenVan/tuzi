@@ -58,6 +58,9 @@ pub struct Tab {
 	path_history: PathHistory,
 	pub preview: Preview,
 	pub watcher: Watcher,
+	/// The set last declared to `watcher`, so it is declared again only when
+	/// the tree's open directories have changed.
+	watch_set: HashSet<PathBuf>,
 	pub fs_scheduler: FsScheduler,
 	pending_listings: HashMap<PathBuf, PendingListing>,
 	pub selection: Selection,
@@ -142,7 +145,11 @@ impl Tab {
 			Duration::from_millis(config.watcher.max_wait_ms),
 			Duration::from_millis(config.watcher.poll_interval_ms),
 		)?;
-		watcher.watch(&root_path)?;
+		// Watch the root before reading it, not alongside: a listing read before
+		// its watch exists can miss a change made in between, which nothing would
+		// ever report. Waits for the watcher's worker, as it always has here.
+		let watch_set = tree.watch_set();
+		watcher.sync_wait(watch_set.clone());
 
 		let engine: Arc<dyn Engine> = Arc::new(LocalEngine);
 		let mut fs_scheduler = FsScheduler::new(id, tx.clone(), engine);
@@ -166,6 +173,7 @@ impl Tab {
 			path_history,
 			preview: Preview::configured(id, tx.clone(), config.preview.clone()),
 			watcher,
+			watch_set,
 			fs_scheduler,
 			pending_listings: HashMap::new(),
 			selection: Selection::default(),
@@ -232,12 +240,52 @@ impl Tab {
 		self.projection.position(path)
 	}
 
+	/// The tree's structure changed under `path`: bring everything derived
+	/// from it up to date. That is the rows to draw and, through
+	/// `sync_watches`, which directories are watched. Every structural change
+	/// ends here, which is what keeps the two from drifting apart.
 	fn sync_projection(&mut self, path: &Path) {
 		self.projection.sync_subtree(&self.tree.root, path, self.filter.as_ref(), self.show_hidden);
+		self.sync_watches();
 	}
 
 	fn rebuild_projection(&mut self) {
 		self.projection.rebuild(&self.tree.root, self.filter.as_ref(), self.show_hidden);
+		self.sync_watches();
+	}
+
+	/// Makes the watched directories the ones the tree has open, if they are not
+	/// already. The invariant this maintains: **a directory is watched exactly
+	/// while it is expanded**. It is stated once, here, rather than kept by
+	/// pairing every expand with a `watch` and every collapse with an
+	/// `unwatch`.
+	fn sync_watches(&mut self) {
+		let wanted = self.tree.watch_set();
+		if wanted != self.watch_set {
+			self.apply_watches(wanted);
+		}
+	}
+
+	/// Declares the set again even though it is unchanged, so that the watcher
+	/// re-checks that every watch is still good.
+	fn resync_watches(&mut self) {
+		let wanted = self.tree.watch_set();
+		self.apply_watches(wanted);
+	}
+
+	fn apply_watches(&mut self, wanted: HashSet<PathBuf>) {
+		// A directory that was not being watched but has a cached listing may
+		// have changed unseen (collapsing keeps the listing and stops watching),
+		// so that listing is read again. One with no listing yet is fetched by
+		// whatever expanded it. The old rows stay on screen until the new ones
+		// arrive.
+		for path in wanted.difference(&self.watch_set) {
+			if self.tree.is_loaded(path) {
+				self.fs_scheduler.refresh(path.clone());
+			}
+		}
+		self.watcher.sync(wanted.clone());
+		self.watch_set = wanted;
 	}
 
 	fn cancel_listing(&mut self, path: &Path) {
@@ -317,11 +365,26 @@ impl Tab {
 			return;
 		};
 		let needs_fetch = self.tree.mark_expanded(&path).unwrap_or(false);
+		// This also starts watching it, and reads a cached listing again.
 		self.sync_projection(&path);
-		self.watcher.watch_async(path.clone());
 		if needs_fetch {
 			self.fs_scheduler.refresh(path);
 		}
+	}
+
+	/// Reads every open directory again, keeping the cursor, selection and
+	/// expansion, and has the watcher re-check every watch. Declaring the set
+	/// again is harmless when nothing is wrong (a watch that is fine is left
+	/// alone, and one that is failing is reported once), so it is safe to do
+	/// even for a refresh the watcher itself asked for. Returns how many
+	/// directories were refreshed.
+	pub fn refresh_all(&mut self) -> usize {
+		self.resync_watches();
+		let dirs = self.tree.open_dirs();
+		for dir in &dirs {
+			self.fs_scheduler.refresh(dir.clone());
+		}
+		dirs.len()
 	}
 
 	/// Expands an exact path while a staged session is being built. Unlike
@@ -335,7 +398,6 @@ impl Tab {
 		}
 		let needs_fetch = self.tree.mark_expanded(path).expect("restore path was just found");
 		self.sync_projection(path);
-		self.watcher.watch_async(path.to_owned());
 		if needs_fetch {
 			self.fs_scheduler.refresh(path.to_owned());
 		}
@@ -361,7 +423,6 @@ impl Tab {
 			self.cancel_listing(&path);
 			self.tree.collapse(&path);
 			self.sync_projection(&path);
-			self.watcher.unwatch(&path);
 			self.fs_scheduler.forget(&path);
 		} else {
 			self.expand_selected();
@@ -383,7 +444,6 @@ impl Tab {
 		self.cancel_listing(&target);
 		self.tree.collapse(&target);
 		self.sync_projection(&target);
-		self.watcher.unwatch(&target);
 		self.fs_scheduler.forget(&target);
 		self.select(&target);
 	}
@@ -394,7 +454,6 @@ impl Tab {
 		let target = if node.cha.is_dir { path } else { self.tree.parent_of(&path).unwrap_or(path) };
 		for collapsed in self.tree.collapse_subtree(&target) {
 			self.cancel_listing(&collapsed);
-			self.watcher.unwatch(&collapsed);
 			self.fs_scheduler.forget(&collapsed);
 		}
 		self.sync_projection(&target);
@@ -408,7 +467,6 @@ impl Tab {
 		let Some(parent) = self.tree.parent_of(&path) else { return };
 		for collapsed in self.tree.collapse_siblings(&path) {
 			self.cancel_listing(&collapsed);
-			self.watcher.unwatch(&collapsed);
 			self.fs_scheduler.forget(&collapsed);
 		}
 		self.sync_projection(&parent);
@@ -420,7 +478,6 @@ impl Tab {
 		let root = self.tree.root.path.clone();
 		for collapsed in self.tree.collapse_all() {
 			self.cancel_listing(&collapsed);
-			self.watcher.unwatch(&collapsed);
 			self.fs_scheduler.forget(&collapsed);
 		}
 		self.sync_projection(&root);
@@ -832,7 +889,6 @@ impl Tab {
 		}
 		let _ = self.tx.send(Event::DdsPublish(Body::Renamed { from: target.clone(), to: dest.clone() }));
 
-		self.watcher.unwatch(&target);
 		self.fs_scheduler.forget(&target);
 		self.selection.remove(&target);
 		if self.tree.is_loaded(parent) {
@@ -963,7 +1019,6 @@ impl Tab {
 			match self.tree.mark_expanded(&directory) {
 				Some(needs_fetch) => {
 					self.sync_projection(&directory);
-					let _ = self.watcher.watch(&directory);
 					if needs_fetch {
 						self.fs_scheduler.refresh(directory);
 						return;
@@ -1245,7 +1300,6 @@ impl Tab {
 	pub fn on_deleted(&mut self, paths: Vec<PathBuf>) {
 		for path in &paths {
 			self.cancel_listing(path);
-			self.watcher.unwatch(path);
 			self.fs_scheduler.forget(path);
 			self.selection.remove(path);
 		}
@@ -1545,7 +1599,7 @@ mod tests {
 			Event::Created { base, value, target, result, .. } => tab.on_created(base, value, target, result),
 			// No App/Registry exists in these single-tab tests; DDS publication
 			// from `cd`/rename is a no-op here.
-			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_) => {}
+			Event::DdsPublish(_) | Event::DdsDeliver(_) | Event::DdsRejected(_) | Event::Visited(_) | Event::WatchIssue { .. } => {}
 			_ => panic!("unexpected event in a single-tab test"),
 		}
 	}
@@ -2654,5 +2708,268 @@ mod tests {
 		assert_eq!(tab.status_line().mode, StatusMode::Unset);
 
 		fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// Applies events until nothing arrives for a while: enough for however many
+	/// directory listings a refresh started.
+	async fn settle(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) {
+		while let Ok(Some(event)) = tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv()).await {
+			apply(tab, event);
+		}
+	}
+
+	fn visible_names(tab: &Tab) -> Vec<String> {
+		tab.visible().iter().map(|(_, node)| node.path.file_name().unwrap().to_string_lossy().into_owned()).collect()
+	}
+
+	/// Stops all watching, so that only an explicit read can notice later changes.
+	fn go_deaf(tab: &Tab) {
+		tab.watcher.sync_wait(HashSet::new());
+	}
+
+	#[tokio::test]
+	async fn refresh_all_reads_open_directories_again_and_keeps_the_view() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-refresh-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		fs::write(root.join("sub/first"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		go_deaf(&tab);
+
+		fs::write(root.join("sub/added"), b"").unwrap();
+		fs::remove_file(root.join("sub/first")).unwrap();
+		fs::write(root.join("top"), b"").unwrap();
+		settle(&mut tab, &mut rx).await;
+		assert!(!visible_names(&tab).contains(&"top".to_owned()), "control: with no watch nothing has noticed the changes");
+
+		assert_eq!(tab.refresh_all(), 2, "the root and the one expanded directory");
+		settle(&mut tab, &mut rx).await;
+		let names = visible_names(&tab);
+		assert!(names.contains(&"top".to_owned()) && names.contains(&"added".to_owned()), "{names:?}");
+		assert!(!names.contains(&"first".to_owned()), "{names:?}");
+		assert!(tab.tree.root.find(&root.join("sub")).unwrap().expanded, "the expansion survives");
+		assert_eq!(tab.visible_at(tab.cursor).unwrap().1.path, root.join("sub"), "and so does the cursor");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn refresh_all_leaves_out_collapsed_directories() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-refresh-collapsed-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		assert_eq!(tab.refresh_all(), 2);
+		tab.collapse_selected();
+		settle(&mut tab, &mut rx).await;
+		assert_eq!(tab.refresh_all(), 1, "a collapsed directory is not on screen, so it is not read");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	#[tokio::test]
+	async fn expanding_a_collapsed_directory_reads_it_again() {
+		let root = std::env::temp_dir().join(format!("tuzi-tab-test-reexpand-{}", std::process::id()));
+		let _ = fs::remove_dir_all(&root);
+		fs::create_dir_all(root.join("sub")).unwrap();
+		fs::write(root.join("sub/first"), b"").unwrap();
+		let root = root.canonicalize().unwrap();
+		let (mut tab, mut rx) = tab(&root).await;
+		tab.select(&root.join("sub"));
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		tab.collapse_selected(); // stops watching it, but keeps the cached listing
+		settle(&mut tab, &mut rx).await;
+
+		fs::write(root.join("sub/created_while_collapsed"), b"").unwrap();
+		fs::remove_file(root.join("sub/first")).unwrap();
+		tab.expand_selected();
+		settle(&mut tab, &mut rx).await;
+		let names = visible_names(&tab);
+		assert!(names.contains(&"created_while_collapsed".to_owned()), "{names:?}");
+		assert!(!names.contains(&"first".to_owned()), "the cached listing must not be shown as if it were current: {names:?}");
+		fs::remove_dir_all(&root).unwrap();
+	}
+
+	/// A small deterministic generator, so that a failing run can be replayed.
+	struct Rng(u64);
+
+	impl Rng {
+		fn below(&mut self, bound: usize) -> usize {
+			self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+			((self.0 >> 33) as usize) % bound.max(1)
+		}
+
+		fn pick<T: Clone>(&mut self, items: &[T]) -> Option<T> {
+			(!items.is_empty()).then(|| items[self.below(items.len())].clone())
+		}
+	}
+
+	fn disk_dirs(root: &Path) -> Vec<PathBuf> {
+		let mut found = vec![root.to_path_buf()];
+		let mut next = 0;
+		while next < found.len() {
+			if let Ok(entries) = fs::read_dir(&found[next]) {
+				for entry in entries.flatten() {
+					if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+						found.push(entry.path());
+					}
+				}
+			}
+			next += 1;
+		}
+		found
+	}
+
+	fn disk_names(dir: &Path) -> std::collections::BTreeSet<String> {
+		fs::read_dir(dir).map(|entries| entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default()
+	}
+
+	/// The two things that must hold once things have settled:
+	/// 1. exactly the open directories that still exist are watched, and
+	/// 2. what is cached for each open directory is what is on disk.
+	fn invariants(tab: &Tab) -> Result<(), String> {
+		let wanted: HashSet<PathBuf> = tab.tree.watch_set().into_iter().filter(|dir| dir.is_dir()).collect();
+		let registered: HashSet<PathBuf> = tab.watcher.registered().into_iter().filter(|dir| dir.is_dir()).collect();
+		if wanted != registered {
+			return Err(format!("watched {:?} but the tree has open {:?}", sorted(&registered), sorted(&wanted)));
+		}
+		// A collapsed directory is not watched, so it is not kept fresh either; it
+		// is read again when it is expanded. (`open_dirs` still includes a
+		// collapsed root, for an explicit refresh.)
+		let watched_by_the_tree = tab.tree.watch_set();
+		for dir in tab.tree.open_dirs() {
+			if !dir.is_dir() || !watched_by_the_tree.contains(&dir) {
+				continue;
+			}
+			let Some(node) = tab.tree.root.find(&dir) else { continue };
+			let cached: std::collections::BTreeSet<String> = node.children.iter().flatten().map(|child| child.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+			let on_disk = disk_names(&dir);
+			if cached != on_disk {
+				return Err(format!("{} is cached as {cached:?} but holds {on_disk:?}", dir.display()));
+			}
+		}
+		Ok(())
+	}
+
+	fn sorted(set: &HashSet<PathBuf>) -> Vec<String> {
+		let mut names: Vec<String> = set.iter().map(|path| path.display().to_string()).collect();
+		names.sort();
+		names
+	}
+
+	async fn converge(tab: &mut Tab, rx: &mut mpsc::UnboundedReceiver<Event>) -> Result<(), String> {
+		let mut last = Ok(());
+		for _ in 0..16 {
+			while let Ok(Some(event)) = tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await {
+				apply(tab, event);
+			}
+			last = invariants(tab);
+			if last.is_ok() {
+				return last;
+			}
+		}
+		last
+	}
+
+	/// Expands, collapses and changes the disk at random, the way a busy
+	/// project would while Tuzi sits open, and requires the watching and the
+	/// cache to agree with the tree and the disk every time things settle.
+	/// This is the invariant the tree-driven watching exists to keep; the other
+	/// tests check individual cases of it.
+	#[tokio::test]
+	async fn watching_and_the_cache_stay_true_to_the_tree_under_random_changes() {
+		for seed in [1u64, 2, 3, 4] {
+			let root = std::env::temp_dir().join(format!("tuzi-tab-test-invariant-{}-{seed}", std::process::id()));
+			let _ = fs::remove_dir_all(&root);
+			for dir in ["a/x", "a/y", "b/z", "c"] {
+				fs::create_dir_all(root.join(dir)).unwrap();
+			}
+			fs::write(root.join("a/x/f"), b"").unwrap();
+			fs::write(root.join("top"), b"").unwrap();
+			let root = root.canonicalize().unwrap();
+			let (mut tab, mut rx) = tab(&root).await;
+			let (mut rng, mut log, mut counter) = (Rng(seed), Vec::<String>::new(), 0u32);
+
+			for round in 0..6 {
+				for _ in 0..6 {
+					counter += 1;
+					// Change the disk only once the watcher has caught up with what the
+					// tree just opened. A directory expanded a moment ago is read and
+					// registered independently, so a change made in the instant between
+					// the two is not reported by anything (`R` fixes it); that window is
+					// not what is under test here, and it widens when the machine is busy.
+					for _ in 0..500 {
+						let wanted: HashSet<PathBuf> = tab.tree.watch_set().into_iter().filter(|dir| dir.is_dir()).collect();
+						let registered: HashSet<PathBuf> = tab.watcher.registered().into_iter().filter(|dir| dir.is_dir()).collect();
+						if wanted == registered {
+							break;
+						}
+						tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+					}
+					let dirs = disk_dirs(&root);
+					let visible_dirs: Vec<PathBuf> = tab.visible().iter().filter(|(_, node)| node.cha.is_dir && node.path.is_dir()).map(|(_, node)| node.path.clone()).collect();
+					let subdirs: Vec<PathBuf> = dirs.iter().filter(|dir| **dir != root).cloned().collect();
+					match rng.below(8) {
+						0 | 1 => {
+							if let Some(dir) = rng.pick(&visible_dirs) {
+								log.push(format!("expand {}", dir.strip_prefix(&root).unwrap().display()));
+								tab.select(&dir);
+								tab.expand_selected();
+							}
+						}
+						2 => {
+							if let Some(dir) = rng.pick(&visible_dirs) {
+								log.push(format!("collapse {}", dir.strip_prefix(&root).unwrap().display()));
+								tab.select(&dir);
+								tab.collapse_selected();
+							}
+						}
+						3 => {
+							if let Some(dir) = rng.pick(&dirs) {
+								log.push(format!("create file in {}", dir.strip_prefix(&root).unwrap().display()));
+								let _ = fs::write(dir.join(format!("f{counter}")), b"");
+							}
+						}
+						4 => {
+							if let Some(dir) = rng.pick(&dirs) {
+								log.push(format!("create dir in {}", dir.strip_prefix(&root).unwrap().display()));
+								let _ = fs::create_dir(dir.join(format!("d{counter}")));
+							}
+						}
+						5 => {
+							if let Some(dir) = rng.pick(&subdirs) {
+								log.push(format!("rm -rf {}", dir.strip_prefix(&root).unwrap().display()));
+								let _ = fs::remove_dir_all(&dir);
+							}
+						}
+						6 => {
+							if let Some(dir) = rng.pick(&subdirs) {
+								log.push(format!("rm -rf and recreate {}", dir.strip_prefix(&root).unwrap().display()));
+								let _ = fs::remove_dir_all(&dir);
+								let _ = fs::create_dir(&dir);
+							}
+						}
+						_ => {
+							if let Some(dir) = rng.pick(&subdirs) {
+								log.push(format!("move {} aside and recreate it", dir.strip_prefix(&root).unwrap().display()));
+								let _ = fs::rename(&dir, dir.with_file_name(format!("moved{counter}")));
+								let _ = fs::create_dir(&dir);
+							}
+						}
+					}
+				}
+				if let Err(problem) = converge(&mut tab, &mut rx).await {
+					panic!("seed {seed}, after round {round}: {problem}\noperations so far:\n  {}", log.join("\n  "));
+				}
+			}
+			fs::remove_dir_all(&root).unwrap();
+		}
 	}
 }

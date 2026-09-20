@@ -50,10 +50,16 @@ For file icons, use a terminal font that includes Nerd Font symbols. `fzf` is op
 ## Usage
 
 ```sh
-tuzi [PATH]
+tuzi [--home DIR] [PATH]
 ```
 
 `PATH` must be a directory and defaults to the current directory.
+Press `g=` (or run `cd @home`) to return to the session home: `--home DIR`
+takes priority, followed by the `home` of a startup session state, then `PATH`,
+then the startup current directory. The home is one global value shared by
+every tab, and a running controller can change it with `set-home`. Relative
+home paths are resolved at startup.
+For example, `tuzi --home /project /tmp` opens `/tmp`; `g=` returns to `/project`.
 
 ```sh
 tuzi --help
@@ -202,7 +208,7 @@ which_key = true
 filename_peek = false      # Show truncated filename continuations near the cursor
 
 [notify]
-info_timeout = 3           # seconds, 1–3600
+info_timeout = 2           # seconds, 1–3600
 warn_timeout = 5
 error_timeout = 8
 
@@ -284,6 +290,13 @@ keymap sequences themselves continue to work.
 Watcher changes are grouped for `debounce_ms`; `max_wait_ms` forces a refresh
 during nonstop filesystem churn. `poll_interval_ms` configures notify's
 polling backend/fallback and does not replace native watching where available.
+Native watching cannot see changes made from another machine on a network
+filesystem such as NFS; press `R` (`:refresh`) to read the open directories
+again. Tuzi also does this by itself when the OS reports that it dropped file
+events, and it registers a directory's watch again when the directory was
+deleted or moved away and came back. If the native backend cannot be used at
+all, for instance because the per-user limit on inotify instances or watches
+is reached, Tuzi says so and polls every `poll_interval_ms` instead.
 
 ### Keymap
 
@@ -424,6 +437,14 @@ Style properties are `fg`, `bg`, `bold`, `italic`, `underline`, and
 `reverse`. Unknown style names and properties are rejected instead of being
 silently ignored.
 
+The number in front of a tab name is drawn quieter than the name, with
+`tabs.index_active` and `tabs.index_inactive`. These are patched onto the
+tab's own style, so they usually set only `fg`: the number keeps whatever
+background and boldness you give `tabs.active` / `tabs.inactive`. If you recolor those
+backgrounds, pick an index color that still contrasts with them. The defaults
+are `#45475a` on the active tab and `#7f849c` on the others, about 4.3:1 and
+3.4:1 against the default backgrounds.
+
 ## Keybindings
 
 | Key | Action |
@@ -450,9 +471,11 @@ silently ignored.
 | `/` / `?` | Find next / previous |
 | `f` | Filter |
 | `.` | Toggle hidden files |
+| `g=` | Go to session home (`--home DIR`, otherwise startup PATH or current directory) |
 | `g~` / `gc` | Go to home / config directory |
 | `gd` / `gD` | Go to Downloads / Desktop |
 | `Ctrl-o` / `Ctrl-i` | Back / forward in directory history |
+| `R` | Refresh: read every open directory again (`:refresh`) |
 | `w` | Show task manager |
 | `Ctrl-p` | Toggle preview |
 | `tt` / `W` | Create / close tab |
