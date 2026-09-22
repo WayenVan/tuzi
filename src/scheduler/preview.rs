@@ -2,7 +2,7 @@ use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 
-use crate::{config::Preview as PreviewConfig, event::Event, preview::{PreviewKey, read_text}};
+use crate::{config::Preview as PreviewConfig, event::Event, preview::{PreviewKey, render_preview}};
 
 /// Runs at most one preview job for a tab. Results always return through
 /// the application's event queue; this type never mutates Preview state.
@@ -31,7 +31,7 @@ impl PreviewScheduler {
 		let config = self.config.clone();
 		self.handle = Some(tokio::spawn(async move {
 			let read_key = key.clone();
-			let result = tokio::task::spawn_blocking(move || read_text(&read_key, &guard, generation, &config))
+			let result = tokio::task::spawn_blocking(move || render_preview(&read_key, &guard, generation, &config))
 				.await
 				.map_err(|error| error.to_string())
 				.and_then(|result| result);
