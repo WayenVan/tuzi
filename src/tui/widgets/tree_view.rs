@@ -176,8 +176,12 @@ fn row_line(
 	let marker = marker.map_or_else(|| Span::raw(" "), |style| Span::styled("│", style));
 	let mut spans = vec![Span::raw(indent), marker, Span::raw(" ")];
 	if let Some(icon) = icon {
+		// kitty only draws a Nerd Font (PUA) icon at full size when the next
+		// cell really holds a space. An unstyled space equals ratatui's blank
+		// cell, so its diff never sends it and kitty shrinks the icon; styling
+		// the space makes it differ, so it always reaches the terminal.
 		spans.push(Span::styled(icon.text, icon.style));
-		spans.push(Span::raw(" "));
+		spans.push(Span::styled(" ", icon.style));
 	}
 	spans.extend(highlight_matches(body, &matches, name_style.unwrap_or_default(), theme));
 	if let Some((text, style)) = suffix {
@@ -382,6 +386,7 @@ mod tests {
 		};
 		let line = row_line(String::new(), None, Some(icon), "name".to_string(), None, Vec::new(), None, None, 80, false, &theme);
 		assert_eq!(line.spans[3].style, Style::new().fg(Color::Blue));
+		assert_eq!(line.spans[4].style, Style::new().fg(Color::Blue), "the space after the icon is styled so kitty sees it");
 	}
 
 	#[test]
