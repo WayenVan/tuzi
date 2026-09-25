@@ -4,6 +4,18 @@ All notable changes to Tuzi are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and Tuzi follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-09-25
+
+### Added
+
+- The preview pane picks a provider for the selected file instead of always reading it as text: Markdown files are rendered as Markdown, JSON is pretty-printed and syntax-highlighted, other text keeps its syntax highlighting, and anything else shows its MIME type and size instead of an error.
+
+### Fixed
+
+- Kitty shrank a Nerd Font icon to a single cell because the space after the icon matched ratatui's blank cell and was never written. The space now carries the icon's style, so the icon keeps its full width.
+- `get-tabs` reported a tab's root as it was opened, while `get-state` resolved it, so a tab opened through a symlink (macOS's `/var` and `/private/var`) appeared under two different paths. Both now resolve it the same way.
+- On macOS, expanding or collapsing a directory restarted FSEvents, and a restarted stream begins at the present, so changes made during the restart were never shown. Watching now keeps one recursive watch per covering root (in practice the tab's root) and restarts only when those roots change; when macOS reports coalesced events, only the open directories they concern are read again instead of every open directory.
+
 ## [0.4.3] - 2026-09-21
 
 ### Added
@@ -124,6 +136,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Initial release.
 
+[0.4.4]: https://github.com/WayenVan/tuzi/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/WayenVan/tuzi/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/WayenVan/tuzi/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/WayenVan/tuzi/compare/v0.4.0...v0.4.1
