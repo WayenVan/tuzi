@@ -10,6 +10,8 @@ use std::{
 use notify::{Config, EventKind, RecursiveMode, Watcher as NotifyWatcher, event::ModifyKind};
 use tokio::{runtime::Handle, sync::mpsc::UnboundedSender, task::AbortHandle, time::Instant};
 
+mod covering;
+
 use crate::{
 	event::Event,
 	fs::{Cha, FsChange},
@@ -158,7 +160,13 @@ impl Watcher {
 	/// so. A view that cannot update itself is still a view.
 	pub fn new(tab: usize, tx: UnboundedSender<Event>, debounce: Duration, max_wait: Duration, poll_interval: Duration) -> io::Result<Self> {
 		let runtime = Handle::try_current().map_err(io::Error::other)?;
-		let native: BackendCtor = Box::new(move |handler| Ok(Box::new(notify::RecommendedWatcher::new(handler, Config::default().with_poll_interval(poll_interval))?)));
+		let native = move |handler| -> notify::Result<Backend> { Ok(Box::new(notify::RecommendedWatcher::new(handler, Config::default().with_poll_interval(poll_interval))?)) };
+		// FSEvents restarts its stream, losing what happens meanwhile, on every
+		// change of watches; see `covering`.
+		#[cfg(target_os = "macos")]
+		let native: BackendCtor = Box::new(move |handler| covering::Covering::wrap(handler, native));
+		#[cfg(not(target_os = "macos"))]
+		let native: BackendCtor = Box::new(native);
 		let polling: BackendCtor = Box::new(move |handler| Ok(Box::new(notify::PollWatcher::new(handler, Config::default().with_poll_interval(poll_interval))?)));
 		Ok(Self::with_backends(tab, tx, runtime, debounce, max_wait, native, polling))
 	}

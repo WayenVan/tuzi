@@ -11,7 +11,9 @@ async fn read_json(lines: &mut Lines<BufReader<ChildStdout>>) -> serde_json::Val
 #[tokio::test]
 async fn controller_get_state_waits_for_the_target_peers_snapshot() {
 	let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-	let root = std::env::temp_dir().join(format!("tuzi-controller-get-state-{}-{nonce}", std::process::id()));
+	// Kept short: the socket lives inside it, and a Unix socket path must fit
+	// in 104 bytes on macOS, whose temp dir alone takes about half of that.
+	let root = std::env::temp_dir().join(format!("tuzi-cgs-{}-{}", std::process::id(), nonce % 1_000_000_000));
 	std::fs::create_dir_all(&root).unwrap();
 	let socket = root.join("dds.sock");
 	let mut process = Command::new(env!("CARGO_BIN_EXE_tu"))
