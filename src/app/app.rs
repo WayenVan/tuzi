@@ -947,7 +947,12 @@ impl App {
 
 	pub(super) fn reply_tabs(&self, query_id: u64) {
 		let (Some(controller), Some(client)) = (&self.controller, &self.dds_client) else { return };
-		let tabs = self.tabs.iter().map(|tab| dds::TabInfo { id: tab.id, cwd: tab.tree.root.path.clone() }).collect();
+		// Resolved like `GetState`'s cwd, so both report a tab under one path
+		// even when its root was opened through a symlink (macOS's /var).
+		let tabs = self.tabs.iter().map(|tab| {
+			let root = &tab.tree.root.path;
+			dds::TabInfo { id: tab.id, cwd: root.canonicalize().unwrap_or_else(|_| root.clone()) }
+		}).collect();
 		client.publish_to(controller.launch.parent, Body::Tabs { query_id, active_tab_id: self.active, tabs });
 	}
 
